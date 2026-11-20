@@ -54,7 +54,7 @@ For request/response operations like `ENCODE` and `FORGET`:
 
 ### 3.2 Streaming responses
 
-For `RECALL`, `PLAN`, `REASON`, `ADMIN_LIST_TOMBSTONED`, `ADMIN_MIGRATE_EMBEDDINGS`:
+For `RECALL`, `PLAN`, `REASON`:
 
 - The request frame has EOS (single request frame).
 - The server may send multiple response frames; only the last one has EOS.
@@ -120,7 +120,7 @@ For an `ENCODE` stream, cancelling after the WAL fsync but before the response i
 
 For a `RECALL` mid-execution, cancellation aborts the search; the client gets the results emitted so far plus the final EOS.
 
-For long-running operations (`PLAN`, `REASON`, `ADMIN_MIGRATE_EMBEDDINGS`), cancellation is the recommended way to stop them early.
+For long-running operations (`PLAN`, `REASON`), cancellation is the recommended way to stop them early. The long-running *admin* operation is backfill, which is not a wire op at all: it is cancelled with `DELETE /v1/backfill/{id}`.
 
 ### 5.4 Implicit cancellation
 

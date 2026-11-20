@@ -15,6 +15,7 @@ use brain_protocol::envelope::response::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::handlers::limits::{check_byte_len, SESSION_TITLE_MAX_BYTES};
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -24,6 +25,7 @@ pub async fn handle_session_create(
     req: SessionCreateRequest,
     ctx: &OpsContext,
 ) -> Result<SessionCreateResponse, OpError> {
+    validate_session_create_request(&req)?;
     let ns = ctx.executor.caller_namespace;
     let space = ctx.executor.caller_space;
     let now = crate::clock::now_unix_nanos();
@@ -148,4 +150,48 @@ fn build_write(request_id: &[u8; 16], ctx: &OpsContext, phase: Phase, domain: &[
     Write::single(write_id, space, phase)
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(hash)
+}
+
+/// A session title is a short human label carried on every row `SESSION_LIST`
+/// returns, so its byte length is bounded where the caller can still shorten
+/// it and retry.
+fn validate_session_create_request(req: &SessionCreateRequest) -> Result<(), OpError> {
+    match req.title.as_deref() {
+        Some(title) => check_byte_len("title", title.len(), SESSION_TITLE_MAX_BYTES),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod validate_session_tests {
+    use super::{validate_session_create_request, SESSION_TITLE_MAX_BYTES};
+    use crate::error::OpError;
+    use brain_protocol::envelope::request::SessionCreateRequest;
+
+    fn req(title: Option<String>) -> SessionCreateRequest {
+        SessionCreateRequest {
+            session_id: 1,
+            title,
+            request_id: [0u8; 16],
+            act_as: None,
+        }
+    }
+
+    /// An absent title and a title at the cap both pass; one byte past it is
+    /// a client-actionable refusal.
+    #[test]
+    fn title_cap_is_enforced_at_the_boundary() {
+        assert!(validate_session_create_request(&req(None)).is_ok());
+        assert!(
+            validate_session_create_request(&req(Some("x".repeat(SESSION_TITLE_MAX_BYTES))))
+                .is_ok()
+        );
+        let err =
+            validate_session_create_request(&req(Some("x".repeat(SESSION_TITLE_MAX_BYTES + 1))))
+                .expect_err("over-cap title must be refused");
+        let OpError::InvalidField { field, .. } = err else {
+            panic!("an over-cap title must name the offending field");
+        };
+        assert_eq!(field, "title");
+    }
 }

@@ -1,13 +1,13 @@
 # 11. Extractors
 
-> **TL;DR.** Three-tier pipeline that derives Entities, Statements, and Relations from Memories. **Extractors are always wired** — every shard runs them on every ENCODE regardless of whether a user schema is declared. All three tiers run **asynchronously** in the per-shard extractor worker — ENCODE enqueues the memory and acknowledges, then the worker runs pattern (regex, tens of microseconds, free) → classifier (pinned model, milliseconds, cheap) → LLM (cached, hundreds of milliseconds to seconds, dollar-significant) over it, with strict cost budgets, schema-validated output, and a per-call cache keyed by `(input_hash, extractor_version, model_version)`. No extractor output exists when ENCODE returns. Persistence is **per-entity gated**: an extracted entity / statement / relation whose type exists in some active schema namespace is persisted; one whose type is undeclared is silently dropped (extraction is best-effort). All three tiers are always-on (no per-tier enable flag — extraction is architectural, like the embedder); a tier that fails to load at shard spawn → `ShardError::ExtractorInitFailed`. All tiers are required to be idempotent. Built-in extractors ship for common entity types, temporal expressions, and basic relations.
+> **TL;DR.** Three-tier pipeline that derives Entities, Statements, and Relations from Memories. **Extractors are always wired** — every shard runs them on every ENCODE regardless of whether a user schema is declared. All three tiers run **asynchronously** in the per-shard extractor worker — ENCODE enqueues the memory and acknowledges, then the worker runs pattern (regex, tens of microseconds, free) → classifier (pinned model, milliseconds, cheap) → LLM (cached, hundreds of milliseconds to seconds, dollar-significant) over it, with per-call cost accounting, schema-validated output, and a per-call cache keyed by `(input_hash, extractor_version, model_version)`. Spend is **tracked, never rationed** — the key is the tenant's. A failing memory retries under a bounded, widening budget and then gives up with a durable terminal audit row rather than retrying forever. No extractor output exists when ENCODE returns. Persistence is **per-entity gated**: an extracted entity / statement / relation whose type exists in some active schema namespace is persisted; one whose type is undeclared is silently dropped (extraction is best-effort). All three tiers are always-on (no per-tier enable flag — extraction is architectural, like the embedder); a tier that fails to load at shard spawn → `ShardError::ExtractorInitFailed`. All tiers are required to be idempotent. Built-in extractors ship for common entity types, temporal expressions, and basic relations.
 
 ## Status
 
 | Field | Value |
 |---|---|
 | Status | Draft |
-| Audience | Implementers of the extractor pipeline; schema authors writing extractor definitions; operators tuning budgets |
+| Audience | Implementers of the extractor pipeline; schema authors writing extractor definitions; operators tuning the pipeline |
 | Voice | Hybrid (rationale + normative) |
 | Depends on | [02. Data Model](../02_data_model/00_purpose.md), [03. Schema DSL](../03_schema/00_purpose.md), [07. Embedding Layer](../07_embedding/00_purpose.md), [10. Metadata + Graph Store](../10_metadata/00_purpose.md) |
 | Referenced by | [13. Retrievers](../13_retrievers/00_purpose.md), [15. Background Workers](../15_background_workers/00_purpose.md) |
@@ -230,7 +230,6 @@ define extractor preference_extraction {
     cache: enabled
     cache_ttl: 90d
     confidence_threshold: 0.7
-    cost_budget: "$0.001 per memory"     # per-call budget; over-budget extractions skipped
     trigger: on encode where memory.kind = episodic
 }
 ```
@@ -242,7 +241,7 @@ LLM semantics:
 - Output is parsed into Entities/Statements/Relations per the target declaration.
 - Result is cached by `(input_hash, extractor_version, model_version)`.
 
-Cost: dollar-significant. The `cost_budget` field is a hard cap; Brain tracks per-memory cost and skips extraction if the projected cost exceeds the budget.
+Cost: dollar-significant, and **tracked rather than capped**. Brain is BYOK — the key that pays belongs to the tenant — so no figure refuses a call. Each call's actual cost is priced from the provider's reported token usage and recorded on the memory's audit row; see [`./01_extractor_tiers.md`](./01_extractor_tiers.md) §22 for the rate table, the two durable spend stores, and the `cost_budget:` field the grammar accepts but nothing enforces.
 
 Determinism: not bit-exact, but heavily mitigated:
 - `temperature = 0` (default; configurable).
@@ -281,9 +280,10 @@ struct ExtractionAudit {
     schema_version: u32,
     started_at: u64,
     completed_at: u64,
-    status: ExtractionStatus,        // Success | Failure | Skipped (cost budget) | Skipped (filter)
+    status: ExtractionStatus,        // Success | Failure | Skipped (filter / duplicate / disabled)
     outputs: Vec<OutputRef>,         // produced statement / entity / relation IDs
-    cost: f32,                       // estimated cost in USD (0 for pattern/classifier)
+    cost_micro_usd: u64,             // billed cost, 1e-6 USD (0 for pattern/classifier)
+    namespace: String,               // tenant billed; "" when unattributed
     error: Option<String>,
     model_metadata: Option<ModelMetadata>,   // for LLM: model version, token counts
 }
@@ -295,13 +295,13 @@ Retention: 90 days default. Configurable.
 
 ## Cost controls
 
-For LLM extractors, three layers of cost control:
+Brain is BYOK: the provider key that pays for an LLM call is the tenant's own. Rationing someone's own key is not Brain's business, so there is no cost ceiling anywhere in the pipeline — no per-call cap, no per-deployment cap, no running total that can refuse a call. What Brain does instead is make the spend visible:
 
-1. **Per-call budget**: declared in the extractor. Skip extraction if projected cost exceeds.
-2. **Per-deployment budget**: global daily/weekly/monthly cap. Enforced by a global counter.
-3. **Selective triggering**: extractors declare `trigger` conditions to skip irrelevant memories.
+1. **Accounting.** Every billed call is priced from the provider's reported token usage and recorded durably — on the memory's `ExtractionAudit` row for the extraction tiers, in the `llm_spend` ledger keyed `(namespace, stage)` for HyPE generation, the HyPE refresh sweep and entity disambiguation. A tenant's total is the sum of both. See [`./01_extractor_tiers.md`](./01_extractor_tiers.md) §22.
+2. **Projection.** The tier logs each call's upper-bound cost before issuing it, so an operator watching a tenant's key sees what is about to be billed. It is an observation; nothing branches on it.
+3. **Selective triggering.** Extractors declare `trigger` conditions, so a memory the extractor was never meant to see costs nothing. This is the only lever that reduces spend, and it works by not making the call rather than by refusing one.
 
-Operators can inspect cost dashboards and adjust extractor configs to stay within budget.
+What *is* bounded is work, not money: a memory whose extraction keeps failing walks a widening retry ladder under a bounded attempt budget and then stops (see [`../15_background_workers/06_typed_graph_workers.md`](../15_background_workers/06_typed_graph_workers.md) §"Bounded extraction retries"). That bound exists so a single memory cannot consume a provider round-trip every cycle forever — a work bound with a cost consequence, not a cost gate.
 
 ## Triggering conditions
 

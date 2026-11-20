@@ -47,8 +47,8 @@ pub const ARENA_FILE: &str = "arena.bin";
 /// `metadata.redb` — substrate + opaque-body redb tables
 pub const METADATA_DB_FILE: &str = "metadata.redb";
 
-/// `wal/` — write-ahead log directory; segments live inside as
-/// `seg-XXXXXXXXXX.wal`.
+/// `wal/` — write-ahead log directory; a segment is named for its sequence
+/// number, zero-padded to ten digits: `0000000001.wal`.
 pub const WAL_DIR: &str = "wal";
 
 // ---------------------------------------------------------------------------
@@ -337,7 +337,7 @@ mod tests {
         let arena = root.join(ARENA_FILE);
         let metadata = root.join(METADATA_DB_FILE);
         let uuid_file = root.join(SHARD_UUID_FILE);
-        let seg = root.join(WAL_DIR).join("seg-0000000001.wal");
+        let seg = root.join(WAL_DIR).join("0000000001.wal");
         std::fs::write(&arena, b"existing-arena-marker").unwrap();
         std::fs::write(&metadata, b"existing-metadata-marker").unwrap();
         std::fs::write(&uuid_file, [0xAB; 16]).unwrap();

@@ -40,7 +40,7 @@ pub mod shared;
 
 // -- Codec layer --
 pub use codec::frame::Frame;
-pub use codec::header::{Header, VERSION};
+pub use codec::header::{Header, SUPPORTED_VERSIONS, VERSION};
 pub use codec::opcode::Opcode;
 
 // -- Envelope layer --

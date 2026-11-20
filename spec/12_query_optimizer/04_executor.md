@@ -4,56 +4,64 @@ The executor takes an `ExecutionPlan` and runs it. This file specifies the execu
 
 ## 1. The executor's interface
 
+There is no `Executor` object. Execution is a set of free functions over a
+cheap-clone context:
+
 ```rust
-struct Executor {
-    storage: StorageHandle,
-    embedder: EmbedderHandle,
-    metrics: MetricsHandle,
+// brain-planner: executor/
+#[derive(Clone)]
+pub struct ExecutorContext {
+    pub embedder: Arc<dyn Dispatcher>,
+    pub index: SharedHnsw,
+    pub metadata: SharedMetadataDb,
+    pub writer: Arc<dyn WriterHandle>,
+    /// `Some` only inside a txn-flagged op's request scope.
+    pub txn: Option<Arc<TxnSnapshot>>,
+    pub caller_namespace: NamespaceId,
+    pub caller_space: SpaceId,
+    // ...
 }
 
-impl Executor {
-    async fn execute(&self, plan: ExecutionPlan) -> Result<Response, ExecError> {
-        match plan {
-            ExecutionPlan::Encode(p) => self.execute_encode(p).await,
-            ExecutionPlan::Recall(p) => self.execute_recall(p).await,
-            // ...
-        }
-    }
-}
+pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext, trace: bool)
+    -> Result<PathResult, ExecError>;
+pub async fn execute_reason(plan: ReasonPlan, ctx: &ExecutorContext, trace: bool)
+    -> Result<ReasonResult, ExecError>;
+// plus `execute_path_stream` / `execute_reason_stream` for the streamed forms.
+// `trace` is what QUERY_TRACE sets (§02 §15).
 ```
 
-The executor is async (returns futures). Each `execute_*` method orchestrates the steps in the plan.
+One `ExecutorContext` is built per shard and cloned per request, where
+`brain-ops`'s dispatcher stamps the authenticated caller's namespace and space
+onto the clone. Every field is an `Arc` or already cheap to clone, so no
+`&mut` and no mutex is involved.
+
+**Only PATH and REASON go through this crate's executor.** ENCODE, RECALL and
+FORGET are planned and executed inside their `brain-ops` handlers
+(`handlers::encode`, `handlers::recall`, `handlers::forget`), which call into
+the retrievers and the writer directly. `ExecutionPlan::Recall` and the RECALL
+plan structs survive only as the shape EXPLAIN renders — see
+[02. Per-operation planning §5](02_per_op_planning.md).
 
 ## 2. Step-by-step execution
 
-Each step in the plan is a discrete async operation:
+Each stage is a discrete async operation, and RECALL's stages are the ones
+worth reading as a sequence:
 
-```rust
-async fn execute_recall(&self, plan: RecallPlan) -> Result<Response> {
-    // Step 1: embed
-    let cue_vector = self.embedder.embed(&plan.embedding.text).await?;
-
-    // Step 2: shard searches in parallel
-    let shard_results = futures::future::try_join_all(
-        plan.shards.iter().map(|s| self.search_shard(s, &cue_vector))
-    ).await?;
-
-    // Step 3: merge
-    let merged = self.merge_results(shard_results, &plan.merge);
-
-    // Step 4: text fetch (if needed)
-    let with_text = if let Some(t) = plan.text_fetch {
-        self.fetch_texts(&merged, t).await?
-    } else {
-        merged
-    };
-
-    // Step 5: response
-    Ok(self.build_response(with_text, plan.response))
-}
+```text
+embed the cue  (one vector, reused by every lane)
+  -> probe the memory HNSW with the resolved ef        [02 §4]
+  -> probe the HyPE, lexical and statement lanes
+  -> fuse the lanes (HyPE boosts a direct hit, never leapfrogs one),
+     then apply the precision floors, which ship at 0 and so neither
+     abstain nor trim until an operator sets them
+  -> resolve metadata rows for the survivors
+  -> fetch texts when the request asked for them
+  -> build the response
 ```
 
-Sequential steps yield to other tasks at await points. Parallel steps (multiple shards) use `try_join_all`.
+Sequential stages yield to other tasks at their await points. Where a stage
+fans out — several lanes, or several shards for a namespace-scoped recall — it
+joins the futures rather than awaiting them in turn.
 
 ## 3. Cooperative yields
 
@@ -103,11 +111,17 @@ For typical requests, the task lives ~10 ms. Brain handles thousands of such tas
 
 The executor uses handles:
 
-- `StorageHandle`: arena, WAL, metadata, HNSW.
-- `EmbedderHandle`: embedder service.
-- `MetricsHandle`: instrumentation.
+- `metadata: SharedMetadataDb` — the shard's redb store.
+- `index: SharedHnsw` — the published HNSW generation.
+- `writer: Arc<dyn WriterHandle>` — the shard's single writer.
+- `embedder: Arc<dyn Dispatcher>` — the embedder service.
+- `vectors` — the per-shard by-slot vector source.
 
-Handles are cheap to clone (Arc-based). Each executor task gets its own handles; no contention.
+They are fields of `ExecutorContext` (§1) rather than separate handle types,
+and every one is an `Arc` or already cheap to clone. A request gets a clone of
+the shard's context with its caller namespace and space stamped on, so there
+is no contention and no handle plumbing per call. Metrics are not a handle:
+the families are process-global statics ([17.01](../17_observability/01_signals.md)).
 
 ## 8. The shared embedder
 
@@ -117,39 +131,36 @@ For a single-CPU embedder: the queue depth determines latency. For a GPU embedde
 
 ## 9. The shared storage
 
-Storage is per-shard; the executor's StorageHandle for a shard talks to that shard's writer/readers.
+Storage is per-shard; a shard's context talks only to that shard's writer and readers.
 
 For reads (RECALL), the executor opens a read transaction (or uses a pre-existing one). Lock-free, MVCC.
 
-For writes (ENCODE, FORGET), the executor sends the operation to the writer task. The writer batches and commits.
+For writes (ENCODE, FORGET), the executor calls the shard's writer handle on its own task. The WAL group commit batches the records; the redb transaction commits them.
 
-## 10. The writer task interaction
+## 10. The writer handle interaction
 
-The writer task is per-shard; only one. The executor sends operations to it via a channel:
+The writer handle is per-shard; only one, and every executor that mutates state calls it:
 
 ```rust
-async fn send_to_writer(&self, op: WriteOp) -> Result<WriteAck> {
-    self.writer_tx.send(op).await?;
-    self.writer_ack.recv().await?
-}
+let ack = writer.submit(write).await?;
 ```
 
-The writer task:
+One `submit` does:
 
-1. Receives operations from the channel.
-2. Batches them (for group commit).
-3. Appends WAL records, fsyncs.
-4. Applies to in-memory state (arena, metadata, HNSW).
-5. Sends acks back to executors.
+1. Idempotency lookup — a replay returns the cached ack and stops here.
+2. Appends its WAL records and awaits the group commit's fsync.
+3. Inserts into the HNSW, before the metadata transaction opens, so a failure here abandons the write with nothing committed.
+4. Opens one redb write transaction, applies every phase, stamps the idempotency row, commits — with no await in that whole region.
+5. Publishes events and enqueues the derivation stages.
 
-Multiple executors can be waiting for acks; each gets its own.
+Multiple executors can be inside `submit` at once; each awaits its own ack. Step 4 is the one they cannot share, and the executor's single thread is what keeps them out of it rather than a queue.
 
 ## 11. The cancellation behavior
 
 If a request is canceled (client disconnects), the executor:
 
 - For in-flight reads: cancels them (Glommio cancels the future).
-- For in-flight writes: doesn't cancel — the write is already in the writer task's queue, and the writer will complete it. The ack is just dropped.
+- For in-flight writes: doesn't cancel — the write's own detached task runs to completion. The ack is just dropped.
 
 This means writes can't be canceled mid-flight. They complete and become durable, even if the client gave up. Brain doesn't have an "undo" for in-flight writes.
 

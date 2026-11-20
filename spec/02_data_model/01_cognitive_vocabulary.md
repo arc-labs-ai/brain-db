@@ -120,7 +120,7 @@ Alternatives rejected:
 
 ### Tombstone
 
-The lifecycle state of a forgotten-but-not-yet-reclaimed slot. Standard distributed-systems vocabulary. Alternatives:
+The lifecycle state of a forgotten-but-not-yet-reclaimed memory. Standard distributed-systems vocabulary. Alternatives:
 
 - **Deleted** — too final; tombstones are recoverable.
 - **Hidden** — too mild; tombstones are excluded from queries.
@@ -130,18 +130,18 @@ The lifecycle state of a forgotten-but-not-yet-reclaimed slot. Standard distribu
 
 ### Reclaimed
 
-The lifecycle state after a tombstoned slot has been reused. Standard memory-management term.
+The terminal lifecycle state, reached when a tombstoned memory's grace window passes and its row and content are deleted. Standard memory-management term — though note that Brain reclaims the *memory*, not the slot id, which is retired rather than handed to a new occupant.
 
 ## 6. The implementation-flavored words Brain hides
 
 Some words exist in the implementation but don't surface in the public vocabulary:
 
-- **Slot** — the fixed-size cell in the arena. Internal; clients don't see slots.
-- **Arena** — the mmap'd file. Internal; clients don't know it exists.
+- **Slot** — the fixed-size cell in the arena, and the slot id packed into a `MemoryId`. Internal; clients don't see slots.
+- **Arena** — the mmap'd file holding the at-rest vector image. Internal; clients don't know it exists.
 - **WAL** — the write-ahead log. Internal; clients see no logs.
 - **HNSW** — the ANN algorithm. Internal; clients don't choose it.
 - **Vector** — the 384-dim float array. Internal; clients send text.
-- **Epoch** — the lock-free reclamation marker. Internal; clients don't know about epochs.
+- **Epoch** — the published generation of the vector index. Internal; clients don't know about epochs.
 
 This isn't accidental. Brain is opinionated about hiding implementation. A client that exposed `slot_id` directly would let users build code that depends on internal stability Brain does not promise. By keeping these words inside, Brain keeps the right to evolve them.
 

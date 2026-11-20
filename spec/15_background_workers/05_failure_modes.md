@@ -65,18 +65,17 @@ What can go wrong with the background workers and how Brain responds.
 
 **Operator action.** Address memory pressure: scale up RAM, reduce shard count, etc.
 
-## 6. The consolidation LLM is unavailable
+## 6. The consolidation summarizer is unavailable
 
-**Failure mode.** The configured LLM service for consolidation is down.
+Consolidation reaches its model through a `Summarizer`, which reports two distinguishable conditions. There is no circuit breaker: the distinction below is what a breaker would otherwise approximate, and it is exact.
 
-**Detection.** LLM call returns errors.
+**No backend at all.** The worker checks `Summarizer::enabled()` once per cycle and returns immediately when it is false, so a deployment without consolidation does no clustering work rather than discovering the absence one `summarize` call in. The substrate default returns `SummarizerError::Disabled`, which also ends the pass.
 
-**Response.**
-- The current cycle's consolidations fail; the worker logs.
-- The next cycle tries again.
-- If sustained, the LLM's circuit breaker opens; the worker pauses for a longer interval.
+**Backend present but failing.** `SummarizerError::Failed` is logged at `trace` and that one cluster is skipped; the pass continues with the next cluster, and the next cycle tries again. A cluster whose summary comes back empty is skipped the same way. Nothing escalates and nothing pauses — a failing summarizer costs the summaries it could not produce and nothing else.
 
-**Operator action.** Restore the LLM service. Or disable consolidation if the LLM is permanently gone.
+Consolidation is billed to the tenant whose memories it consolidates: the namespace is passed to `summarize` rather than inferred, and clustering is strictly within one `(namespace, space, session)`, so every call has exactly one owner.
+
+**Operator action.** Restore the summarization backend, or leave it disabled — consolidation is a no-op without one, not a failure.
 
 ## 7. (Removed) The decay worker created database contention
 
@@ -213,7 +212,3 @@ After a Brain restart with WAL replay:
 - The first few cycles may catch up on backlog.
 
 This is by design; no special handling needed. Workers are robust to restarts.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

@@ -1,8 +1,9 @@
 //! HNSW parameters with Brain's defaults.
 //!
-//! `M=16, ef_construction=200, ef_search=64, ef_search_max=500`. PQ
-//! compression is part of the core implementation and is not
-//! exposed as a knob — every corpus uses HNSW+PQ.
+//! These are the HNSW knobs; the shipped defaults are
+//! `M=16, ef_construction=200, ef_search=64, ef_search_max=500`. Indexes run
+//! at full precision — product quantization lives in [`crate::pq`] and is not
+//! driven from these parameters.
 
 use thiserror::Error;
 
@@ -49,11 +50,12 @@ pub struct IndexParams {
     /// Weaviate derives `ef = k * 8` for the same query, clamped to the same
     /// 500 ceiling we already use.
     ///
-    /// **The default is 1, which reproduces today's behaviour exactly.** It is
-    /// a knob first and a default change second: the factor raises read cost
-    /// in proportion to `k`, so the recall it buys has to be measured before
-    /// the default moves. That measurement needs the retrieval-only eval
-    /// (§6 of the accuracy plan) which does not exist yet.
+    /// **The default is 1, so `ef` is derived as `k * 1`: the beam equals the
+    /// requested `k` and incurs no extra read cost.** It is a knob first and a
+    /// default change second: the factor raises read cost in proportion to `k`,
+    /// so the recall it buys must be measured before the default moves. That
+    /// measurement needs a retrieval-only recall evaluation, which does not
+    /// exist yet.
     ///
     /// # Most of the accepted range does nothing at the shipped defaults
     ///

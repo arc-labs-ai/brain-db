@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn graph_payload_round_trips_through_framing() {
-        // Sub-task 15.2: a opaque-body record carries an opaque body
+        // An opaque-body record carries an opaque body
         // through the full framing layer (header + payload + footer +
         // CRC). The framing is byte-identical to substrate records; only
         // the `record_type` byte and body interpretation differ.

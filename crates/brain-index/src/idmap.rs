@@ -56,7 +56,7 @@ impl IdMap {
     /// exercise the `u32::MAX` overflow guard without performing
     /// billions of inserts.
     #[cfg(test)]
-    pub(crate) fn with_next_id(next_id: u32) -> Self {
+    fn with_next_id(next_id: u32) -> Self {
         Self {
             forward: HashMap::new(),
             reverse: HashMap::new(),

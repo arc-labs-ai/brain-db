@@ -14,7 +14,7 @@ curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
 curl -s -X POST http://127.0.0.1:9092/v1/snapshots -d '{"name":"my-snapshot"}'
 ```
 
-Health and metrics live on a separate **metrics listener** (default port `9091`): `GET /healthz` for liveness and `GET /metrics` for the Prometheus scrape. Database-wide counters (shard count, WAL size, HNSW node counts, request rates) are exposed by `GET /metrics`; a dedicated JSON stats-summary route is not yet implemented.
+Health and metrics live on a separate **public listener** (`[server] metrics_addr`, default `127.0.0.1:9091`), which carries exactly three routes and no authentication: `GET /healthz` (liveness — is the accept loop running), `GET /readyz` (readiness — `200` with `{"ready":true,"shards":N,"alive":N}` iff the node has at least one shard and every shard's executor is still draining, `503` otherwise), and `GET /metrics` (Prometheus text exposition). Database-wide counters (shard count, WAL size, HNSW node counts, request rates) come from `GET /metrics`; a dedicated JSON stats-summary route is not implemented.
 
 ## 2. The categories
 
@@ -40,22 +40,34 @@ The exposition includes `brain_shards_total`, `brain_wal_size_bytes`, `brain_hns
 
 ### Health
 
+Two probes, answering different questions
+(`crates/brain-server/src/admin/handlers/healthz.rs`,
+`crates/brain-server/src/admin/handlers/readyz.rs`):
+
 ```bash
-curl -s http://127.0.0.1:9091/healthz
+# Liveness: is the admin accept loop running? Plain text, always 200.
+$ curl -s http://127.0.0.1:9091/healthz
+ok
+
+# Readiness: can this node serve data-plane traffic right now? JSON.
+$ curl -s http://127.0.0.1:9091/readyz
+{"ready":true,"shards":4,"alive":4}
 ```
 
-Returns overall health, including per-shard state:
+`/readyz` is the one worth wiring to a load balancer. A node is ready only if it
+has at least one shard and **every** shard's executor loop is still draining
+requests; it flips to `503` the moment a shard thread dies, so the orchestrator
+drains the node instead of routing requests that can never be served. The body
+is JSON on both the `200` and the `503`, so a probe can log which shards are
+missing.
 
-```json
-{
-  "status": "healthy",
-  "shards": {
-    "<uuid_1>": "healthy",
-    "<uuid_2>": "healthy"
-  },
-  "version": "1.0.0"
-}
-```
+Shards are recovered and spawned before the admin listener binds, so a fresh
+process is ready as soon as `/readyz` answers at all — the probe earns its keep
+after startup, not during it.
+
+Neither probe reports per-shard identity or a version string. `/healthz`
+returns the two bytes `ok`; the build version is on `brain_build_info` in the
+metrics exposition, and per-shard detail is on `GET /v1/shards`.
 
 ### Info
 
@@ -83,7 +95,7 @@ Parameters (all optional; lists are comma-separated): `namespace=<id>`, `space=<
 curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
 ```
 
-Triggers an immediate HNSW rebuild on the shard. Async; the call returns a job handle immediately. Track progress via the `brain_hnsw_rebuild_progress_pct` metric on the metrics listener.
+Triggers an immediate HNSW rebuild on the shard. Async; the call returns a job handle immediately. There is no progress metric — `brain_hnsw_rebuild_*` is a deferred family (`crates/brain-server/src/metrics/mod.rs:31-40`). Watch `brain_worker_cycles_total{worker="hnsw_maintenance"}` and `brain_hnsw_node_count` for the shard, and `brain_hnsw_tombstone_ratio` to confirm the rebuild did its job.
 
 ### GC
 
@@ -98,9 +110,23 @@ Compacts the metadata store (redb); may take minutes for large stores. In-place 
 ### Create a snapshot
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/snapshots -d '{"name":"my-snapshot"}'
-# Per-shard: add "shard":"<uuid>" to the body.
+# Snapshot shard 3. The shard is a QUERY parameter, not a body field.
+curl -s -X POST 'http://127.0.0.1:9092/v1/snapshots?shard=3'
+# → {"id":7,"shard":3}
 ```
+
+Three things to get right here, because each fails quietly:
+
+- The route takes **no request body**. There is no `name` parameter —
+  a snapshot is identified by a numeric `id` the shard assigns, returned in the
+  response (`crates/brain-server/src/admin/handlers/snapshot/create.rs:22-24`).
+- `shard` is a **query parameter** and a **shard index**, parsed as an integer;
+  a non-numeric value is rejected with `invalid shard`.
+- **Omitting `shard=` snapshots shard 0**, it does not snapshot every shard.
+  The parser defaults to zero rather than erroring
+  (`crates/brain-server/src/admin/query.rs:11-23`), so a command meant for the
+  whole deployment silently covers one shard. Loop over the indices from
+  `GET /v1/shards`.
 
 Creates a consistent snapshot. Brain:
 
@@ -118,10 +144,16 @@ Lists snapshots:
 
 ```json
 [
-  {"name": "pre-upgrade-2026-05-07", "shard": "<uuid>", "size_gb": 12.3, "created_at": "..."},
-  {"name": "scheduled-daily-001", "shard": "<uuid>", "size_gb": 12.3, "created_at": "..."}
+  {"shard": 0, "id": 7, "taken_at_unix_nanos": 1763212800000000000, "size_bytes": 13207224320},
+  {"shard": 1, "id": 4, "taken_at_unix_nanos": 1763190000000000000, "size_bytes": 12884901888}
 ]
 ```
+
+The listing walks every shard, so it is the one snapshot route that is not
+scoped by `?shard=`. A single shard failing to list fails the whole request
+with a generic `500` — the per-shard error carries filesystem paths and redb
+internals, so it is logged rather than returned
+(`crates/brain-server/src/admin/handlers/snapshot/list.rs:43-53`).
 
 ### Restore a snapshot
 
@@ -145,34 +177,88 @@ Removes a snapshot.
 
 ```bash
 curl -s http://127.0.0.1:9092/v1/workers
-# Per-shard: curl -s 'http://127.0.0.1:9092/v1/workers?shard=<uuid>'
+# One shard: curl -s 'http://127.0.0.1:9092/v1/workers?shard=0'
 ```
 
-Returns worker status:
+`shard` is the **integer index**, not a UUID. The response is an object with a
+`workers` array (`crates/brain-server/src/admin/handlers/worker/list.rs:83-100`):
 
 ```json
-[
-  {"shard": "...", "name": "decay", "status": "running", "last_run": "...", "next_run": "..."},
-  {"shard": "...", "name": "consolidation", "status": "running", "last_run": "...", "next_run": "..."}
-]
+{"workers":[
+  {"shard":0,"name":"decay","cycles":41,"processed":1203,"errors":0,"panics":0,
+   "pending_work":0,"last_cycle_duration_ms":7,"last_run_unix":1763164800,
+   "paused":false}
+]}
 ```
 
-### Stop / start a worker
+There is no `next_run`: a worker's next tick is its interval from `last_run`,
+and the fields that matter for triage are `pending_work` (the backlog estimate),
+`errors` / `panics`, and `paused`.
+
+That interval is **fixed in the binary, per worker kind**
+(`crates/brain-workers/src/config.rs:152-228`), and is not operator-tunable.
+The `[workers] *_interval_sec` keys are parsed and validated, but eleven of
+them reach no scheduler at all — a test enumerates that set and asserts its
+size so the condition stays deliberate
+(`crates/brain-server/src/config/mod.rs:2078-2145`). The scheduler also reads
+the interval once before entering its loop
+(`crates/brain-workers/src/scheduler.rs:377`, `:462`), so nothing moves a
+cadence at runtime either. Reading one of those keys back from
+`GET /v1/config` reports what the file says, **not** what the scheduler is
+doing.
+
+The levers that do work are the three control actions below.
+
+The fan-out is **partial-tolerant and says so**. If some shards answer and
+others fail, the status is `207 Multi-Status` with a top-level `errors` array
+naming the shards that dropped out — a short worker list never arrives as a
+clean `200`. Only an all-shard failure is a `500`.
+
+### Stop / start / run a worker now
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/stop  -d '{"shard":"<uuid>"}'
-curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/start -d '{"shard":"<uuid>"}'
+curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/stop
+curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/start
+curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/run-now
 ```
 
-Pauses or resumes a specific worker. The path is `/v1/workers/{name}/{action}`.
+The path is `/v1/workers/{name}/{action}`, with `{action}` one of `stop`,
+`start`, `run-now`. It takes **no body and no shard parameter**: each shard runs
+its own instance of every worker, and the action applies to all of them. The
+reply reports how many shards took it:
 
-### Run a worker now
+```json
+{"worker":"decay","action":"stop","applied_shards":4,"errors":[]}
+```
+
+`stop` pauses the loop's work, not the loop: the worker keeps ticking on its
+fixed interval and can be resumed without restarting the shard. `start` also
+kicks the wake channel, so a resumed worker runs its next cycle without waiting
+out the current sleep.
+
+`run-now` is the only way to make a worker act off-cadence. For a worker whose
+interval is longer than an incident — the snapshot worker's hour, the daily
+sweepers — `run-now` is the remedy, not a config change.
+
+#### The C0 guard — four workers that cannot be paused
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/workers/decay/run-now -d '{"shard":"<uuid>"}'
+$ curl -s -X POST http://127.0.0.1:9092/v1/workers/extractor/stop
+worker `extractor` is C0 always-on and cannot be paused, resumed, or run on demand
 ```
 
-Triggers an immediate cycle.
+`extractor`, `forget_cascade`, `schema_migration` and `statement_embed` are
+refused with `403` for every one of the three actions
+(`crates/brain-server/src/admin/handlers/worker/mod.rs:31-36`). They are the
+write/read-coherence set: extraction populates the typed graph that
+entity-anchored reads fuse over, and pausing it makes those reads quietly answer
+from an incomplete graph. A degradation nothing reports is worse than a refusal.
+
+Every other registered worker is controllable, and the controllable set is
+derived from the scheduler's **live registration snapshot** rather than a
+hand-maintained list — so a newly added maintenance worker is controllable the
+day it lands, and no C0 worker becomes pausable by being left off a list. An
+unregistered name is a `400`, distinct from the C0 `403`.
 
 ## 7. Configuration operations
 
@@ -188,23 +274,32 @@ Reloads configuration from disk. Some settings reload live; others require resta
 
 ```bash
 curl -s http://127.0.0.1:9092/v1/config
-# Single key: curl -s 'http://127.0.0.1:9092/v1/config?key=workers.decay.interval'
+# Single key / subtree: curl -s 'http://127.0.0.1:9092/v1/config?key=workers.consolidation_interval_sec'
 ```
 
 Returns the current configuration. With a `key` parameter, returns just that key.
 
-### Set configuration
+### Set configuration — one key
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/config \
-  -d '{"key":"workers.decay.interval","value":"30m"}'
+curl -s -X POST 'http://127.0.0.1:9092/v1/config?key=monitoring.logging.level&value=debug'
 ```
 
-The route is `POST /v1/config` — the same path as the `GET`, distinguished by method. There is no `/v1/config/set`. `POST /v1/config/reload` is a separate route that re-reads the configuration file.
+The route is `POST /v1/config` — the same path as the `GET`, distinguished by
+method, and it takes the key and value as **query parameters**, not a JSON
+body. There is no `/v1/config/set`.
 
-Updates a setting. Live reload if supported; otherwise persisted for next restart.
+**Exactly one key is settable at runtime: `monitoring.logging.level`**
+(`crates/brain-server/src/admin/handlers/config/set.rs:27`). Every other key
+answers `501` with a `restart-required` marker naming the key, rather than a
+no-op success — a configuration call that reports success and changes nothing
+is worse than a refusal, because the operator stops looking. Change anything
+else in the file and restart.
 
-Not all settings are runtime-tunable. Brain logs which take effect immediately vs which need restart.
+Raising the log level live is the case that has to work without a restart: it
+is what an operator reaches for while an incident is in progress, and
+restarting the process to see more of it destroys the state they were trying to
+observe. `BRAIN_LOG` sets the same filter at boot.
 
 ## 8. Audit operations
 
@@ -230,71 +325,88 @@ Exports audit logs to a file. For long-term archival.
 
 ## 9. Diagnostic operations
 
-### Profile
+### Profile — not implemented
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile \
-  -d '{"shard":"<uuid>","duration":"30s","output":"/tmp/profile.pb"}'
+$ curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile   # → 501
 ```
 
-Captures a CPU profile of the shard's executor. Output is pprof-compatible.
+The route is registered and answers `501` with a deferred marker
+(`crates/brain-server/src/admin/handlers/diagnostics/profile.rs`): an in-process
+CPU profiler for a shard's Glommio executor is not built.
+
+Profile from outside the process instead — `perf record` / `perf top` against
+the `brain-shard-<id>` thread, which is named precisely so it can be picked out
+(`crates/brain-server/src/shard/mod.rs:3113`). A shard is pinned to one core
+when a cpu is assigned, so the thread and the core are interchangeable targets.
 
 ### Debug snapshot
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/debug-snapshot \
-  -d '{"shard":"<uuid>","output":"/tmp/debug.json"}'
+curl -s 'http://127.0.0.1:9092/v1/diagnostics/debug-snapshot?shard=3' > debug.json
 ```
 
-Captures a detailed runtime snapshot:
+A **GET** with a query parameter — no body, and no `output` field; the snapshot
+comes back in the response, so redirect it to a file yourself
+(`crates/brain-server/src/admin/router.rs:270-274`,
+`crates/brain-server/src/admin/handlers/diagnostics/debug_snapshot.rs:1-2`).
 
-- Active tasks.
-- Pending requests.
-- In-memory state summary.
-- Recent errors.
-- Worker statuses.
+It captures a **partial** snapshot of one shard's runtime state — pending
+requests from the dispatch-queue depth, and the in-memory state summary. As
+with the other `?shard=` routes, omitting the parameter reports on shard 0.
 
-For deep debugging.
+For deep debugging, paired with `perf` from outside the process.
 
 ## 10. Space operations
 
-### List spaces
+### List spaces / space stats — not implemented
 
 ```bash
-curl -s http://127.0.0.1:9092/v1/spaces
-# Per-shard: curl -s 'http://127.0.0.1:9092/v1/spaces?shard=<uuid>'
+$ curl -s http://127.0.0.1:9092/v1/spaces               # → 501
+$ curl -s http://127.0.0.1:9092/v1/spaces/<space-id>    # → 501
 ```
 
-Lists the spaces on the shard.
+Both reads answer `501` with a `phase-11/space-index` marker
+(`crates/brain-server/src/admin/handlers/space/list.rs`, and the `GET` arm of
+`.../space/by_id.rs:58-61`). They need a `space_id` secondary index that does
+not exist: every table key is already space-prefixed, which is what makes
+isolation structural, but a prefix lets you scan *within* one space, not
+enumerate the set of them.
 
-### Space stats
+That is the cost of the key layout, and it is the right trade — the alternative
+is a second index on the write path for a read only an operator makes. Until
+it exists, per-space numbers come from the tenant's own wire reads
+(`SPACE_*`, `MEMORY_LIST`) rather than from the admin plane.
 
-```bash
-curl -s http://127.0.0.1:9092/v1/spaces/<space-id>
-```
-
-Per-space stats:
-
-```json
-{
-  "space_id": "...",
-  "space": "support-bot:user123",
-  "shard": "...",
-  "memory_count": 12345,
-  "session_count": 5,
-  "oldest_memory_age": "30d"
-}
-```
-
-`space` is the structured string the registry stored; `space_id` is the `UUIDv5` derived from it, which is what routing and every table key use. The derivation is one-way, so the registry row is the only place the string survives.
+A space's own identity is still one-way: `space_id` is the `UUIDv5` derived
+from the structured string, so the registry row is the only place the string
+survives.
 
 ### Delete a space
 
 ```bash
-curl -s -X DELETE http://127.0.0.1:9092/v1/spaces/<space-id> -d '{"confirm":true}'
+# By derived space id (the UUIDv5 that routing and every table key use):
+curl -s -X DELETE 'http://127.0.0.1:9092/v1/spaces/<space-uuid>?namespace=acme'
+
+# By the external string ingress hashes, in its canonical hyphenated form:
+curl -s -X DELETE 'http://127.0.0.1:9092/v1/spaces/<external-uuid>?namespace=acme&by=external'
 ```
 
-Deletes every row under that space — the GDPR-erasure path. Destructive; the server requires the confirmation field. The tenant-facing equivalent is the `SPACE_DELETE` opcode (`0x0072`), which acts on the caller's *own* effective space and needs no admin secret.
+Deletes every row under that space — the GDPR-erasure path.
+
+**`?namespace=` is required**, and the call is a `400` without it
+(`crates/brain-server/src/admin/handlers/space/by_id.rs:99-107`). The namespace
+is the outer half of the `(namespace, space)` scope key, and the wire path takes
+it from the caller's key — the admin plane has no key to take it from, so it has
+to be named. Add `?by=external` when the path segment is the external string
+rather than the derived id.
+
+There is **no confirmation field and no dry run**: the route takes no body, and
+the only guard is possession of the admin secret. Treat the call itself as the
+point of no return.
+
+The tenant-facing equivalent is the `SPACE_DELETE` opcode (`0x0072`), which acts
+on the caller's *own* effective space and needs no admin secret.
 
 There is no agent-level admin surface. "Agent" names the client application, not a storage scope; the thing an operator lists, inspects and deletes is a **space**.
 
@@ -324,55 +436,85 @@ curl -s -X POST http://127.0.0.1:9092/v1/memories/<memory-id>/restore
 curl -s http://127.0.0.1:9092/v1/schema/review
 
 # Rebuild a named index (distinct from /v1/rebuild-ann, which rebuilds the HNSW).
-curl -s -X POST http://127.0.0.1:9092/v1/rebuild -d '{"index":"memory_text","shard":"<uuid>"}'
+curl -s -X POST 'http://127.0.0.1:9092/v1/rebuild?index=tantivy_memory&shard=3'
 ```
+
+Both parameters are query parameters. `index` is required — omitting it answers
+`400` — and takes one of exactly seven values
+(`crates/brain-server/src/admin/handlers/rebuild.rs:89-95`):
+
+```
+memory_hnsw, entity_hnsw, hype_hnsw, statement_question_hnsw,
+all, tantivy_memory, tantivy_statement
+```
+
+An unrecognised name answers `400` with that list, so a typo is caught; a
+missing `shard=` is not, and rebuilds shard 0. The response reports what was
+done: `{"index":"tantivy_memory","entries":N,"elapsed_ms":M,"shard":3}`.
 
 ## 11. Shard operations
 
 ### List shards
 
 ```bash
-curl -s http://127.0.0.1:9092/v1/shards
+$ curl -s http://127.0.0.1:9092/v1/shards
+{"shards":[{"index":0,"shard_id":0},{"index":1,"shard_id":1}]}
 ```
 
-Lists shards.
+The one implemented shard route (`crates/brain-server/src/admin/handlers/shard/list.rs`).
+It reports the shards this process is running and their runtime ids, and nothing
+else — no per-shard counters. Per-shard storage numbers come from `/metrics`,
+where every storage and HNSW gauge carries a `shard` label.
 
-### Create a shard (rare)
+### Create / delete a shard — not implemented
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/shards -d '{"logical_id":16}'
+$ curl -s -X POST   http://127.0.0.1:9092/v1/shards        # → 501
+$ curl -s -X DELETE http://127.0.0.1:9092/v1/shards/0      # → 501
 ```
 
-Creates a new shard. Used during expansion.
+Both routes are registered and both answer `501` with a deferred marker
+(`crates/brain-server/src/admin/handlers/shard/create.rs`,
+`.../shard/delete.rs`). The shard tier is not elastic: `shard_count` is settled
+when the data directory is created, recorded in `layout.json`, and checked on
+every open — a `MemoryId` encodes its shard, so serving a directory with a
+different count would route every existing id at a shard that does not hold it.
 
-### Delete a shard (rare)
-
-```bash
-curl -s -X DELETE http://127.0.0.1:9092/v1/shards/<shard-id> -d '{"confirm":true}'
-```
-
-Deletes a shard. All its data is gone. Used during decommission.
+The routes exist rather than 404 so that an operator reaching for expansion is
+told it is deferred instead of guessing whether they have the path wrong.
+Changing the shard count means a new data directory and a re-ingest; see
+[`spec/16_sharding/05_rebalancing_and_replication.md`](../16_sharding/05_rebalancing_and_replication.md) §2.
 
 ## 12. Authentication
 
 Admin operations require an admin token, passed as a bearer header:
 
 ```bash
-export BRAIN_ADMIN_TOKEN="..."
-curl -s -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN" http://127.0.0.1:9092/v1/shards
+export BRAIN__ADMIN__TOKEN="..."
+curl -s -H "Authorization: Bearer $BRAIN__ADMIN__TOKEN" http://127.0.0.1:9092/v1/shards
 ```
 
-The admin token is the operator **admin secret**: it gates the whole admin surface, including key provisioning. Multiple tokens supported (per-operator). Mint and revoke agent-facing keys via the API-key routes — these require the admin secret in the `Authorization` header:
+**One secret, compared whole.** `[admin] token` (or `BRAIN__ADMIN__TOKEN`) is a single string; every `/v1/*` route is gated on a constant-time comparison against it (`crates/brain-server/src/admin/router.rs:64-79`). There is no per-operator token list and no scoping: a request either presents that one secret and may do everything on the admin plane, or it is refused. Fail-closed — with no token configured the listener does not start.
+
+Mint and revoke data-plane keys through the API-key routes, which need the same secret:
 
 ```bash
-# Mint a scoped key (creates/interns the namespace, binds the agent + permissions)
+# Mint a key. space_id_hex is required: it is the 16-byte space id as 32 hex
+# chars, and it is what every operation issued on this key gets stamped with.
 curl -s -X POST http://127.0.0.1:9092/v1/api-keys \
-  -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN" \
-  -d '{"namespace":"acme","agent":"support-bot","permissions":["encode","recall"]}'
-# Revoke a key
-curl -s -X DELETE http://127.0.0.1:9092/v1/api-keys/<key-id> \
-  -H "Authorization: Bearer $BRAIN_ADMIN_TOKEN"
+  -H "Authorization: Bearer $BRAIN__ADMIN__TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"space_id_hex":"00000000000000000000000000000001",
+       "namespace":"acme",
+       "permissions":["ENCODE","RECALL"]}'
+# Revoke a key, by the hex of its BLAKE3 hash
+curl -s -X DELETE http://127.0.0.1:9092/v1/api-keys/<key-hash-hex> \
+  -H "Authorization: Bearer $BRAIN__ADMIN__TOKEN"
 ```
+
+`permissions` is either a list of names or a raw `u32` bitfield. Names are matched case-insensitively and cover the single bits — `ENCODE`, `RECALL`, `FORGET`, `LINK`, `SCHEMA_UPLOAD`, `ADMIN`, `ACT_AS`, `LLM_CREDENTIAL` — plus the bundles `STANDARD_SPACE`, `READ_ONLY`, `READ_WRITE` and `FULL` (`crates/brain-server/src/admin/handlers/api_keys.rs:72-98`). An unknown name is refused rather than silently dropped. `org_id_hex`, `user_id_hex`, `may_act` and `service_principal` are optional. The reply carries the raw secret once and never again.
+
+There is no `agent` field: a key names a space, and the space is the identity.
 
 #### The `ACT_AS` permission and the `may_act` allowlist
 
@@ -390,8 +532,8 @@ the `api_keys` table (alongside `namespace`, `agent`, `permissions`), and Brain
 honors an `act_as` request **only** when the target namespace is in this
 allowlist. A principal can never act as a namespace outside its `may_act` set,
 and the mint never crosses its own namespace boundary — cross-tenant isolation
-stays absolute (`OQ-V2-4`). K8s's unbounded impersonation is a documented
-God-credential; the `may_act` allowlist is the bound that avoids inheriting it.
+stays absolute. Unbounded impersonation, as Kubernetes offers it, is a
+God-credential; the `may_act` allowlist is the bound that avoids it.
 
 A single **`"*"` entry** is the **wildcard grant**: the principal may act as
 *any* namespace. This is the trusted multi-tenant front-door case — a
@@ -403,8 +545,8 @@ The wildcard is the deliberate, auditable escape hatch for a front-door
 principal; it does **not** relax the per-request effective-identity isolation —
 each `act_as` op still runs strictly as its own `(namespace, space)`, and the
 dual-principal audit records that a `"*"` service key performed it. Grant `"*"`
-only to a genuinely trusted service principal (mTLS/private transport, per
-`R6`), never to a tenant key.
+only to a genuinely trusted service principal, reached over mTLS or a private
+transport, never to a tenant key.
 
 ```jsonc
 // Mint an edge/gateway service principal that may act for two named tenants:
@@ -452,37 +594,68 @@ This closes the agent-impersonation surface: an authenticated client at one `age
 
 The key-issuance flow + the `api_keys` redb table live under `crates/brain-server/src/admin/api_key.rs`; operator UX for key rotation rides on the `/v1/api-keys` routes.
 
-## 13. The dry-run mode
+## 13. Dry runs
 
-For destructive operations, pass a `dry_run` field:
+**The destructive admin routes have no dry-run mode.** `DELETE /v1/spaces/{id}`
+takes no body and no `dry_run` parameter; it deletes. Possession of the admin
+secret is the whole of the authorization, which is the other reason the listener
+stays on loopback.
 
-```bash
-curl -s -X DELETE http://127.0.0.1:9092/v1/spaces/<space-id> -d '{"dry_run":true}'
-# Would delete: 12345 memories, 5 sessions, 67890 edges
+Where a dry run does exist, it is a worker control, not an HTTP flag. Two
+sweepers take `dry_run` in their config sections and log what they would reclaim
+instead of reclaiming it — the supersession sweeper
+(`crates/brain-server/src/config/mod.rs:664`) and the predicate GC
+(`:711`):
+
+```toml
+[workers.predicate_gc]
+enabled = true
+dry_run = true
+
+[workers.supersession_sweeper]
+enabled = true
+dry_run = true
 ```
 
-Shows what would happen without doing it.
+That is where a dry run earns its keep — a sweeper decides what to delete from a
+rule, and the rule is what an operator wants to check. An explicit `DELETE` of a
+named space has nothing to preview: the operator already named the thing.
 
 ## 14. Scriptable output
 
-Responses are JSON by default — ready for scripts. Pipe through `jq` for human-readable or tabular shaping:
+Responses are JSON — ready for scripts. Pipe through `jq`:
 
 ```bash
-curl -s http://127.0.0.1:9092/v1/shards | jq .
-curl -s http://127.0.0.1:9092/v1/shards | jq -r '.[] | [.shard, .memory_count] | @tsv'
+curl -s -H "Authorization: Bearer $BRAIN__ADMIN__TOKEN" \
+  http://127.0.0.1:9092/v1/shards | jq .
+# {"shards":[{"index":0,"shard_id":0}, ...]}
 ```
+
+Note the shape: `/v1/shards` returns an **object** with a `shards` array, not a
+bare array, so `jq '.shards[]'` rather than `jq '.[]'`. Per-shard counters are
+not in it — those are `/metrics` gauges carrying a `shard` label.
 
 ## 15. Output piping
 
-The admin API composes with standard Unix tools:
+The admin API composes with standard Unix tools. Every call needs the bearer
+header, so export it once:
 
 ```bash
-curl -s http://127.0.0.1:9092/v1/spaces \
-  | jq -r '.[].space_id' \
-  | xargs -I{} curl -s http://127.0.0.1:9092/v1/spaces/{}
+export BRAIN__ADMIN__TOKEN="..."
+auth=(-H "Authorization: Bearer $BRAIN__ADMIN__TOKEN")
+
+# Which workers are registered, and when each last ran:
+curl -s "${auth[@]}" http://127.0.0.1:9092/v1/workers | jq .
+
+# Run every reclamation worker now, in order:
+for w in idempotency_cleanup wal_retention slot_reclamation; do
+  curl -s "${auth[@]}" -X POST "http://127.0.0.1:9092/v1/workers/$w/run-now"
+done
 ```
 
-Standard Unix tool composition.
+Fan-out over spaces is not scriptable from here: the space listing is `501`
+(§10), so there is no id list to pipe. Per-space numbers come from the tenant's
+own wire reads.
 
 ## 16. The "background ops" tracking
 
@@ -493,11 +666,15 @@ $ curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"
 {"job":"abc-123","status":"started"}
 ```
 
-Job progress for rebuilds is exposed through the `brain_hnsw_rebuild_progress_pct` metric on the metrics listener; richer per-job status polling is future work.
+The returned job id is not pollable: there is no per-job status route and no rebuild-progress metric. Completion is inferred from `brain_hnsw_tombstone_ratio` dropping for that shard. Per-job status polling is future work.
 
 ## 16.5. Identity binding for admin keys
 
-Admin operations authenticate with admin keys, which are separate from client agent keys. Each admin key carries explicit scope claims — which agents it may inspect, which shards it may rebuild, whether it may snapshot, whether it may restore. The server derives the operator's permissions from the key at AUTH time; admin calls do not accept an arbitrary `space_id` or `shard_id` override that bypasses the claims.
+Admin operations authenticate with the operator admin secret, which is a different object from a data-plane API key: the secret is a bearer token on an HTTP listener, a data-plane key is presented in the wire AUTH frame and resolves to `(namespace, space, permissions)`.
+
+The admin secret carries **no scope claims**. It is unscoped by construction — one secret, all of `/v1/*` — which is why the listener stays on loopback and why a leaked admin token is a full deployment compromise rather than a bounded one. Scoped operator credentials would need a second credential store on the admin plane and do not exist.
+
+The consequence for callers: an admin route's `space_id` or `shard_id` argument is not checked against claims, because there are none to check against. It is checked for existence and range only.
 
 This means an admin key issued for "inspect agent A only" cannot rebuild agent B's HNSW even if the request syntactically allows it; the server rejects the operation at dispatch with an authorization error. Audit logs record the key's claims alongside the operation, so post-incident review can verify that an action was authorized at the moment it ran, not just that the operator had access at some point.
 

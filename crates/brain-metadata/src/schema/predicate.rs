@@ -11,11 +11,13 @@ use brain_core::PredicateId;
 use brain_core::{Predicate, StatementKind};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
+use crate::tables::contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
 use crate::tables::predicate::{
     PredicateDefinition, SchemaOrigin, PREDICATES_BY_SCOPE_TABLE, PREDICATES_TABLE,
-    PREDICATE_EMBEDDINGS_TABLE,
+    PREDICATE_EMBEDDINGS_TABLE, PREDICATE_ID_HIGH_WATER_TABLE,
 };
 use crate::tables::scope::{space_chain, DeclScope, SPACE_BASE};
+use crate::tables::statement::STATEMENTS_BY_PREDICATE_ID_TABLE;
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -100,6 +102,49 @@ impl From<u8> for ObjectConstraint {
             entity_type_id: 0,
         }
     }
+}
+
+/// One predicate declaration an incoming schema document re-states, resolved
+/// to the exact storage form an intern would write. A replace preserves a
+/// re-stated declaration so statements already written against it keep
+/// resolving to its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PredicateRedeclaration {
+    pub name: String,
+    pub kind_constraint: Option<StatementKind>,
+    pub object_constraint: ObjectConstraint,
+    pub subject_entity_type_id: u32,
+    pub description: String,
+    pub is_stateful: bool,
+}
+
+impl PredicateRedeclaration {
+    fn matches(&self, row: &PredicateDefinition) -> bool {
+        row_matches_constraints(
+            row,
+            self.kind_constraint,
+            self.object_constraint,
+            self.subject_entity_type_id,
+            self.is_stateful,
+        )
+    }
+}
+
+fn row_matches_constraints(
+    row: &PredicateDefinition,
+    kind_constraint: Option<StatementKind>,
+    object_constraint: ObjectConstraint,
+    subject_entity_type_id: u32,
+    is_stateful: bool,
+) -> bool {
+    // Schema version is judged separately so an unchanged declaration can
+    // advance versions without changing its id. Subject type is compared
+    // because it changes which statements the declaration permits.
+    row.kind_constraint == crate::tables::predicate::encode_kind_constraint(kind_constraint)
+        && row.object_type_constraint_byte == object_constraint.object_type_byte
+        && row.object_entity_type_id == object_constraint.entity_type_id
+        && row.subject_entity_type_id == subject_entity_type_id
+        && row.is_stateful == is_stateful
 }
 
 // ---------------------------------------------------------------------------
@@ -789,7 +834,7 @@ pub fn predicate_intern_with_subject(
     // Idempotency / adoption probe.
     //
     // Three cases for a pre-existing row:
-    // 1. Constraints match exactly → idempotent re-registration,
+    // 1. Semantic constraints match → idempotent re-registration,
     //    return existing id.
     // 2. Row's origin is `ImplicitFromWrite` → adopt it: upgrade
     //    to `SchemaDeclared` at this schema_version with the new
@@ -813,30 +858,34 @@ pub fn predicate_intern_with_subject(
         }
     };
     if let Some((id_raw, row)) = probed {
-        // Constraint-only equality — version is treated separately so
-        // an unchanged predicate carried into a new schema version is a
-        // no-op rather than a conflict.
-        let constraints_match = row.kind_constraint
-            == crate::tables::predicate::encode_kind_constraint(kind_constraint)
-            && row.object_type_constraint_byte == object_type_constraint_byte
-            && row.object_entity_type_id == object_entity_type_id
-            // Without this, re-uploading a schema that ADDS `subject:
-            // Entity<T>` to an existing predicate would match as
-            // "unchanged" and the new constraint would never reach the
-            // row — the upload would report success and enforce nothing.
-            && row.subject_entity_type_id == subject_entity_type_id
-            && row.description == description
-            && row.is_stateful == is_stateful;
+        // Only semantic constraints decide identity, so an unchanged
+        // predicate carried into a new schema version is a no-op rather
+        // than a conflict. Schema version and description are judged
+        // separately below because neither changes what already-stored
+        // statements mean.
+        let constraints_match = row_matches_constraints(
+            &row,
+            kind_constraint,
+            ObjectConstraint {
+                object_type_byte: object_type_constraint_byte,
+                entity_type_id: object_entity_type_id,
+            },
+            subject_entity_type_id,
+            is_stateful,
+        );
 
-        if constraints_match && row.schema_version == schema_version {
+        if constraints_match
+            && row.schema_version == schema_version
+            && row.description == description
+        {
             return Ok(PredicateId::from(id_raw));
         }
 
-        // Constraints match but schema_version moved forward: bump the
-        // stored row's version (and the SchemaDeclared origin payload)
-        // in-place so v2 schemas that keep v1's predicates verbatim can
-        // be uploaded cleanly. Same row id is reused so already-written
-        // statements that reference it stay valid.
+        // When constraints match but the schema version advances or the
+        // documentation is corrected, re-stamp the stored row in place,
+        // updating its version and the SchemaDeclared origin payload. This
+        // lets v2 schemas that keep v1's predicates verbatim upload cleanly;
+        // reusing the same row id keeps already-written statements valid.
         if constraints_match && row.origin().is_schema_declared() {
             let pred = Predicate {
                 id: PredicateId::from(id_raw),
@@ -895,19 +944,8 @@ pub fn predicate_intern_with_subject(
         });
     }
 
-    // Fresh registration. Allocate id = max(existing) + 1.
-    let next_id_raw: u32 = {
-        let t = wtxn.open_table(PREDICATES_TABLE)?;
-        let mut max: u32 = 0;
-        for entry in t.iter()? {
-            let (k, _) = entry?;
-            let id = k.value();
-            if id > max {
-                max = id;
-            }
-        }
-        max.checked_add(1).expect("PredicateId space exhausted")
-    };
+    // Fresh registration.
+    let next_id_raw: u32 = predicate_next_id(wtxn)?;
 
     let pred = Predicate {
         id: PredicateId::from(next_id_raw),
@@ -933,6 +971,81 @@ pub fn predicate_intern_with_subject(
     }
 
     Ok(PredicateId::from(next_id_raw))
+}
+
+/// Allocate the next `PredicateId`, advancing the persisted high-water mark.
+///
+/// An id is never reused. Deleting a predicate removes its row but not the
+/// statements written against it: those still carry the number, so handing
+/// the same number to the next name interned would silently change what
+/// every one of them asserts. The mark only rises, so a dropped id is
+/// retired for the life of the store.
+///
+/// The mark is a single row because `PREDICATES_TABLE` is keyed on the bare
+/// id — one id space serves every namespace and space in the store, which is
+/// the same space the superseded `max(existing) + 1` scan covered.
+///
+/// With no mark stored the store predates the table, so the mark is seeded
+/// from the highest id anything in the store still witnesses, not merely the
+/// highest live registry key. A store may already have dropped its
+/// highest-numbered predicate while statements, contradiction records, or a
+/// leftover embedding still carry that number.
+fn predicate_next_id(wtxn: &WriteTransaction) -> Result<u32, PredicateOpError> {
+    let stored: Option<u32> = wtxn
+        .open_table(PREDICATE_ID_HIGH_WATER_TABLE)?
+        .get(&())?
+        .map(|v| v.value());
+    let high_water: u32 = match stored {
+        Some(mark) => mark,
+        None => predicate_id_seed(wtxn)?,
+    };
+    let next = high_water
+        .checked_add(1)
+        .expect("PredicateId space exhausted");
+    {
+        let mut t = wtxn.open_table(PREDICATE_ID_HIGH_WATER_TABLE)?;
+        t.insert(&(), &next)?;
+    }
+    Ok(next)
+}
+
+/// Find the highest predicate id that any durable table still witnesses.
+/// Stores without a high-water mark may have retired ids whose registry rows
+/// are gone, so a live registry row is not enough to identify the next safe
+/// number. The registry and embeddings count when they still have the
+/// highest witness, while statements and contradiction records pin ids that
+/// may outlive the registry row.
+fn predicate_id_seed(wtxn: &WriteTransaction) -> Result<u32, PredicateOpError> {
+    let mut seed: u32 = 0;
+    let highest_registry: Option<u32> = wtxn
+        .open_table(PREDICATES_TABLE)?
+        .last()?
+        .map(|(k, _)| k.value());
+    if let Some(v) = highest_registry {
+        seed = seed.max(v);
+    }
+    let highest_embedding: Option<u32> = wtxn
+        .open_table(PREDICATE_EMBEDDINGS_TABLE)?
+        .last()?
+        .map(|(k, _)| k.value());
+    if let Some(v) = highest_embedding {
+        seed = seed.max(v);
+    }
+    {
+        let t = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            seed = seed.max(k.value().2);
+        }
+    }
+    {
+        let t = wtxn.open_table(STATEMENT_CONTRADICTION_AUDIT_TABLE)?;
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            seed = seed.max(k.value().1);
+        }
+    }
+    Ok(seed)
 }
 
 /// Resolve a predicate in `scope`, coining it if nothing resolves.
@@ -971,20 +1084,9 @@ pub fn predicate_intern_or_get(
         return Ok(PredicateId::from(id_raw));
     }
 
-    // Fresh allocation. Same `max + 1` scheme as `predicate_intern`
+    // Fresh allocation. Shares the high-water mark with `predicate_intern`
     // so id ordering stays globally monotone across both write paths.
-    let next_id_raw: u32 = {
-        let t = wtxn.open_table(PREDICATES_TABLE)?;
-        let mut max: u32 = 0;
-        for entry in t.iter()? {
-            let (k, _) = entry?;
-            let id = k.value();
-            if id > max {
-                max = id;
-            }
-        }
-        max.checked_add(1).expect("PredicateId space exhausted")
-    };
+    let next_id_raw: u32 = predicate_next_id(wtxn)?;
 
     let pred = Predicate {
         id: PredicateId::from(next_id_raw),
@@ -1194,18 +1296,25 @@ fn decode_candidate(row: &PredicateDefinition, bytes: &[u8]) -> PredicateConsoli
     )
 }
 
-/// Drop every schema-declared predicate row in `namespace`. Implicit-
-/// from-write rows are preserved — they belong to the open-vocabulary
-/// world, not the declared schema. Used by `SCHEMA_REPLACE`: callers
-/// invoke this before re-running `apply_schema_definitions` with the
-/// new schema so the destructive replace doesn't trip the constraint
-/// conflict check on same-name diverging declarations.
-///
-/// Returns the number of rows removed.
-pub fn predicate_drop_schema_declared(
+/// One schema-declared predicate a replace would remove. The same victim set
+/// drives both the destructive drop and the in-use safety gate, so the gate
+/// can never disagree with the drop it is guarding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedPredicate {
+    /// Identifier of the registry row that would be removed.
+    pub id: PredicateId,
+    /// Declaration name used in the schema document.
+    pub name: String,
+    /// Qualified name used by the scope index.
+    pub qname: String,
+}
+
+/// Select schema-declared predicates a replace would remove from `scope`.
+pub fn predicate_schema_declared_victims(
     wtxn: &WriteTransaction,
     scope: DeclScope<'_>,
-) -> Result<usize, PredicateOpError> {
+    redeclared: &[PredicateRedeclaration],
+) -> Result<Vec<DroppedPredicate>, PredicateOpError> {
     let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
 
@@ -1217,39 +1326,55 @@ pub fn predicate_drop_schema_declared(
     // declared them. Scanning therefore made a base REPLACE take every
     // sibling space's declarations with it, and a space REPLACE take the
     // tenant's — the opposite of what an overlay is for.
-    //
-    // Collect first so we don't mutate while iterating.
-    let victims: Vec<(u32, String)> = {
-        let idx = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE)?;
-        let t = wtxn.open_table(PREDICATES_TABLE)?;
-        let mut out = Vec::new();
-        for entry in idx.iter()? {
-            let (k, v) = entry?;
-            let (q, sp) = k.value();
-            if sp != space {
-                continue;
-            }
-            let id = v.value();
-            let Some(row) = t.get(&id)?.map(|g| g.value()) else {
-                continue;
-            };
-            // The qname carries a namespace, so one scope's slice of the
-            // index still spans every tenant; the row is what settles it.
-            if row.namespace == namespace && row.origin().is_schema_declared() {
-                out.push((id, q.to_string()));
-            }
+    let idx = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE)?;
+    let t = wtxn.open_table(PREDICATES_TABLE)?;
+    let mut out = Vec::new();
+    for entry in idx.iter()? {
+        let (k, v) = entry?;
+        let (q, sp) = k.value();
+        if sp != space {
+            continue;
         }
-        out
-    };
+        let id = v.value();
+        let Some(row) = t.get(&id)?.map(|g| g.value()) else {
+            continue;
+        };
+        if row.namespace == namespace
+            && row.origin().is_schema_declared()
+            && !redeclared
+                .iter()
+                .any(|entry| entry.name == row.name && entry.matches(&row))
+        {
+            out.push(DroppedPredicate {
+                id: PredicateId::from(id),
+                name: row.name,
+                qname: q.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Drop the scope's schema-declared predicates except declarations the
+/// incoming document re-states unchanged. Preserving those rows keeps
+/// statements written against them named after the replace.
+///
+/// Returns the number of rows removed.
+pub fn predicate_drop_schema_declared(
+    wtxn: &WriteTransaction,
+    scope: DeclScope<'_>,
+    redeclared: &[PredicateRedeclaration],
+) -> Result<usize, PredicateOpError> {
+    let victims = predicate_schema_declared_victims(wtxn, scope, redeclared)?;
     let count = victims.len();
     {
         let mut t = wtxn.open_table(PREDICATES_TABLE)?;
-        for (id, _) in &victims {
-            t.remove(id)?;
+        for victim in &victims {
+            t.remove(&victim.id.raw())?;
         }
     }
-    for (id, q) in &victims {
-        scope_remove_entry(wtxn, q.as_str(), *id)?;
+    for victim in &victims {
+        scope_remove_entry(wtxn, victim.qname.as_str(), victim.id.raw())?;
     }
     Ok(count)
 }
@@ -1383,10 +1508,14 @@ pub fn predicate_reclaim_orphans(
         // not match the namespace its predicate was coined under, so scoping
         // this to the predicate's own namespace would miss live references
         // and delete a row something still points at.
-        let live =
-            crate::statement::crud::statement_any_live_by_predicate(wtxn, PredicateId::from(id))
-                .map_err(|e| PredicateOpError::Dependency(format!("live statement probe: {e}")))?;
-        if live {
+        // Tombstoned statements still reference the predicate through history
+        // and a possible soft-FORGET restore, so they also keep it from GC.
+        let referenced = crate::statement::crud::statement_any_reference_by_predicate(
+            wtxn,
+            PredicateId::from(id),
+        )
+        .map_err(|e| PredicateOpError::Dependency(format!("statement reference probe: {e}")))?;
+        if referenced {
             summary.still_referenced += 1;
             continue;
         }
@@ -1425,6 +1554,7 @@ pub fn predicate_reclaim_orphans(
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+    use crate::tables::contradiction::{contradiction_outcome, ContradictionAudit};
     use crate::tables::fresh_db;
     use redb::ReadableDatabase;
 
@@ -1477,6 +1607,211 @@ mod tests {
         let id = predicate_intern_or_get(&wtxn, DeclScope::space(ns, space), name, 0, T0).unwrap();
         wtxn.commit().unwrap();
         id
+    }
+
+    /// Without this preservation probe, replacing an unchanged declaration
+    /// would remove its row and orphan statements that still carry its id.
+    #[test]
+    fn a_replace_that_restates_a_predicate_keeps_its_identifier() {
+        let (_dir, db) = open_db();
+        let id = intern_at(&db, SPACE_BASE, "acme", "alpha");
+        let wtxn = db.begin_write().unwrap();
+        let dropped = predicate_drop_schema_declared(
+            &wtxn,
+            DeclScope::base("acme"),
+            &[PredicateRedeclaration {
+                name: "alpha".into(),
+                kind_constraint: Some(StatementKind::Fact),
+                object_constraint: ObjectConstraint::ANY,
+                subject_entity_type_id: 0,
+                description: String::new(),
+                is_stateful: false,
+            }],
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            declares_exactly(&db, SPACE_BASE, "acme", "alpha"),
+            Some(id.raw())
+        );
+        let rtxn = db.begin_read().unwrap();
+        assert!(predicate_get(&rtxn, id).unwrap().is_some());
+    }
+
+    /// A description is documentation, so correcting it preserves the declaration's row and id.
+    #[test]
+    fn a_description_only_predicate_replace_preserves_row_and_updates_prose() {
+        let (_dir, db) = open_db();
+        let id = intern_at(&db, SPACE_BASE, "acme", "alpha");
+        let wtxn = db.begin_write().unwrap();
+        let dropped = predicate_drop_schema_declared(
+            &wtxn,
+            DeclScope::base("acme"),
+            &[PredicateRedeclaration {
+                name: "alpha".into(),
+                kind_constraint: Some(StatementKind::Fact),
+                object_constraint: ObjectConstraint::ANY,
+                subject_entity_type_id: 0,
+                description: "corrected documentation".into(),
+                is_stateful: false,
+            }],
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            declares_exactly(&db, SPACE_BASE, "acme", "alpha"),
+            Some(id.raw())
+        );
+
+        let wtxn = db.begin_write().unwrap();
+        let restamped = predicate_intern_with_subject(
+            &wtxn,
+            DeclScope::base("acme"),
+            "alpha",
+            Some(StatementKind::Fact),
+            ObjectConstraint::ANY,
+            0,
+            1,
+            "corrected documentation",
+            false,
+            T0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(restamped, id);
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(PREDICATES_TABLE).unwrap();
+        assert_eq!(
+            t.get(&id.raw()).unwrap().unwrap().value().description,
+            "corrected documentation"
+        );
+    }
+
+    /// A same-version re-intern must write corrected documentation instead of
+    /// retaining stale prose.
+    #[test]
+    fn a_same_version_predicate_reintern_restamps_description() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let first = predicate_intern_with_subject(
+            &wtxn,
+            DeclScope::base("acme"),
+            "alpha",
+            Some(StatementKind::Fact),
+            ObjectConstraint::ANY,
+            0,
+            1,
+            "original documentation",
+            false,
+            T0,
+        )
+        .unwrap();
+        let second = predicate_intern_with_subject(
+            &wtxn,
+            DeclScope::base("acme"),
+            "alpha",
+            Some(StatementKind::Fact),
+            ObjectConstraint::ANY,
+            0,
+            1,
+            "new documentation",
+            false,
+            T0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(second, first);
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(PREDICATES_TABLE).unwrap();
+        assert_eq!(
+            t.get(&first.raw()).unwrap().unwrap().value().description,
+            "new documentation"
+        );
+    }
+
+    /// Without selective preservation, an omitted declaration would be kept
+    /// or its retired id could be handed to a later name.
+    #[test]
+    fn a_replace_that_omits_a_predicate_retires_its_identifier() {
+        let (_dir, db) = open_db();
+        let alpha = intern_at(&db, SPACE_BASE, "acme", "alpha");
+        let beta = intern_at(&db, SPACE_BASE, "acme", "beta");
+        let wtxn = db.begin_write().unwrap();
+        assert_eq!(
+            predicate_drop_schema_declared(
+                &wtxn,
+                DeclScope::base("acme"),
+                &[PredicateRedeclaration {
+                    name: "alpha".into(),
+                    kind_constraint: Some(StatementKind::Fact),
+                    object_constraint: ObjectConstraint::ANY,
+                    subject_entity_type_id: 0,
+                    description: String::new(),
+                    is_stateful: false,
+                }]
+            )
+            .unwrap(),
+            1
+        );
+        wtxn.commit().unwrap();
+        assert_eq!(
+            declares_exactly(&db, SPACE_BASE, "acme", "alpha"),
+            Some(alpha.raw())
+        );
+        assert_eq!(declares_exactly(&db, SPACE_BASE, "acme", "beta"), None);
+        let gamma = intern_at(&db, SPACE_BASE, "acme", "gamma");
+        assert!(gamma.raw() > beta.raw());
+    }
+
+    /// Without constraint matching, a changed declaration would preserve the
+    /// old row and make old statements silently mean the new constraint.
+    #[test]
+    fn a_replace_that_changes_an_object_constraint_does_not_reuse_the_identifier() {
+        let (_dir, db) = open_db();
+        let old = intern_at(&db, SPACE_BASE, "acme", "alpha");
+        let wtxn = db.begin_write().unwrap();
+        assert_eq!(
+            predicate_drop_schema_declared(
+                &wtxn,
+                DeclScope::base("acme"),
+                &[PredicateRedeclaration {
+                    name: "alpha".into(),
+                    kind_constraint: Some(StatementKind::Fact),
+                    object_constraint: ObjectConstraint::from(2),
+                    subject_entity_type_id: 0,
+                    description: String::new(),
+                    is_stateful: false,
+                }]
+            )
+            .unwrap(),
+            1
+        );
+        wtxn.commit().unwrap();
+        assert_eq!(declares_exactly(&db, SPACE_BASE, "acme", "alpha"), None);
+        let new_id = {
+            let wtxn = db.begin_write().unwrap();
+            let id = predicate_intern_with_subject(
+                &wtxn,
+                DeclScope::base("acme"),
+                "alpha",
+                Some(StatementKind::Fact),
+                ObjectConstraint::from(2),
+                0,
+                1,
+                "",
+                false,
+                T0,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        assert_ne!(new_id, old);
+        assert!(new_id.raw() > old.raw());
     }
 
     /// Declaring in a space is an override; MENTIONING a name in a space is
@@ -1550,7 +1885,7 @@ mod tests {
         let overlay = intern_at(&db, SPACE_A, "acme", "owns");
 
         let wtxn = db.begin_write().unwrap();
-        let dropped = predicate_drop_schema_declared(&wtxn, DeclScope::base("acme")).unwrap();
+        let dropped = predicate_drop_schema_declared(&wtxn, DeclScope::base("acme"), &[]).unwrap();
         wtxn.commit().unwrap();
 
         assert_eq!(dropped, 1, "only the base's own declaration is a victim");
@@ -1572,7 +1907,7 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         let dropped =
-            predicate_drop_schema_declared(&wtxn, DeclScope::space("acme", SPACE_A)).unwrap();
+            predicate_drop_schema_declared(&wtxn, DeclScope::space("acme", SPACE_A), &[]).unwrap();
         wtxn.commit().unwrap();
 
         assert_eq!(dropped, 1);
@@ -1612,7 +1947,7 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         let dropped =
-            predicate_drop_schema_declared(&wtxn, DeclScope::space("acme", SPACE_A)).unwrap();
+            predicate_drop_schema_declared(&wtxn, DeclScope::space("acme", SPACE_A), &[]).unwrap();
         wtxn.commit().unwrap();
 
         assert_eq!(dropped, 1);
@@ -2546,6 +2881,236 @@ mod tests {
                 ("brain:alpha".to_string(), 1),
                 ("brain:zeta".to_string(), 1),
             ]
+        );
+    }
+
+    /// Predicate identifiers remain retired after a declaration is removed,
+    /// so statements carrying the retired number can never change meaning.
+    #[test]
+    fn dropping_a_predicate_retires_its_identifier() {
+        let (_dir, db) = open_db();
+        let dropped = intern_at(&db, SPACE_BASE, "acme", "alpha");
+
+        {
+            let wtxn = db.begin_write().unwrap();
+            assert_eq!(
+                predicate_drop_one(&wtxn, DeclScope::base("acme"), "alpha").unwrap(),
+                Some(dropped),
+                "dropping a declared predicate returns its identifier"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        let next = intern_at(&db, SPACE_BASE, "acme", "delta");
+        assert_ne!(
+            next.raw(),
+            dropped.raw(),
+            "a new declaration must not reuse a retired identifier"
+        );
+        assert!(
+            next.raw() > dropped.raw(),
+            "new predicate identifiers must advance past retired identifiers"
+        );
+    }
+
+    /// Predicate identifiers increase monotonically across independent
+    /// declaration and removal transactions, preserving stable references.
+    #[test]
+    fn repeated_predicate_churn_keeps_identifiers_strictly_increasing() {
+        let (_dir, db) = open_db();
+        let mut ids = Vec::new();
+
+        for i in 0..4 {
+            let name = format!("churn_{i}");
+            let id = intern_at(&db, SPACE_BASE, "acme", &name);
+            ids.push(id.raw());
+
+            let wtxn = db.begin_write().unwrap();
+            assert_eq!(
+                predicate_drop_one(&wtxn, DeclScope::base("acme"), &name).unwrap(),
+                Some(id),
+                "each churned declaration must be removed by its identifier"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        assert!(
+            ids.windows(2).all(|pair| pair[1] > pair[0]),
+            "predicate identifiers must increase across committed churn"
+        );
+        assert_eq!(
+            ids.len(),
+            ids.iter().copied().collect::<HashSet<_>>().len(),
+            "predicate identifiers must not repeat"
+        );
+    }
+
+    /// A store without a recorded high-water mark continues numbering above
+    /// every predicate already persisted on disk, avoiding identifier clashes.
+    #[test]
+    fn seeding_predicates_without_a_high_water_mark_continues_above_live_ids() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(7, "alpha"), (12, "beta")] {
+                let pred = Predicate {
+                    id: PredicateId::from(id_raw),
+                    namespace: "acme".to_string(),
+                    name: name.to_string(),
+                    kind_constraint: None,
+                    object_type_constraint_byte: 0,
+                    object_entity_type_id: 0,
+                    subject_entity_type_id: 0,
+                    schema_version: 0,
+                    description: String::new(),
+                    is_stateful: false,
+                };
+                let row = PredicateDefinition::from_predicate(&pred, T0);
+                {
+                    let mut t = wtxn.open_table(PREDICATES_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = intern_at(&db, SPACE_BASE, "acme", "gamma");
+        assert_eq!(
+            next.raw(),
+            13,
+            "a store without a mark must continue above its highest live identifier"
+        );
+        assert_ne!(
+            next.raw(),
+            7,
+            "the new identifier must not clash with seeded rows"
+        );
+        assert_ne!(
+            next.raw(),
+            12,
+            "the new identifier must not clash with seeded rows"
+        );
+    }
+
+    /// A retired predicate identifier still carried by statements remains
+    /// unavailable when a store has no recorded high-water mark.
+    #[test]
+    fn seeding_predicates_without_a_high_water_mark_clears_a_dropped_but_referenced_id() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(1, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+                let pred = Predicate {
+                    id: PredicateId::from(id_raw),
+                    namespace: "acme".to_string(),
+                    name: name.to_string(),
+                    kind_constraint: None,
+                    object_type_constraint_byte: 0,
+                    object_entity_type_id: 0,
+                    subject_entity_type_id: 0,
+                    schema_version: 0,
+                    description: String::new(),
+                    is_stateful: false,
+                };
+                let row = PredicateDefinition::from_predicate(&pred, T0);
+                {
+                    let mut t = wtxn.open_table(PREDICATES_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            {
+                let mut idx = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE).unwrap();
+                for index in 0..3u8 {
+                    let mut stmt_bytes = [0u8; 16];
+                    stmt_bytes[15] = index;
+                    idx.insert(&(1u32, SPACE_BASE, 5u32, stmt_bytes), &())
+                        .unwrap();
+                }
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = intern_at(&db, SPACE_BASE, "acme", "epsilon");
+        assert_eq!(
+            next.raw(),
+            6,
+            "a retired identifier that statements still carry must not be handed to a new name"
+        );
+        assert_ne!(
+            next.raw(),
+            5,
+            "a retired identifier that statements still carry must not be handed to a new name"
+        );
+    }
+
+    /// Every durable predicate witness contributes to the seed used without
+    /// a recorded high-water mark.
+    #[test]
+    fn seeding_predicates_without_a_high_water_mark_counts_every_table_that_witnesses_an_id() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(1, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+                let pred = Predicate {
+                    id: PredicateId::from(id_raw),
+                    namespace: "acme".to_string(),
+                    name: name.to_string(),
+                    kind_constraint: None,
+                    object_type_constraint_byte: 0,
+                    object_entity_type_id: 0,
+                    subject_entity_type_id: 0,
+                    schema_version: 0,
+                    description: String::new(),
+                    is_stateful: false,
+                };
+                let row = PredicateDefinition::from_predicate(&pred, T0);
+                {
+                    let mut t = wtxn.open_table(PREDICATES_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            {
+                let mut t = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE).unwrap();
+                t.insert(&7u32, &[1u8, 2u8][..]).unwrap();
+            }
+            {
+                let mut t = wtxn
+                    .open_table(STATEMENT_CONTRADICTION_AUDIT_TABLE)
+                    .unwrap();
+                let audit = ContradictionAudit {
+                    audit_id_bytes: [1u8; 16],
+                    subject_bytes: [0u8; 16],
+                    predicate_id: 9,
+                    contradicting_statement_ids: Vec::new(),
+                    detected_at_unix_nanos: 0,
+                    resolved_at_unix_nanos: None,
+                    outcome: contradiction_outcome::PENDING,
+                };
+                t.insert(&([0u8; 16], 9u32), &audit).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = intern_at(&db, SPACE_BASE, "acme", "zeta");
+        assert_eq!(
+            next.raw(),
+            10,
+            "a witness outside the registry still retires its identifier"
         );
     }
 }

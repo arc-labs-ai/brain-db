@@ -145,7 +145,7 @@ SUBSCRIBE is the only streaming primitive. It opens a long-lived connection that
 
 - The client provides filters.
 - Brain streams events that match.
-- Events are delivered in WAL order (per shard).
+- Events are delivered in WAL order (per shard): strictly on replay, and on the live tail an event arriving out of order ends the stream with `ERROR(Overloaded)` rather than being reordered.
 
 The client controls flow with windowing and acknowledgments.
 

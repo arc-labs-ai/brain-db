@@ -256,7 +256,7 @@ impl AmbiguityResolverWorker {
             // the candidate.
             let source = EntityId::from(proposal.source_entity);
             let candidate = EntityId::from(proposal.candidate_entity);
-            let new_score = match self.recheck_score(source, candidate) {
+            let new_score = match self.recheck_score(source, candidate).await {
                 Ok(s) => s,
                 Err(reason) => {
                     if let Some(m) = &self.metrics {
@@ -337,7 +337,7 @@ impl AmbiguityResolverWorker {
     /// candidate is no longer in the HNSW (it was tombstoned / merged
     /// away after the proposal was filed); `Err(reason)` for transient
     /// embedder / HNSW failures.
-    fn recheck_score(&self, source: EntityId, candidate: EntityId) -> Result<f32, String> {
+    async fn recheck_score(&self, source: EntityId, candidate: EntityId) -> Result<f32, String> {
         // Load the source's canonical name to embed.
         let source_name = {
             let db = self.metadata.as_ref();
@@ -354,9 +354,8 @@ impl AmbiguityResolverWorker {
                 None => return Err("source entity missing".into()),
             }
         };
-        let vector = self
-            .embedder
-            .embed(&source_name)
+        let vector = brain_ops::embedding::embed_off_reactor(&self.embedder, &source_name)
+            .await
             .map_err(|e| format!("embedder failed: {e}"))?;
         let hits = {
             let hnsw = self.entity_hnsw.read();
@@ -499,7 +498,6 @@ impl Worker for AmbiguityResolverWorker {
 // recheck path operates over a single shard's entity HNSW (mixed-type
 // indexing is acceptable because the HNSW is per-shard). Suppress the
 // unused import in release builds via this dummy reference.
-#[allow(dead_code)]
 fn _ensure_entity_type_referenced() -> EntityTypeId {
     EntityTypeId(0)
 }
@@ -538,6 +536,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex as StdMutex;
+
+    fn glommio_run<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        glommio::LocalExecutorBuilder::default()
+            .name("ambiguity-test")
+            .spawn(move || async move { f().await })
+            .expect("spawn glommio test executor")
+            .join()
+            .expect("test executor join")
+    }
 
     const NOW: u64 = 1_700_000_000_000_000_000;
 
@@ -701,124 +713,200 @@ mod tests {
 
     #[test]
     fn tick_promotes_proposal_when_confidence_grows() {
-        // Seed Acme + Acme Holdings far apart (proposal cosine ~0.75),
-        // then after the proposal is filed move Acme Holdings' HNSW
-        // vector very close to Acme's so the recompute clears 0.95.
-        let fx = fixture();
-        let acme_v = shared_axis(10, 11, 1.0, 0.0);
-        let acme = seed_entity(&fx.metadata, &fx.hnsw, "Acme", acme_v);
-        let original_holdings_v = shared_axis(10, 11, 0.75, 0.661);
-        let holdings = seed_entity(&fx.metadata, &fx.hnsw, "Acme Holdings", original_holdings_v);
+        glommio_run(|| async {
+            // Seed Acme + Acme Holdings far apart (proposal cosine ~0.75),
+            // then after the proposal is filed move Acme Holdings' HNSW
+            // vector very close to Acme's so the recompute clears 0.95.
+            let fx = fixture();
+            let acme_v = shared_axis(10, 11, 1.0, 0.0);
+            let acme = seed_entity(&fx.metadata, &fx.hnsw, "Acme", acme_v);
+            let original_holdings_v = shared_axis(10, 11, 0.75, 0.661);
+            let holdings =
+                seed_entity(&fx.metadata, &fx.hnsw, "Acme Holdings", original_holdings_v);
 
-        // Proposal: holdings → acme, original cosine 0.75. Use real
-        // wall-clock now so the worker's age check doesn't trip
-        // expiry.
-        let pid = enqueue(&fx.metadata, holdings, acme, 0.75, real_now_unix_nanos());
+            // Proposal: holdings → acme, original cosine 0.75. Use real
+            // wall-clock now so the worker's age check doesn't trip
+            // expiry.
+            let pid = enqueue(&fx.metadata, holdings, acme, 0.75, real_now_unix_nanos());
 
-        // Simulate "context grew": the worker re-embeds "Acme Holdings"
-        // and finds it almost identical to Acme. Replace the embedder's
-        // mapping for "Acme Holdings" with a near-clone of acme_v, and
-        // re-insert that same vector into the HNSW for the holdings id.
-        // The HNSW already has the original vector at this id; insert
-        // returns an error on duplicate, so the simplest way to flip
-        // the cosine is to rebuild the holdings HNSW row by deleting it
-        // and re-inserting. HNSW lacks a delete API in this codebase,
-        // so we instead make the embedder return the new "close"
-        // vector AND we seed a NEW entity to act as the promoted
-        // candidate. The neat alternative: keep holdings unchanged in
-        // the HNSW (so the search returns it at the original cosine)
-        // and use the "embedder returns a vector that now puts
-        // holdings at 0.97 from acme" path — embedder controls the
-        // query vector, not the stored vector.
-        //
-        // Pre-recheck embedder mapping wasn't set, so the worker would
-        // fall back to its hash fallback. Set "Acme Holdings" to a
-        // vector that, when used as the query vector, scores high
-        // against acme_v in the HNSW. Since cosine(query, acme_v) =
-        // dot(query, acme_v) for unit vectors and acme_v = (1, 0) on
-        // (10, 11), we set query = (0.98, 0.199) → cosine ≈ 0.98.
-        let close_v = shared_axis(10, 11, 0.98, 0.199);
-        fx.embedder.set("Acme Holdings", close_v);
+            // Simulate "context grew": the worker re-embeds "Acme Holdings"
+            // and finds it almost identical to Acme. Replace the embedder's
+            // mapping for "Acme Holdings" with a near-clone of acme_v, and
+            // re-insert that same vector into the HNSW for the holdings id.
+            // The HNSW already has the original vector at this id; insert
+            // returns an error on duplicate, so the simplest way to flip
+            // the cosine is to rebuild the holdings HNSW row by deleting it
+            // and re-inserting. HNSW lacks a delete API in this codebase,
+            // so we instead make the embedder return the new "close"
+            // vector AND we seed a NEW entity to act as the promoted
+            // candidate. The neat alternative: keep holdings unchanged in
+            // the HNSW (so the search returns it at the original cosine)
+            // and use the "embedder returns a vector that now puts
+            // holdings at 0.97 from acme" path — embedder controls the
+            // query vector, not the stored vector.
+            //
+            // Pre-recheck embedder mapping wasn't set, so the worker would
+            // fall back to its hash fallback. Set "Acme Holdings" to a
+            // vector that, when used as the query vector, scores high
+            // against acme_v in the HNSW. Since cosine(query, acme_v) =
+            // dot(query, acme_v) for unit vectors and acme_v = (1, 0) on
+            // (10, 11), we set query = (0.98, 0.199) → cosine ≈ 0.98.
+            let close_v = shared_axis(10, 11, 0.98, 0.199);
+            fx.embedder.set("Acme Holdings", close_v);
 
-        // But the worker reads the *candidate* (acme) score in the HNSW
-        // result list. The HNSW's neighbour set when queried with
-        // close_v sees acme_v at cosine 0.98 and original_holdings_v
-        // at cosine cosine(close_v, original_holdings_v) ≈ ...
-        // The worker walks `hits` looking for `candidate == acme`, so
-        // we need acme to be returned with cosine ≥ auto_apply.
-        // close_v ⋅ acme_v = 0.98 ≥ 0.95.
+            // But the worker reads the *candidate* (acme) score in the HNSW
+            // result list. The HNSW's neighbour set when queried with
+            // close_v sees acme_v at cosine 0.98 and original_holdings_v
+            // at cosine cosine(close_v, original_holdings_v) ≈ ...
+            // The worker walks `hits` looking for `candidate == acme`, so
+            // we need acme to be returned with cosine ≥ auto_apply.
+            // close_v ⋅ acme_v = 0.98 ≥ 0.95.
 
-        let metrics = Arc::new(AmbiguityResolverMetrics::new());
-        let worker = AmbiguityResolverWorker::new(
-            fx.metadata.clone(),
-            fx.hnsw.clone(),
-            fx.embedder.clone() as Arc<dyn Dispatcher>,
-        )
-        .with_metrics(metrics.clone());
+            let metrics = Arc::new(AmbiguityResolverMetrics::new());
+            let worker = AmbiguityResolverWorker::new(
+                fx.metadata.clone(),
+                fx.hnsw.clone(),
+                fx.embedder.clone() as Arc<dyn Dispatcher>,
+            )
+            .with_metrics(metrics.clone());
 
-        let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
-        assert_eq!(processed, 1, "exactly one proposal processed");
+            let processed = worker.tick(&fx.worker_ctx).await.unwrap();
+            assert_eq!(processed, 1, "exactly one proposal processed");
 
-        let rtxn = fx.metadata.as_ref().read_txn().unwrap();
-        let updated = proposal_get(&rtxn, pid).unwrap().unwrap();
-        assert_eq!(
-            updated.status,
-            proposal_status::AUTO_APPLIED,
-            "proposal must be AutoApplied; got {} with recheck {}",
-            updated.status,
-            updated.last_recheck_confidence,
-        );
-        assert!(
-            updated.last_recheck_confidence >= DEFAULT_AUTO_APPLY_THRESHOLD,
-            "recheck must clear the auto-apply threshold; got {}",
-            updated.last_recheck_confidence,
-        );
+            let rtxn = fx.metadata.as_ref().read_txn().unwrap();
+            let updated = proposal_get(&rtxn, pid).unwrap().unwrap();
+            assert_eq!(
+                updated.status,
+                proposal_status::AUTO_APPLIED,
+                "proposal must be AutoApplied; got {} with recheck {}",
+                updated.status,
+                updated.last_recheck_confidence,
+            );
+            assert!(
+                updated.last_recheck_confidence >= DEFAULT_AUTO_APPLY_THRESHOLD,
+                "recheck must clear the auto-apply threshold; got {}",
+                updated.last_recheck_confidence,
+            );
 
-        // The candidate must now be the holdings' `merged_into`.
-        let t = rtxn
-            .open_table(brain_metadata::tables::entity::ENTITIES_TABLE)
-            .unwrap();
-        let holdings_row = t.get(&holdings.to_bytes()).unwrap().unwrap().value();
-        assert_eq!(
-            holdings_row.merged_into_bytes,
-            Some(acme.to_bytes()),
-            "holdings must now redirect to acme",
-        );
+            // The candidate must now be the holdings' `merged_into`.
+            let t = rtxn
+                .open_table(brain_metadata::tables::entity::ENTITIES_TABLE)
+                .unwrap();
+            let holdings_row = t.get(&holdings.to_bytes()).unwrap().unwrap().value();
+            assert_eq!(
+                holdings_row.merged_into_bytes,
+                Some(acme.to_bytes()),
+                "holdings must now redirect to acme",
+            );
 
-        let m = metrics.snapshot();
-        assert_eq!(m.proposals_promoted_to_merge_total, 1);
-        assert_eq!(m.sweeps_total, 1);
+            let m = metrics.snapshot();
+            assert_eq!(m.proposals_promoted_to_merge_total, 1);
+            assert_eq!(m.sweeps_total, 1);
+        });
     }
 
     #[test]
     fn tick_rejects_when_confidence_drops() {
-        let fx = fixture();
-        let acme_v = shared_axis(20, 21, 1.0, 0.0);
-        let acme = seed_entity(&fx.metadata, &fx.hnsw, "Acme", acme_v);
-        let bitcoin_v = shared_axis(80, 81, 1.0, 0.0);
-        let bitcoin = seed_entity(&fx.metadata, &fx.hnsw, "Bitcoin", bitcoin_v);
+        glommio_run(|| async {
+            let fx = fixture();
+            let acme_v = shared_axis(20, 21, 1.0, 0.0);
+            let acme = seed_entity(&fx.metadata, &fx.hnsw, "Acme", acme_v);
+            let bitcoin_v = shared_axis(80, 81, 1.0, 0.0);
+            let bitcoin = seed_entity(&fx.metadata, &fx.hnsw, "Bitcoin", bitcoin_v);
 
-        let pid = enqueue(&fx.metadata, bitcoin, acme, 0.75, real_now_unix_nanos());
+            let pid = enqueue(&fx.metadata, bitcoin, acme, 0.75, real_now_unix_nanos());
 
-        // Recheck: embedder returns a vector orthogonal to acme_v so
-        // the cosine drops to ~0.
-        let orthogonal = shared_axis(80, 81, 1.0, 0.0);
-        fx.embedder.set("Bitcoin", orthogonal);
+            // Recheck: embedder returns a vector orthogonal to acme_v so
+            // the cosine drops to ~0.
+            let orthogonal = shared_axis(80, 81, 1.0, 0.0);
+            fx.embedder.set("Bitcoin", orthogonal);
 
-        let metrics = Arc::new(AmbiguityResolverMetrics::new());
-        let worker = AmbiguityResolverWorker::new(
-            fx.metadata.clone(),
-            fx.hnsw.clone(),
-            fx.embedder.clone() as Arc<dyn Dispatcher>,
-        )
-        .with_metrics(metrics.clone());
+            let metrics = Arc::new(AmbiguityResolverMetrics::new());
+            let worker = AmbiguityResolverWorker::new(
+                fx.metadata.clone(),
+                fx.hnsw.clone(),
+                fx.embedder.clone() as Arc<dyn Dispatcher>,
+            )
+            .with_metrics(metrics.clone());
 
-        futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
-        let rtxn = fx.metadata.as_ref().read_txn().unwrap();
-        let updated = proposal_get(&rtxn, pid).unwrap().unwrap();
-        assert_eq!(updated.status, proposal_status::REJECTED);
-        let m = metrics.snapshot();
-        assert_eq!(m.proposals_rejected_total, 1);
+            worker.tick(&fx.worker_ctx).await.unwrap();
+            let rtxn = fx.metadata.as_ref().read_txn().unwrap();
+            let updated = proposal_get(&rtxn, pid).unwrap().unwrap();
+            assert_eq!(updated.status, proposal_status::REJECTED);
+            let m = metrics.snapshot();
+            assert_eq!(m.proposals_rejected_total, 1);
+        });
+    }
+
+    #[test]
+    fn recheck_embed_allows_sibling_progress() {
+        glommio_run(|| async {
+            struct SlowDispatcher {
+                started: Arc<AtomicBool>,
+                finished: Arc<AtomicBool>,
+            }
+
+            impl Dispatcher for SlowDispatcher {
+                fn embed(&self, _text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                    self.started
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    self.finished
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok({
+                        let mut v = [0.0; VECTOR_DIM];
+                        v[0] = 1.0;
+                        v
+                    })
+                }
+
+                fn embed_batch(
+                    &self,
+                    texts: &[&str],
+                ) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                    texts.iter().map(|text| self.embed(text)).collect()
+                }
+
+                fn fingerprint(&self) -> [u8; 16] {
+                    [0xAE; 16]
+                }
+            }
+
+            let fx = fixture();
+            let source = seed_entity(
+                &fx.metadata,
+                &fx.hnsw,
+                "Source",
+                shared_axis(0, 1, 1.0, 0.0),
+            );
+            let candidate = seed_entity(
+                &fx.metadata,
+                &fx.hnsw,
+                "Candidate",
+                shared_axis(0, 1, 1.0, 0.0),
+            );
+            let started = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
+            let embedder: Arc<dyn Dispatcher> = Arc::new(SlowDispatcher {
+                started: started.clone(),
+                finished: finished.clone(),
+            });
+            let worker = AmbiguityResolverWorker::new(
+                fx.metadata.clone(),
+                fx.hnsw.clone(),
+                embedder.clone(),
+            );
+            let recheck = worker.recheck_score(source, candidate);
+            let probe = async {
+                while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                    glommio::timer::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                !finished.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let (score, progressed) = futures_lite::future::zip(recheck, probe).await;
+            assert!(score.is_ok());
+            assert!(progressed);
+        });
     }
 
     #[test]

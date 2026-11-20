@@ -13,8 +13,9 @@ Defines Brain's custom binary wire protocol over TCP. Frames carry a fixed
 payload cap) wrapping a CBOR payload. The crate owns frame/header/opcode codec
 plumbing, the `RequestBody`/`ResponseBody` dispatch envelopes, the connection
 handshake and stream-control ops, the per-domain operation request/response
-types (memory, entity, statement, relation, query, procedural, txn, subscribe,
-admin, extractor), the structured error taxonomy, and the schema DSL surface
+types (memory, entity, statement, relation, graph, query, procedural, txn,
+subscribe, session, space, admin, extractor, capabilities, and the tenant LLM
+credential ops), the structured error taxonomy, and the schema DSL surface
 (AST, pest-based parser, validator, and schema-management wire ops). Pure
 encode/decode — `#![forbid(unsafe_code)]`.
 

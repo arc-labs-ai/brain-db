@@ -33,6 +33,15 @@ use crate::wal::record::WalRecord;
 pub static FLUSH_DURABLE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Arms exactly one injected `flush_durable` failure on this executor
+    /// thread so tests can drive the terminal-fault path without a real
+    /// device error.
+    pub static FAIL_NEXT_FLUSH_DURABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 // ---------------------------------------------------------------------------
 // Constants.
 // ---------------------------------------------------------------------------
@@ -160,6 +169,20 @@ impl WalSegment {
 
         let file = BufferedFile::create(&path).await?;
 
+        // Reserve the rollover range without changing the logical file
+        // length. Recovery therefore continues to read only record bytes,
+        // while later appends do not need to extend filesystem extents.
+        if let Err(error) = file
+            .pre_allocate(crate::WAL_SEGMENT_SIZE_BYTES as u64, true)
+            .await
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "WAL segment preallocation unavailable; continuing with extent growth"
+            );
+        }
+
         // Build the header, compute CRC, write the 4 KB block.
         let mut header = WalSegmentHeaderRaw {
             magic: WAL_SEGMENT_MAGIC,
@@ -269,6 +292,13 @@ impl WalSegment {
     pub async fn flush_durable(&mut self) -> Result<(), WalSegmentError> {
         if self.write_buf.is_empty() {
             return Ok(());
+        }
+
+        #[cfg(test)]
+        if FAIL_NEXT_FLUSH_DURABLE.with(|fail| fail.replace(false)) {
+            return Err(WalSegmentError::Io(std::io::Error::other(
+                "injected flush failure",
+            )));
         }
 
         let offset = (WAL_SEGMENT_HEADER_LEN + self.bytes_on_disk) as u64;

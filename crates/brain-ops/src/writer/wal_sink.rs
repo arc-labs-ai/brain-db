@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use brain_storage::wal::record::{Lsn, WalRecord};
 use brain_storage::wal::wal::WalError;
+use brain_storage::wal::CommitError;
 use parking_lot::Mutex;
 
 /// Boundary between the writer and the per-shard WAL.
@@ -59,8 +60,8 @@ pub trait WalSink: Send + Sync {
     }
 }
 
-/// Errors a `WalSink` can surface. Production maps the real
-/// [`WalError`] into the `Internal` variant; tests use
+/// Errors a `WalSink` can surface. A latched WAL-broken failure becomes
+/// `StorageFaulted`; everything else becomes `Internal`. Tests use
 /// `Internal("…")` directly.
 #[derive(Debug, thiserror::Error)]
 pub enum WalSinkError {
@@ -68,11 +69,20 @@ pub enum WalSinkError {
     Internal(String),
     #[error("wal sink: drain task gone")]
     Disconnected,
+    /// The WAL has latched its terminal broken state; appends fail for the
+    /// life of the process. `detail` is the underlying reason, for the log.
+    #[error("wal sink: shard storage is terminally faulted")]
+    StorageFaulted { detail: String },
 }
 
 impl From<WalError> for WalSinkError {
     fn from(e: WalError) -> Self {
-        Self::Internal(format!("{e}"))
+        match &e {
+            WalError::Commit(CommitError::WalBroken(reason)) => Self::StorageFaulted {
+                detail: reason.clone(),
+            },
+            _ => Self::Internal(format!("{e}")),
+        }
     }
 }
 

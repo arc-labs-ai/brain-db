@@ -12,8 +12,8 @@
 //!
 //! Wire handlers consult `OpsContext` for the schema gate, emit
 //! typed-graph events on the bus, and project to wire view types. The
-//! worker doesn't need those steps — the schema filter runs upstream
-//! (E.7), events fire via the parent ENCODE notification, and the
+//! worker doesn't need those steps — the schema filter runs upstream,
+//! events fire via the parent ENCODE notification, and the
 //! mention edge / statement / relation rows are the worker's only
 //! desired side-effect. Calling the wire handler from the worker
 //! would re-enter the metadata lock and duplicate events.

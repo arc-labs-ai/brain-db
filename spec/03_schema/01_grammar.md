@@ -124,7 +124,7 @@ extractor_field  := "patterns" ws? "[" ws? (regex_literal ws?)* "]"     # patter
                   | "confidence:" ws? number                             # pattern fixed conf
                   | "confidence_threshold:" ws? number                   # classifier/llm
                   | "trigger:" ws? trigger_expr
-                  | "cost_budget:" ws? cost_expr                         # llm
+                  | "cost_budget:" ws? cost_expr                         # llm, declarative
                   | "depends_on:" ws? "[" ws? identifier_list ws? "]"
                   | "resolver" ws? "{" ws? resolver_config_fields "}"
 ```

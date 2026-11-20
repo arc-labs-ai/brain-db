@@ -107,7 +107,7 @@ The OS makes this decision better than any application-level cache we could buil
 
 ### 3.3 No huge pages on the arena
 
-An earlier draft of this spec proposed using `MADV_HUGEPAGE` on the arena. We've corrected this based on the [Linux kernel transparent hugepage documentation](https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/mm/transhuge.rst):
+`MADV_HUGEPAGE` does not apply to the arena. Per the [Linux kernel transparent hugepage documentation](https://github.com/torvalds/linux/blob/master/Documentation/admin-guide/mm/transhuge.rst):
 
 > "Currently THP only works for anonymous memory mappings and tmpfs/shmem. But in the future it can expand to other filesystems."
 
@@ -317,7 +317,7 @@ A shard is the unit of internal scaling within a node. Targets are per-shard, as
 |---|---|---|
 | Memories per shard | 10⁶ – 10⁷ | Sweet spot is 1–10 million. Beyond 10M, TLB pressure on the arena starts to matter (see §3.3 above). |
 | Active connections per shard | up to 1000 | Each connection costs 2–4 KiB resident. 1000 connections per shard is a soft limit; spread across shards if higher. |
-| Concurrent in-flight operations per shard | 10–100 | Bound by the shard's writer task. Reads scale much higher. |
+| Concurrent in-flight operations per shard | 15 at the shipped defaults | A hard permit bound, not a target: `max_batch_bytes / 4 KiB`, floored at 2 (`crates/brain-server/src/shard/mod.rs:4641-4650`). Widening the WAL commit window and its batch budget widens this with it. Admission is in order, so a saturated shard queues rather than reordering. |
 
 ### 1.2 Latency
 
@@ -503,7 +503,7 @@ A confidence of 0.8 should mean "80% chance this is the correct/relevant memory"
 | Acknowledged write durability | 100% (after WAL fsync) |
 | Lost-write rate | 0 in normal operation |
 | Window of vulnerability after WAL fsync | 0 |
-| Window of vulnerability before WAL fsync | bounded by group commit interval (≤ 200 µs) |
+| Window of vulnerability before WAL fsync | bounded by the group-commit window: 100 µs, or sooner if the batch reaches 60 KiB (`GroupCommitConfig::default`, `crates/brain-storage/src/wal/group_commit.rs:52-59`) |
 
 A write that the client sees acknowledged is durable: it survives an immediate process crash or host crash. A write that the client has not yet seen acknowledged may be lost; idempotent retry recovers.
 

@@ -177,26 +177,11 @@ If the system schema content changes between versions of the
 binary, the running deployment **doesn't** auto-upgrade. The next
 deployment that opens the redb file with a newer binary picks up
 the new content only if the existing `brain` namespace version is
-bumped explicitly via a binary-bootstrap migration (see §07 Q11).
+bumped explicitly via a binary-bootstrap migration.
 For v1, this is fine — the system schema is stable across the
 release.
 
-## 3. What this replaces
-
-| Pre-19 (hand-seeded)                       | Post-19 (system schema)                |
-|---|---|
-| `BUILTIN_PREDICATES` const in `db.rs`      | `define predicate ...` blocks         |
-| `BUILTIN_RELATION_TYPES` const in `db.rs`  | `define relation_type ...` blocks     |
-| `seed_builtin_entity_types` for `Person`   | `define entity_type Person { ... }`   |
-| `seed_builtin_predicates` writer fn        | `seed_system_schema` (parser path)    |
-| `seed_builtin_relation_types` writer fn    | same                                  |
-
-The downstream `EntityTypeDefinition`, `PredicateDefinition`,
-`RelationTypeDefinition` rows are byte-identical to the previous
-hand-seeded versions. Integration tests don't change. The diff
-is internal to the bootstrap path.
-
-## 4. Version 1 stability
+## 3. Version 1 stability
 
 The system schema ships at version 1 and SHOULD NOT change shape
 during v1. Adding new types is forwards-compatible (write paths
@@ -215,7 +200,7 @@ The validator-version field (§05 §2.1) gives Brain a way
 to detect when the validator's understanding of the system schema
 has evolved. v1 fixes validator-version = 1.
 
-## 5. Tests
+## 4. Tests
 
 This section verifies:
 
@@ -223,19 +208,14 @@ This section verifies:
   schema; `schema_active("brain")` returns `Some(1)`.
 - Re-opening the same dir is a no-op (no second version row).
 - All built-in type IDs (Person, related_to, reports_to,
-  co_authored, brain:is_a, etc.) match the pre-19 hand-seeded
-  IDs — verifies the system schema is the same definitions in DSL
-  form.
+  co_authored, brain:is_a, etc.) are allocated in a fixed,
+  deterministic order, so a fresh seed reproduces them exactly.
 - An invariant test in `system_schema/mod.rs` parses + validates
   the embedded string at compile time of the test suite (no
   runtime panic at `MetadataDb::open`).
 
-## 6. Open questions
+## 5. Reading the system schema
 
-See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:
-
-- Q11 — Binary-bootstrap migration when the system schema's
-  content changes across binary versions.
-- Q12 — Should the system schema be queryable via the same
-  `SCHEMA_GET` opcode the user types use? Yes; the only
-  difference is `namespace = "brain"` is read-only at upload.
+The system schema is queryable through the same `SCHEMA_GET` opcode
+the user types use. The only difference is that `namespace =
+"brain"` is read-only at upload.

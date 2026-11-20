@@ -174,15 +174,15 @@ fn read_meta(metadata: &SharedMetadataDb, id: MemoryId) -> Option<MemoryMetadata
 
 fn edges_out_count(metadata: &SharedMetadataDb, src: MemoryId) -> usize {
     let rtxn = metadata.read_txn().unwrap();
-    list_memory_edges_from(&rtxn, src, None)
-        .map(|v| v.len())
+    list_memory_edges_from(&rtxn, src, None, 0)
+        .map(|p| p.rows.len())
         .unwrap_or(0)
 }
 
 fn edges_in_count(metadata: &SharedMetadataDb, tgt: MemoryId) -> usize {
     let rtxn = metadata.read_txn().unwrap();
-    list_memory_edges_to(&rtxn, tgt, None)
-        .map(|v| v.len())
+    list_memory_edges_to(&rtxn, tgt, None, 0)
+        .map(|p| p.rows.len())
         .unwrap_or(0)
 }
 

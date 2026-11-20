@@ -1,6 +1,6 @@
 # 17. Observability + Operations
 
-> **TL;DR.** What operators see and do. Metrics in OpenMetrics format (per-shard, per-operation, per-tenant), structured JSON logs, OpenTelemetry traces, health endpoints, the five golden signals plus recall quality. Reference dashboards and alert rules ship with Brain. Admin operations (stats, rebuild, snapshot, restore, worker control, configuration reload, audit query) flow over the same wire protocol with admin opcodes. Runbooks for common situations let an SRE diagnose without deep Brain expertise.
+> **TL;DR.** What operators see and do. Metrics in OpenMetrics format, per-shard and per-operation but **never per-tenant** — a tenant label would multiply every series by the tenant count, so per-space questions are answered from logs and the audit trail instead. Structured logs (compact or JSON), OpenTelemetry traces, health endpoints, and the five golden signals. Reference dashboards and alert rules ship with Brain. Admin operations (stats, rebuild, snapshot, restore, worker control, configuration reload, audit query) flow over a separate admin HTTP listener with its own mandatory bearer token. Runbooks for common situations let an SRE diagnose without deep Brain expertise.
 
 ## Status
 
@@ -78,25 +78,34 @@ For a fully-instrumented deployment: < 5% overhead. Acceptable.
 
 ## 5. Self-observability
 
-Brain observes itself:
+Brain observes itself, on the admin listener
+(`crates/brain-server/src/admin/router.rs:33-56`):
 
-- Health endpoints (`/healthz`, `/readyz`).
-- Self-diagnostics (`/debug/...`).
-- Status page (HTML at `/`).
+- `/healthz` — liveness, unauthenticated.
+- `/readyz` — readiness, which reports whether the shards are serving.
+- `/metrics` — the Prometheus exposition, on its own listener and port.
+- `POST /v1/diagnostics/debug-snapshot` — a state dump for an escalation.
 
-Operators can check Brain without external tooling.
+Operators can check Brain without external tooling. There is no HTML status
+page and no `/debug/*` tree; everything above returns JSON or the Prometheus
+text format.
 
 ## 6. The "five golden signals" coverage
 
 Per Google's SRE book:
 
-- **Latency**: per-operation p50/p95/p99 metrics.
-- **Traffic**: requests per second, by operation and shard.
-- **Errors**: error rates, by operation and code.
-- **Saturation**: CPU, memory, queue depth, disk usage.
-- **Plus** — for Brain — recall quality, salience drift, etc.
+- **Latency**: per-operation quantiles, from the request duration histogram.
+- **Traffic**: requests per second by operation; per-shard volume from the
+  query and writer families rather than the request family.
+- **Errors**: error rates by operation. **Not by code** — the status label has
+  three values and no code dimension, so a per-code breakdown comes from the
+  logs.
+- **Saturation**: CPU, resident memory, derivation queue depth, arena
+  occupancy, WAL size, and the derivation admission budget.
+- **Plus** — for Brain — index quality, via the HNSW tombstone ratio. A direct
+  recall estimate needs sampled exact-search comparison and is not emitted.
 
-Each signal has metrics, alerts, and dashboard panels.
+Each signal has metrics and alerts; the dashboard panels cover most of them.
 
 ## 7. The "what to monitor" levels
 
@@ -111,10 +120,14 @@ Level 3: Per-operation health.
   Are encodes/recalls/etc. fast and successful?
 
 Level 4: Per-tenant health.
-  Are specific agents (scoped by namespace / agent) experiencing issues?
+  Are specific agents experiencing issues?
 ```
 
-Operators monitor at all levels; alerts fire at the level appropriate to the issue.
+Levels 1 to 3 are answered by metrics. **Level 4 is not** — no metric carries a
+`space_id` or `namespace` label, so per-tenant health is read from the request
+logs, which carry the effective identity per entry, and from the audit trail.
+Alerts fire at the level appropriate to the issue, which in practice means
+levels 1 to 3.
 
 ## 8. The "ops runbook" approach
 
@@ -132,12 +145,15 @@ Each runbook has steps to diagnose and resolve. Operators don't need to derive p
 
 Brain is a data system. Observability emphasizes data-related signals:
 
-- Memory count growth.
-- Tombstone accumulation.
-- Vector quality (recall metrics).
-- Edge graph density.
+- Arena and index growth, as the stand-in for memory count — there is no live
+  memory-count gauge, and allocated slots include tombstoned ones.
+- Tombstone accumulation, and the tombstone ratio that drives index
+  maintenance.
+- Derivation backlog depth and age: how far a workspace has drifted from its
+  own data.
+- Edge and typed-graph write rates, per derivation worker.
 
-These complement system signals (CPU, etc.).
+These complement system signals (CPU, memory, disk).
 
 ## 10. The "automation hooks"
 
@@ -151,13 +167,21 @@ Brain emits signals; the automation platform (Kubernetes, etc.) acts on them.
 
 ## 11. The "audit" requirement
 
-For compliance scenarios:
+For compliance scenarios, Brain keeps an audit trail in shard metadata and
+exposes it on the admin plane at `GET /v1/audit` and `GET /v1/audit/export`.
 
-- Every state-mutating operation is audit-logged.
-- Audit logs are tamper-evident (append-only, hash-chained).
-- Logs are exportable for external storage.
+Be precise about what it records: it is an **extraction and
+entity-resolution** audit — which extractor ran against which memory, at which
+version, with what outcome, cost and outputs — not a log of every
+state-mutating operation. Entries are append-only and time-ordered by a UUIDv7
+key, and each carries a BLAKE3 hash of the input text, which exists to detect
+an edited memory rather than to chain entries together
+(`crates/brain-metadata/src/tables/audit.rs:1-6`, `:86-96`).
 
-Audit is opt-in; not all deployments need it.
+That hash is **not** a tamper-evidence chain: no entry references its
+predecessor's hash, so the trail is append-only by construction rather than
+cryptographically verifiable. A deployment that needs tamper evidence gets it
+by exporting to append-only external storage.
 
 ## 12. The "in-production debugging"
 
@@ -165,7 +189,7 @@ When something goes wrong:
 
 - Detailed logs from the affected time.
 - Traces showing the request path.
-- Metrics showing session (load, errors elsewhere).
+- Metrics showing context: load, and errors elsewhere.
 
 These three together usually identify the issue. Brain exposes them readily.
 
@@ -173,11 +197,14 @@ These three together usually identify the issue. Brain exposes them readily.
 
 Clients contribute observability:
 
-- Per-request client-side metrics (latency from client perspective).
-- Trace propagation (so server-side traces include client session).
-- Errors visible to applications.
+- Per-request client-side metrics: latency as the client experienced it,
+  which includes the network the server cannot see.
+- Errors as the application saw them.
 
-End-to-end observability spans client-and-server.
+Client and server traces are **separate traces today**: the wire protocol
+carries no trace context, so Brain's spans are roots rather than children of
+the caller's. Join them by timestamp and by the space identity the server
+records, not by a shared trace id.
 
 ## 14. The "self-service" diagnostics
 
@@ -194,8 +221,11 @@ Most issues should be diagnosable by an SRE familiar with general database opera
 
 For issues beyond runbook scope:
 
-- Detailed logs (TRACE level if needed).
-- Heap / CPU profiling (Brain supports pprof-style).
+- Detailed logs, at TRACE level if needed.
+- CPU profiling from **outside** the process, with `perf` against the named
+  shard threads. `POST /v1/diagnostics/profile` answers `501` — the in-process
+  Glommio profiler is not built, and there is no pprof endpoint.
+- `POST /v1/diagnostics/debug-snapshot` for a state dump.
 - Direct admin access for inspecting state.
 - Engineering escalation if the issue is a Brain bug.
 
@@ -213,13 +243,18 @@ Operators need data over time. Brain emits, the metrics platform retains, the op
 
 ## 17. The "cost visibility"
 
-For cost-conscious deployments:
+The one cost figure Brain emits directly is LLM spend:
+`brain_extractor_llm_micro_usd_spent_total`, a per-shard counter in
+dollar-micro-units, so a spend rate is `rate(...)/1e6` dollars per second.
 
-- Per-operation cost (CPU, embedder calls).
-- Per-tenant cost (if multi-tenant).
-- Cost anomalies.
+Per-tenant cost is **not** a metric — the same cardinality rule applies — but it
+is recorded durably: each audit entry carries the extraction's
+`cost_micro_usd` and the namespace it is billed to, which is how a per-tenant
+total is produced without a tenant label on a series.
 
-Brain's metrics enable cost dashboards. Cost itself is the operator's metric system.
+Everything else is inferred: CPU from `process_cpu_seconds_total`, derivation
+pressure from the admission gauges. Cost itself lives in the operator's metric
+system.
 
 ---
 

@@ -30,19 +30,61 @@ The handle lets the registry pause, resume, or query a worker.
 
 ## 3. The worker config
 
-Each worker has configuration:
+Four knobs, shared by every worker:
 
 ```rust
-struct WorkerConfig {
-    enabled: bool,
-    interval_secs: u32,          // How often to run
-    batch_size: usize,           // How much per cycle
-    max_runtime_ms: u32,         // Soft cap per cycle
-    priority: TaskPriority,      // Glommio priority
+pub struct WorkerConfig {
+    /// A disabled worker stays registered (so it is still introspectable)
+    /// and its loop keeps ticking, but never calls `run_cycle`.
+    pub enabled: bool,
+    pub interval: Duration,      // Sleep between cycles
+    pub batch_size: usize,       // Soft cap on units of work per cycle
+    pub max_runtime: Duration,   // Soft cap on wall-clock per cycle
 }
 ```
 
-Defaults are tuned for typical workloads. Operators can adjust per-worker.
+There is **no priority field**. Glommio exposes no per-task priority; what a
+worker's scheduling is set by is the task queue it runs in, which is a property
+of the scheduler rather than of the worker (below).
+
+`WorkerConfig::defaults_for(kind)` is the one cadence table, and it decides
+`enabled` as well as timing: `entity_gc`, `statement_reclaim` and
+`predicate_gc` ship **off**, because reclaiming rows a read already filters out
+is something an operator opts into. Which cadences an operator can override,
+and which are a property of the build, is §16.
+
+**Where workers run.** A shard is one Glommio executor, and until it was
+changed every worker reached it through plain `spawn_local` — which means the
+executor's *default* task queue, the one that serves incoming requests.
+Glommio schedules queues by share, so a derivation burst and a client's ENCODE
+ranked as equals, and derivation is not a polite neighbour: each finished
+provider call brings a JSON decode, a projection, a redb commit and an HNSW
+insert back onto that lane. Measured on one shard with 120 memories, a
+128-wide extractor fan-out returned `503 engine.unavailable` on 9 of 120
+writes.
+
+`WorkerScheduler` therefore creates one queue of its own on first `register`
+and spawns every worker into it with `spawn_local_into`:
+
+```rust
+create_task_queue(Shares::Static(250), Latency::NotImportant, "brain-workers")
+```
+
+250 shares against the default queue's 1000. Under contention workers get
+roughly a fifth of the lane; with the request path idle they get all of it,
+because shares only bind when something else wants to run. An acked write is a
+promise already kept, while derivation is enrichment allowed to arrive late.
+
+Splitting the two across executors is not available: `OpsContext` is `!Send`
+by design — that is the share-nothing thread-per-core model — so a worker and
+the requests it competes with necessarily share one executor. Priority is the
+only lever that exists here.
+
+Share accounting cannot preempt work that never yields, so one worker needed a
+second mechanism: the classifier tier's GLiNER forward pass is ~3.8 s of
+uninterruptible CPU per micro-batch with no await point inside it, and it runs
+on Glommio's blocking pool rather than the reactor thread. See
+[11. Extractor tiers](../11_extractors/01_extractor_tiers.md).
 
 ## 4. The worker lifecycle
 
@@ -145,21 +187,30 @@ Workers self-rate-limit by sleeping between cycles. Default intervals:
 - Slot reclamation: every 10 minutes.
 - WAL retention: every 1 minute.
 
-For deployments that want different rates, configuration overrides are supported.
+Ten of these cadences can be overridden from `[workers]`; the rest are a
+property of the build (§16).
 
-## 12. The "shed load" interaction
+## 12. What happens under load
 
-When Brain is overloaded (CPU > 90%), workers shed load:
-- Reduce batch sizes.
-- Skip non-essential cycles.
-- The HNSW rebuild and consolidation are most-likely-to-skip.
+There is **no CPU-triggered load shedding**: nothing samples CPU, and no
+worker reduces its batch size or skips a cycle because the shard is busy.
+Three mechanisms cover the ground instead, and they are worth distinguishing
+because only the first is automatic:
 
-Critical workers (idempotency sweep, WAL retention) continue at reduced rate.
+- **The share split (§3).** Workers run in a 250-share queue against the
+  request path's 1000, so under contention they are scheduled less and the
+  request path keeps its budget. This is the whole of the automatic response.
+- **`max_runtime`.** A soft cap per cycle, checked between units of work, so
+  one cycle cannot run unboundedly long. It cannot interrupt a single unit —
+  which is why the classifier's forward pass is offloaded rather than capped.
+- **The operator.** `POST /v1/workers/{name}/stop` pauses a worker's
+  `run_cycle` while its loop keeps ticking, so it resumes without restarting
+  the shard; `start` resumes it and `run-now` triggers one cycle.
 
 ## 13. The "stop" semantics
 
 A worker can be stopped:
-- Operator command (`ADMIN_WORKER_STOP <kind>`).
+- Operator command (`POST /v1/workers/{name}/stop`).
 - Configuration disable (`workers.<kind>.enabled = false`).
 - Shutdown signal at shard close.
 
@@ -168,7 +219,7 @@ After stop, the worker's loop exits cleanly. In-progress work is committed first
 ## 14. The "restart" semantics
 
 A worker can be restarted:
-- Operator command (`ADMIN_WORKER_RESTART <kind>`).
+- Operator command (`POST /v1/workers/{name}/start`, or `run-now` for a single cycle).
 - After config change requiring restart.
 
 The worker loop restarts; previous in-flight state is lost (the worker recomputes what's needed).
@@ -194,28 +245,55 @@ Operators monitor these to detect:
 
 ## 16. The configuration surface
 
+Two shapes, and the difference matters: the maintenance workers share one flat
+block of cadences, while the typed-graph and derivation workers each get a
+section with their own knobs.
+
 ```toml
-[workers.decay]
-enabled = true
-interval = "1h"
-batch_size = 10000
+[workers]
+# Sleep between cycles, in seconds. Omitting a key leaves the built-in
+# cadence. Each value must be >= 1; a zero is refused at boot.
+consolidation_interval_sec = 300
+hnsw_maintenance_interval_sec = 300
+idempotency_cleanup_interval_sec = 3600
+slot_reclamation_interval_sec = 600
+wal_retention_interval_sec = 60
+edge_scrub_interval_sec = 1800
+counter_reconciliation_interval_sec = 3600
+statistics_update_interval_sec = 300
+embedder_cache_eviction_interval_sec = 60
+snapshot_interval_sec = 3600
 
-[workers.consolidation]
+[workers.auto_edge]
 enabled = true
-interval = "5m"
-batch_size = 100
-threshold_episodes_in_context = 50
+interval_ms = 100
+batch_size = 256
+similarity_threshold = 0.85
+top_k = 5
+ef_search = 64
+channel_capacity = 1024
 
-[workers.hnsw_maintenance]
-enabled = true
-interval = "5m"
-tombstone_ratio_threshold = 0.30
-recall_threshold = 0.90
-
-# ... etc
+[workers.supersession_sweeper]
+enabled = false
+retention_seconds = 0      # 0 keeps superseded rows forever
 ```
 
-Each worker has its own section. Defaults are sensible; operators tune as needed.
+Rules the shape implies:
+
+- **A cadence is read once, at registration**, and kept for the life of the
+  process, so changing one needs a restart. The ten keys are held in a
+  fixed-width table paired with the worker kind each governs, precisely so a
+  key cannot be added to the file and never arrive at a scheduler — an
+  operator who edits a value that reaches nothing sees no error and no change.
+- **`access_boost` has no key.** Eleven maintenance workers, ten cadences:
+  its tick is a property of the build.
+- **Unknown keys are refused** (`deny_unknown_fields`), so a typo fails boot
+  rather than being silently ignored.
+- **Not every knob is configurable.** The audit-log sweeper's 90-day
+  retention, the entity GC's 30-day grace, and the stale-extraction detector's
+  cadence are code defaults with no section to set them from. The LLM response
+  cache's TTL is per extractor, declared as `cache_ttl` in the extractor
+  document, not an operator knob at all.
 
 ## 17. The development testing
 
@@ -225,4 +303,4 @@ For production deployments, workers run continuously; their effects are visible 
 
 ---
 
-*Continue to [`02_memory_maintenance.md`](02_memory_maintenance.md) for the decay worker.*
+*Continue to [`02_memory_maintenance.md`](02_memory_maintenance.md) for memory maintenance.*

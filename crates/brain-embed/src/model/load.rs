@@ -152,8 +152,8 @@ impl ModelHandle {
 
     /// Forward pass on already-tokenised input. Returns the raw
     /// last-hidden-state tensor of shape `(batch, seq_len, hidden)`.
-    /// Sub-task 5.3 wraps this with mean-pool + L2-normalise to produce
-    /// the user-visible `[f32; 384]` vector.
+    /// The caller wraps this with mean-pool + L2-normalise to produce the
+    /// user-visible `[f32; 384]` vector.
     pub(crate) fn forward(
         &self,
         input_ids: &Tensor,

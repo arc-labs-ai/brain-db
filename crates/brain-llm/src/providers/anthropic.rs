@@ -46,24 +46,12 @@ use serde_json::{json, Value};
 
 use crate::client::{model_id_hash, LlmClient, LlmFuture};
 use crate::error::LlmError;
+use crate::pricing::ModelPricing;
 use crate::providers::runtime::run_on_provider_runtime;
 use crate::types::{LlmRequest, LlmResponse, LlmRole, SystemBlock};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
-
-/// Pricing (dollar micro-units per token) for known Anthropic
-/// models. Conservative defaults for unknown models.
-const PRICE_INPUT_PER_TOKEN_DEFAULT: u64 = 1;
-const PRICE_OUTPUT_PER_TOKEN_DEFAULT: u64 = 5;
-/// Cache writes are billed at roughly 125% of the live input rate
-/// on Anthropic. We approximate at 1 µ$ / token here — the precise
-/// per-model multiplier lives in the operator's pricing config.
-/// Cache reads are nominally ~10% of the live rate but the default
-/// table charges 0 so the cost figure stays a conservative
-/// lower-bound; downstream metrics expose `cache_read_input_tokens`
-/// directly for accurate accounting.
-const PRICE_CACHE_WRITE_PER_TOKEN_DEFAULT: u64 = 1;
 
 /// Anthropic client. Construct via [`Self::with_endpoint`] (for tests
 /// against mock servers).
@@ -175,10 +163,18 @@ impl LlmClient for AnthropicClient {
         let api_key = self.api_key.clone();
         let model = self.model.clone();
         let url = format!("{}/v1/messages", self.base_url);
+        // Weighed before the request is consumed below; the guard lives
+        // inside the async block so occupancy spans the whole round trip
+        // and is released even if the call is cancelled.
+        let weight = crate::inflight::request_bytes(&request);
         let body = build_request_body(&request);
         let timeout = request.timeout;
 
         Box::pin(async move {
+            // Admitted by BYTES against the machine's budget, not by a count.
+            // Parking here is what backpressure looks like: the durable queue
+            // keeps the work, so this defers a call rather than losing it.
+            let _admitted = crate::admission::global().admit_bytes(weight).await;
             if api_key.is_empty() {
                 return Err(LlmError::Auth {
                     provider: crate::router::PROVIDER_ANTHROPIC,
@@ -250,13 +246,9 @@ impl LlmClient for AnthropicClient {
                     log_call(&model, &response);
                     Ok(response)
                 },
-                || LlmError::ProviderError {
-                    status: 0,
-                    message: "no provider runtime; LLM completions are disabled".to_string(),
-                },
-                |e| LlmError::ProviderError {
-                    status: 0,
-                    message: format!("anthropic completion task failed: {e}"),
+                || LlmError::ProviderRuntimeUnavailable,
+                |e| LlmError::RequestTaskFailed {
+                    reason: format!("anthropic completion task failed: {e}"),
                 },
             )
             .await
@@ -409,7 +401,7 @@ struct AnthropicUsage {
 
 fn decode_anthropic_response(
     payload: AnthropicResponseBody,
-    _request: &LlmRequest,
+    request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
     // Concatenate all text-kind content blocks. Tool-use / thinking
     // blocks are ignored.
@@ -422,28 +414,40 @@ fn decode_anthropic_response(
             content.push_str(&block.text);
         }
     }
-    if content.is_empty() {
-        return Err(LlmError::OutputDecodeFailed {
-            reason: "anthropic response had no text-kind content blocks".into(),
-        });
-    }
-
-    let cost_micro_usd = payload.usage.input_tokens * PRICE_INPUT_PER_TOKEN_DEFAULT
-        + payload.usage.output_tokens * PRICE_OUTPUT_PER_TOKEN_DEFAULT
-        + payload.usage.cache_creation_input_tokens * PRICE_CACHE_WRITE_PER_TOKEN_DEFAULT;
-
     let truncated = payload.stop_reason.as_deref() == Some("max_tokens");
-
-    Ok(LlmResponse {
+    let model = if payload.model.is_empty() {
+        request.model.clone()
+    } else {
+        payload.model.clone()
+    };
+    let resp = LlmResponse {
         content,
         tokens_in: payload.usage.input_tokens,
         tokens_out: payload.usage.output_tokens,
         cache_creation_input_tokens: payload.usage.cache_creation_input_tokens,
         cache_read_input_tokens: payload.usage.cache_read_input_tokens,
-        cost_micro_usd,
+        cost_micro_usd: match ModelPricing::for_model(&model) {
+            Some(pricing) => pricing.cost_micro_usd(
+                payload.usage.input_tokens,
+                payload.usage.output_tokens,
+                payload.usage.cache_creation_input_tokens,
+                payload.usage.cache_read_input_tokens,
+            ),
+            None => {
+                tracing::warn!(target: "brain_llm::pricing", model = %model, tokens_in = payload.usage.input_tokens, tokens_out = payload.usage.output_tokens, "no published pricing for this model; token counts are recorded but its cost is reported as zero — add it to brain_llm::pricing::ModelPricing");
+                0
+            }
+        },
         model_version: payload.model,
         truncated,
-    })
+    };
+    if resp.content.is_empty() {
+        return Err(LlmError::EmptyContent {
+            reason: "anthropic response had no text-kind content blocks".into(),
+            billed: resp,
+        });
+    }
+    Ok(resp)
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
@@ -675,7 +679,7 @@ mod tests {
         assert_eq!(resp.tokens_out, 50);
         assert_eq!(resp.cache_creation_input_tokens, 0);
         assert_eq!(resp.cache_read_input_tokens, 0);
-        // 100 * 1 + 50 * 5 = 350 (default pricing, no cache contribution).
+        // (100 * 1000 + 50 * 5000) nano / 1000 = 350 micro-USD.
         assert_eq!(resp.cost_micro_usd, 350);
         assert_eq!(resp.model_version, "claude-haiku-4-5-20240307");
     }
@@ -698,6 +702,9 @@ mod tests {
         let resp = decode_anthropic_response(payload, &req).unwrap();
         assert_eq!(resp.cache_creation_input_tokens, 1500);
         assert_eq!(resp.cache_read_input_tokens, 0);
+        // (100*1000 + 50*5000 + 1500*1250) nano
+        //  = 100_000 + 250_000 + 1_875_000 = 2_225_000 nano = 2225 micro-USD.
+        assert_eq!(resp.cost_micro_usd, 2225);
 
         // Subsequent-call shape: cache_read populated, no creation.
         let raw2 = r#"{
@@ -714,6 +721,11 @@ mod tests {
         let resp2 = decode_anthropic_response(payload2, &req).unwrap();
         assert_eq!(resp2.cache_creation_input_tokens, 0);
         assert_eq!(resp2.cache_read_input_tokens, 1500);
+        // (100*1000 + 50*5000 + 1500*100) nano
+        //  = 100_000 + 250_000 + 150_000 = 500_000 nano = 500 micro-USD. A cache
+        //  read costs a tenth of the live input rate, so the same 1500 tokens
+        //  that cost 1875 micro-USD to write cost 150 to read back.
+        assert_eq!(resp2.cost_micro_usd, 500);
     }
 
     #[test]
@@ -771,11 +783,37 @@ mod tests {
         };
         let req = LlmRequest::new("m", "x");
         let err = decode_anthropic_response(payload, &req).unwrap_err();
-        assert!(matches!(
-            err,
-            LlmError::OutputDecodeFailed { ref reason }
-                if reason.contains("no text-kind")
-        ));
+        match err {
+            LlmError::EmptyContent { billed, .. } => {
+                assert_eq!(billed.cost_micro_usd, 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A non-text-only response carries the provider usage for spend recording.
+    #[test]
+    fn non_text_only_response_carries_billed_cost() {
+        let payload = AnthropicResponseBody {
+            stop_reason: None,
+            model: "claude-haiku-4-5".into(),
+            content: vec![AnthropicContent {
+                kind: "thinking".into(),
+                text: String::new(),
+            }],
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        };
+        let err = decode_anthropic_response(payload, &LlmRequest::new("claude-haiku-4-5", "x"))
+            .unwrap_err();
+        match err {
+            LlmError::EmptyContent { billed, .. } => assert_eq!(billed.cost_micro_usd, 150), // (100*1000 + 10*5000) / 1000 = 150 micro-USD.
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

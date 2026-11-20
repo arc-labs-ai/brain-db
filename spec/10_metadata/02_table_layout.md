@@ -8,7 +8,7 @@ The tables in the metadata store. Each table is a typed B-tree maintained by red
 |---|---|---|---|
 | `memories` | `MemoryId` (16 B, BE) | `MemoryMetadata` | Per-memory metadata |
 | `texts` | `MemoryId` | `Vec<u8>` | Memory text content (UTF-8) |
-| `memory_vectors` | `MemoryId` | vector bytes | Durable copy of the memory's embedding |
+| `memory_vectors` | `MemoryId` | vector bytes | The memory's embedding — its one durable home |
 | `memory_artifacts` | `MemoryId` | `&str` (JSON) | Durable per-memory write-artifact bundle for `MEMORY_INSPECT` (§9a) |
 | `edges` | `(from, kind, to, disambiguator)` (§3) | `EdgeData` | Forward edges — every edge in Brain, not just memory→memory |
 | `edges_reverse` | `(to, kind, from, disambiguator)` | `EdgeData` | The same edges keyed by target |
@@ -32,9 +32,17 @@ The tables in the metadata store. Each table is a typed B-tree maintained by red
 | `extraction_queue` | `MemoryId` | queue entry | Durable trigger the ExtractorWorker drains |
 | `hype_question_vectors` | `MemoryId` | vectors | Write-time hypothetical-question embeddings |
 | `hype_neighborhood_hash` | `MemoryId` | hash | Guards redundant HyPE regeneration |
-| `__schema_meta` | `()` | storage version | On-disk format version; refuses a too-new database |
+| `extractor_pipeline_audit` | `MemoryId` (16 B, BE) | `ExtractorPipelineAuditEntry` | Per-memory extraction outcome; the idempotency probe and the durable retry counters ([`05_failure_and_audit.md`](05_failure_and_audit.md) §3) |
+| `llm_spend` | `(namespace, stage)` | `u64` micro-USD | Running spend for model-backed stages that write no audit row ([`05_failure_and_audit.md`](05_failure_and_audit.md) §3a) |
+| `merge_log` | `(timestamp_unix_nanos, MergeId)` (24 B) | `MergeRecord` | Entity-merge history; the per-row diff unmerge replays ([`05_failure_and_audit.md`](05_failure_and_audit.md) §5) |
+| `entity_merge_audit_overflow` | `(MergeId, chunk)` (20 B) | `MergeAuditOverflow` | Re-routed id lists for merges too large to carry inline ([`05_failure_and_audit.md`](05_failure_and_audit.md) §5.1) |
+| `merge_review_queue` | proposal id (16 B) | `MergeReviewProposal` | Merge proposals in the `[0.7, 0.95)` band, awaiting re-check ([`05_failure_and_audit.md`](05_failure_and_audit.md) §5a) |
+| `merge_review_by_status` | `(status_byte, proposal_id)` (17 B) | `()` | Scan-by-status index over the review queue |
+| `__schema_meta` | `&str` (`"schema_version"`) | `u32` | On-disk format version; refuses a database written by any other version (§6) |
 
 The typed-graph tables (entities, statements, relations, predicates, entity types, relation types, extractors, schema versions and their secondary indexes and audit tables) are catalogued in [`03_substrate_tables.md`](03_substrate_tables.md) and the sections that follow it. Together the database holds roughly seventy-five tables.
+
+Three tables are **deliberately not** in this catalog, because they are not in `metadata.redb`. `llm_credentials` has its own file at the data-directory root, and the `llm_responses` / `llm_response_ttl` cache pair has its own per-shard file; all three are in §16. A reader counting `TableDefinition`s across the metadata crate will therefore find three more than this database holds.
 
 The table count is intentional: each table has a single, focused purpose. Brain does not pack multiple types into one table.
 
@@ -53,7 +61,7 @@ Range queries by MemoryId are common: "all memories created in the last hour", "
 
 ## 3. Edge tables: one logical relation, two physical directions
 
-**One pair of tables holds every edge in Brain.** Cognitive edges (`Memory → Memory`), mention edges (`Memory → Entity`) and typed relations (`Entity → Entity`) are not three storage schemes — both endpoints are keyed as a `NodeRef` and the label as an `EdgeKindRef`, so graph traversal is one BFS and recovery, the change feed and the FORGET cascade each work over one structure. Mention edges previously had no home at all; unifying gave them one.
+**One pair of tables holds every edge in Brain.** Cognitive edges (`Memory → Memory`), mention edges (`Memory → Entity`) and typed relations (`Entity → Entity`) are not three storage schemes — both endpoints are keyed as a `NodeRef` and the label as an `EdgeKindRef`, so graph traversal is one BFS and recovery, the change feed and the FORGET cascade each work over one structure.
 
 Edges are stored twice, once in each direction:
 
@@ -116,13 +124,23 @@ a UI as-is.
 
 ## 6. Schema evolution
 
-Each table has a format version embedded in its metadata. When Brain opens the metadata store:
+The whole file carries **one** format version, held in the singleton `__schema_meta` table under the key `"schema_version"`. The current version is `1`.
 
-- Read the format version of each table.
-- If older than current, run any registered migrations.
-- If newer than current, refuse to open (Brain is too old).
+In principle each table could carry its own version, and a literal implementation would maintain one version row per table. One global row covers the file instead: the tables ship from the same crate and co-evolve, so bumping one means bumping the file's format, and per-table machinery would multiply the open-time checks with no concrete benefit.
 
-Migrations are detailed in [03.05 Schema Versioning](../03_schema/05_versioning.md).
+When Brain opens the metadata store:
+
+- **Table absent** — a fresh database. Stamp the current version and materialize every catalog table.
+- **Same version** — open.
+- **Any other version**, older or newer — refuse to open.
+
+Refusing an older file is the point, not a gap. Several readers resolve a stored row without surfacing a decode failure: the `memory_artifacts` bundle is parsed with a fallback to the default, so a row written against another layout comes back **empty** and blanks the inspect view of every memory already stored, with nothing in a log to say so; the rkyv rows in the catalog are resolved with an expectation that the file is intact, so the same mismatch panics the thread that reads it — which the admin audit query and the audit sweeper both do. Neither failure announces itself as a version problem. Refusing the file at open is the honest failure.
+
+There is no migration registry and no migration tool. A version bump means a fresh data directory.
+
+Two things that look like migrations are not. The `entity_by_type` listing index and the id-ordered statement pagination indexes are rebuilt from the primary rows on open when they are empty. Both are derived data, rebuilt the same way the in-RAM indexes are, and both are idempotent no-ops once they hold a row — index construction, not a format change.
+
+An internal table gets an underscore-prefixed name; the domain tables never use that prefix.
 
 ## 7. The singleton tables
 
@@ -160,24 +178,32 @@ bundle** per memory — the friendly, per-stage view `MEMORY_INSPECT` returns fo
 *any* memory, not just the one just written via the live ENCODE trace.
 
 - Key: MemoryId.
-- Value: JSON text of the wire `EncodeStageArtifact` — `{ vector, record,
+- Value: JSON text of the wire `EncodeStageArtifact` — `{ record,
   keyword_fields, hype_questions, graph }`.
 
 The bundle exists because most stages' derived data is otherwise discarded
-once consumed: the embedding lives in the arena (not readable as a friendly
-vector), the analyzed lexical terms and the HyPE question *text* are dropped
-after indexing/embedding (only their tokens/vectors survive), and the graph is
-scattered across the entity/statement/relation tables. `memory_artifacts` keeps
-one renderable copy.
+once consumed: the analyzed lexical terms and the HyPE question *text* are
+dropped after indexing/embedding (only their tokens/vectors survive), and the
+graph is scattered across the entity/statement/relation tables.
+`memory_artifacts` keeps one renderable copy.
+
+**The embedding is not in the bundle.** The wire type carries a `vector` field
+and `MEMORY_INSPECT` still answers with it, but it is read from
+`memory_vectors` at inspect time, not stored here. A second copy would put a
+384-float JSON array on the ack path — the largest field in the bundle by far,
+serialized on every write — for a reader that is better served by a point
+lookup on a flat byte run.
 
 **Incremental population, one row, no lost update.** Several producers write
-different portions at different times, each via a read-modify-write inside a
-single redb write txn (redb's exclusive write lock serializes them):
+different portions at different times. The async ones each do a
+read-modify-write inside a single redb write txn (redb's exclusive write lock
+serializes them); the sync producer writes the row outright, because the write
+it runs under reserved a fresh MemoryId and so has no bundle to preserve:
 
-- **Sync**, on the ENCODE ack txn (`apply_upsert_memory`): `vector`, `record`,
-  and `keyword_fields` (the exact terms the shared `memory_text` analyzer
-  produces). Committed atomically with the memory row — no extra transaction on
-  the ack path.
+- **Sync**, on the ENCODE ack txn (`apply_upsert_memory`): `record` and
+  `keyword_fields` (the exact terms the shared `memory_text` analyzer
+  produces), plus the embedding into `memory_vectors`. Committed atomically
+  with the memory row — no extra transaction on the ack path.
 - **Async**, off the ack path: the extractor worker merges `graph` after its
   typed-graph commit (read back through the same enrichment resolver RECALL
   uses); the HyPE worker merges `hype_questions`.
@@ -185,10 +211,10 @@ single redb write txn (redb's exclusive write lock serializes them):
 So `MEMORY_INSPECT` returns `found = true` with the sync fields immediately,
 and the graph / HyPE fields fill in as the workers settle.
 
-**Lifecycle.** The bundle carries the vector + derived graph — recoverable
-information about the memory — so it is purged alongside the text on hard
-FORGET, and alongside the memory row on slot reclamation (soft-forget after
-grace). `record.lsn` is `0` in the durable bundle (the WAL position isn't
+**Lifecycle.** The bundle's derived graph and the memory's stored embedding are
+recoverable information about the memory, so both rows are purged alongside the
+text on hard FORGET, and alongside the memory row on slot reclamation
+(soft-forget after grace). `record.lsn` is `0` in the durable bundle (the WAL position isn't
 assigned until the ENCODE `submit` append); the live ENCODE trace's `persist`
 stage carries the real LSN.
 
@@ -235,7 +261,7 @@ In the v1 spec:
 
 Around seventy-five tables live in one `metadata.redb`, split roughly into the substrate set catalogued in §1 and the typed-graph set in §15.
 
-Adding a table is a schema change — it requires a format version bump recorded in `__schema_meta`. Tables are not added lightly.
+Adding a table is **not** a format change. `materialize_all_tables` runs inside the same open-time write transaction that stamps the version, so every table this binary knows about exists after open — redb materializes a table on demand, and a new one adds no column to any existing row. That is what keeps the `__schema_meta` version (§6) for changes that really do make a stored row unreadable: a key or value encoding change. Tables are still not added lightly, but a new one costs no data directory.
 
 ## 15. Typed-graph tables
 
@@ -300,6 +326,24 @@ Every shard maintains derived indexes outside `metadata.redb`: two tantivy direc
 
 One piece of durable state is **not** per shard. `llm_credentials.redb`, at the data-directory root, holds every tenant's sealed LLM provider key keyed `(namespace, space)`: there is one answer per scope and every shard has to resolve the same one. Its sealing key is `llm_credential_kek` in the same directory unless `[llm.credentials] kek` supplies one. A backup that captures the store without the key file restores nothing usable, and one that captures both together carries the plaintext-equivalent — so they are worth separating deliberately rather than by accident.
 
+```rust
+pub const LLM_CREDENTIALS_TABLE:
+    TableDefinition<'static, (&str, [u8; 16]), LlmCredentialRow> =
+    TableDefinition::new("llm_credentials");
+
+pub struct LlmCredentialRow {
+    pub provider: String,                // "openai", "anthropic"
+    pub model: String,                   // the model the key was registered for
+    pub sealed: SealedSecret,            // sealed against this row's namespace + provider
+    pub fingerprint: String,             // display-safe tail; never reconstructable
+    pub created_at_unix_nanos: u64,
+}
+```
+
+Every field except `sealed` is safe to show an operator: the row answers "which key is installed" without the key being readable again. `LlmCredentialRow`'s `Debug` prints shape only, so a credential row cannot put tenant key material into a log line.
+
+`space` is the scope the credential was registered **at** — the space base for one key covering the whole namespace, or a real space to give one team or app its own. Writes land exactly where they name, and reads walk narrowest-first: the caller's space, then the namespace base. So putting a key on the namespace never silently replaces a team's own, and a space that has one shadows the base for itself alone. This is the same asymmetry schema declarations use, and for the same reason — nearly every request names a space, so inferring the scope on a write would turn every ordinary namespace-wide registration into a per-space override.
+
 The LLM cache is **not** migrated across a BYOK boundary. Its key includes a credential-scope component, and rows written before that component existed cannot say which credential paid for them — serving them under per-namespace credentials would be exactly the cross-tenant reuse the scope exists to prevent. A pre-BYOK cache file is refused rather than adopted.
 
 ### 16.1 Tantivy indexes
@@ -358,16 +402,36 @@ Separate redb file per shard: `llm_cache.redb`. Kept apart from `metadata.redb` 
 
 | Table | Key | Value | Purpose |
 |---|---|---|---|
-| `llm_responses` | (input_hash, extractor_id, extractor_version, model_id) | LLM raw response (rkyv) | Idempotency cache |
-| `llm_response_ttl` | (expiry_timestamp, cache_key) | () | TTL index for sweeper |
+| `llm_responses` | `([u8; 32] input_hash, u32 extractor_id, u32 extractor_version, u64 model_id, u64 credential_scope)` | `LlmResponse` (rkyv) | Idempotency cache |
+| `llm_response_ttl` | `(u64 expiry_unix_secs, [u8; 32] input_hash)` | `()` | TTL index for sweeper |
 
-The cache sweeper worker (low priority) periodically removes expired entries.
+```rust
+pub struct LlmResponse {
+    pub response_blob: Vec<u8>,          // rkyv-encoded; opaque to this layer
+    pub created_at_unix_nanos: u64,
+    pub expires_at_unix_nanos: u64,
+    pub token_count: u32,                // per-extractor cost budgeting
+    pub model_id: u64,                   // mirrored from the key for fast scans
+}
+```
+
+`model_id` is the blake3-low-64 of the model identifier string, so a variable-length model name is not embedded in every key.
+
+`credential_scope` is what keeps the cache from spending one tenant's money on another's request. Under BYOK the caller's own provider key pays for the completion, so without a scope component the first tenant to extract a given input would have their paid response handed to every other tenant that hashed to it. The scope confines sharing to callers billing to the same credential. A single-key deployment maps every namespace to the house scope (`0`), where that distinction is vacuous and the cache behaves as a plain one.
+
+It sits **last** on purpose: the sweeper resolves a TTL hint back to its rows by range-scanning the `input_hash` prefix, and appending the component keeps that scan correct where inserting it earlier would break it. Expiry is a property of the row rather than of who paid for it, so every scope's copy of an input expires together.
+
+The key states the **contract** — the inputs a cached extraction is allowed to be a function of. What the cache actually discriminates on is stricter: `input_hash` is a hash of the owning space, the schema version and the fully materialized prompt body, so it also moves with the anchor date, the declared types and kinds, the candidate predicates, the prior entities and the bounded neighbor context. The difference runs the safe way — every input the contract names is inside that hash, so the cache can miss on a change the contract cannot see, but can never serve a response the contract would consider stale. [`../11_extractors/05_idempotency.md`](../11_extractors/05_idempotency.md) §1 states the same distinction from the extractor side.
+
+The TTL index keys expiry in **seconds**, not nanoseconds — second granularity is all eviction needs and it keeps the key smaller. The sweeper walks `range(..=now)` and deletes the cache row along with the index entry.
 
 Cache size cap: configurable, default 10 GB per shard. When cap is hit, LRU eviction.
 
 ## 17. Index rebuild
 
-Tantivy and HNSW indexes are derived. On disaster recovery or operator request, they can be rebuilt from the authoritative redb tables and the WAL:
+Tantivy and HNSW indexes are derived, so either can be reconstructed on disaster recovery or operator request. They do not reconstruct the same way. A tantivy index is rebuilt wholesale from the authoritative redb tables and takes no part in the WAL's durability story — there is no log position for it to resume from. The memory HNSW does have one: its snapshot records the LSN it was taken at, and recovery replays the WAL past that point rather than rebuilding from scratch.
+
+The tantivy rebuild:
 
 ```
 rebuild --index=statements.tantivy --shard=000
@@ -379,7 +443,7 @@ rebuild --index=statements.tantivy --shard=000
   └─ Mark index version
 ```
 
-Rebuilds run in the background; the server continues to serve from existing indexes during the rebuild. On completion, the new index replaces the old atomically.
+Rebuilds run in the background; the server continues to serve from existing indexes throughout, and a rebuild that fails leaves the existing one serving. What is atomic on completion is the **publish**: the new reader bundle is built in full and then swapped in as one store, so a read sees either the complete old index or the complete new one. The on-disk directory swap underneath it is not atomic, and the reconciliation that covers a crash mid-swap is in [`06_tantivy_layout.md`](06_tantivy_layout.md) §5.
 
 ## 18. Entity storage detail
 

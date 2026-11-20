@@ -45,7 +45,7 @@ pub(crate) async fn handle_request(
     .await
 }
 
-pub(crate) fn timeout_response(after: Duration) -> Response<ResponseBody> {
+fn timeout_response(after: Duration) -> Response<ResponseBody> {
     let body = format!("{{\"error\":\"request timed out after {after:?}\"}}\n");
     Response::builder()
         .status(StatusCode::GATEWAY_TIMEOUT)

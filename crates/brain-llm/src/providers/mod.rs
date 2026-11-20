@@ -7,7 +7,8 @@
 
 pub mod anthropic;
 pub mod openai;
-pub(crate) mod runtime;
+mod runtime;
+pub mod sizing;
 
 pub use anthropic::AnthropicClient;
 pub use openai::OpenAIClient;

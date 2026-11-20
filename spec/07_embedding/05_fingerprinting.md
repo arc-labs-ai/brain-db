@@ -120,7 +120,7 @@ During a model upgrade:
 - New memories (encoded after the model swap) have the new fingerprint.
 - Queries embedded with the new model match only new memories.
 
-This means queries are partial during migration. To avoid this, operators should run `ADMIN_MIGRATE_EMBEDDINGS` before switching to query the new model. Detailed in [`06_migration.md`](06_migration.md).
+This means queries are partial during migration. Avoiding it needs a re-embedding pass before the new model starts answering queries — the migration [`06_migration.md`](06_migration.md) specifies and nothing implements. Detailed in [`06_migration.md`](06_migration.md).
 
 ## 8. The fingerprint table
 
@@ -139,7 +139,7 @@ value: {
 This table:
 
 - Lets operators see the fingerprint history of a shard.
-- Supports `ADMIN_STATS` queries about model migration progress.
+- Would support progress reporting for a model migration, if one existed.
 - Helps diagnose "why are my queries returning fewer results than expected?".
 
 ## 9. Multiple models in flight
@@ -172,7 +172,7 @@ In `ENCODE_VECTOR_DIRECT` (where the client provides a pre-computed vector), the
 - The fingerprint is in its known set.
 - The vector dimension matches what that fingerprint registered (e.g., a fingerprint for a 768-dim model can't carry a 384-dim vector).
 
-If the fingerprint is unknown, Brain rejects with `UnknownModel`. Operators can register additional fingerprints via `ADMIN_REGISTER_MODEL` (an admin-only opcode), specifying the model's vector dim and other properties.
+If the fingerprint is unknown, Brain rejects with `UnknownModel`. Registering additional fingerprints was to be `ADMIN_REGISTER_MODEL`, which is **an opcode number only** — no body, no dispatch. The registry is populated by the models the build loads.
 
 ## 12. The fingerprint and consolidation
 

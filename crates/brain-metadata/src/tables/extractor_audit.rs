@@ -62,7 +62,8 @@ pub mod failure_class {
     /// is not).
     pub const UNCLASSIFIED: u8 = 0;
     /// The provider blipped (timeout / rate-limit / network / 5xx) — the
-    /// same call can succeed later. Retried with backoff, never terminal.
+    /// same call can succeed later. Retried with widening backoff until
+    /// its retry budget is spent, at which point the row is terminal.
     pub const TRANSIENT: u8 = 1;
     /// The call can't succeed as-is (bad/absent key, no balance, malformed
     /// request, schema mismatch). Terminal immediately so the operator sees
@@ -84,6 +85,59 @@ pub fn retry_backoff_nanos(attempts: u8) -> u64 {
     RETRY_BACKOFF_BASE_NANOS
         .saturating_mul(1u64 << shift)
         .min(RETRY_BACKOFF_CAP_NANOS)
+}
+
+/// Provider-outage coverage the absolute attempt budget is sized for. Two days
+/// is long past the point the abandonment metric and the error log have
+/// surfaced an outage, and short of holding a memory's grounding hostage
+/// indefinitely.
+const PROVIDER_OUTAGE_COVERAGE_NANOS: u64 = 2 * 24 * 3_600 * 1_000_000_000;
+
+/// The two retry budgets a transient extraction failure is held to.
+///
+/// Both end the retries on their own: the per-item one catches a memory failing
+/// on its own content, the absolute one catches a provider that never comes
+/// back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransientRetryBudget {
+    /// Transient failures a memory may accrue *while the provider is reachable*
+    /// before its extraction is abandoned.
+    ///
+    /// Policy. A failure that lands while other memories' LLM calls are
+    /// succeeding is the memory's own, and the same text fails the same way on
+    /// the next attempt, so this is small by choice rather than by derivation.
+    pub max_item_attributable_failures: u8,
+    /// Absolute ceiling on extraction attempts for one memory, whatever the
+    /// cause. An attempt not attributable to the memory is charged to the
+    /// provider, and a provider outage must not convert a shard's whole queue
+    /// into permanent derivation loss.
+    pub max_attempts: u8,
+}
+
+impl Default for TransientRetryBudget {
+    fn default() -> Self {
+        Self {
+            max_item_attributable_failures: 5,
+            // Retries widen to one attempt per `RETRY_BACKOFF_CAP_NANOS`, so the
+            // attempts that cover a stated outage window is that window divided
+            // by the capped interval.
+            max_attempts: (PROVIDER_OUTAGE_COVERAGE_NANOS / RETRY_BACKOFF_CAP_NANOS) as u8,
+        }
+    }
+}
+
+/// Whether a transient-failure row has spent its retry budget and is therefore
+/// terminal. Either bound alone ends the retries: the per-item one catches a
+/// memory failing on its own content, the absolute one catches a provider that
+/// never comes back.
+#[must_use]
+pub fn transient_budget_spent(
+    attempts: u8,
+    item_attributable_failures: u8,
+    budget: TransientRetryBudget,
+) -> bool {
+    item_attributable_failures >= budget.max_item_attributable_failures
+        || attempts >= budget.max_attempts
 }
 
 /// `TierStatus` byte values. Mirrors per-tier outcome inside one
@@ -191,19 +245,24 @@ pub struct ExtractorPipelineAuditEntry {
     /// LLM cost in dollar-micro-units (1e-6 USD). 0 when the LLM tier
     /// didn't run.
     pub llm_micro_usd_spent: u64,
-    /// How many extraction attempts this memory has had. Starts at 1 on
-    /// the first run; incremented each time a retryable failure re-records
-    /// the row. Used to compute the transient-retry backoff
-    /// ([`retry_backoff_nanos`]); not a terminal cap any more — a transient
-    /// failure retries until it succeeds (the read path's grounding must
-    /// not be permanently lost to a passing provider outage), while a
-    /// permanent failure is terminal on the first attempt regardless.
+    /// Counts extraction attempts, starting at 1. Drives the transient retry
+    /// backoff exponent via [`retry_backoff_nanos`] and is the absolute bound
+    /// checked by [`transient_budget_spent`].
     pub attempts: u8,
     /// One of the [`failure_class`] constants. Set on a failed LLM tier so
     /// the retry decision can keep transient failures reprocessable and
     /// terminate permanent ones. `UNCLASSIFIED` for success / skip / non-LLM
     /// outcomes.
     pub failure_class: u8,
+    /// Transient LLM failures this memory accrued while the provider was
+    /// demonstrably reachable — another LLM-tier run on the shard succeeded
+    /// inside the worker's reachability window. A transient failure with no such
+    /// evidence is charged to the provider and counts only toward `attempts`, so
+    /// an outage cannot spend this budget on memories that are perfectly fine.
+    /// Read by [`transient_budget_spent`].
+    ///
+    /// Appended last so the field order stays append-only.
+    pub item_attributable_failures: u8,
 }
 
 impl ExtractorPipelineAuditEntry {
@@ -234,6 +293,8 @@ impl ExtractorPipelineAuditEntry {
             // `with_attempts` when re-recording a retryable LLM failure.
             attempts: 1,
             failure_class: failure_class::UNCLASSIFIED,
+            // No failure has yet been shown to be attributable to this memory.
+            item_attributable_failures: 0,
         }
     }
 
@@ -251,6 +312,12 @@ impl ExtractorPipelineAuditEntry {
     #[must_use]
     pub fn with_failure_class(mut self, class: u8) -> Self {
         self.failure_class = class;
+        self
+    }
+
+    #[must_use]
+    pub fn with_item_attributable_failures(mut self, failures: u8) -> Self {
+        self.item_attributable_failures = failures;
         self
     }
 
@@ -281,26 +348,30 @@ pub enum ExtractorPipelineAuditError {
 
 /// Whether a failed audit `entry` is a retryable transient LLM failure.
 ///
-/// Retryable ONLY when the LLM tier itself failed (statements are LLM-only,
-/// and a failed LLM call wrote zero, so a retry can't duplicate them) AND
-/// the failure isn't classified permanent. A pattern/classifier-only
-/// failure is never retryable: its rows already committed, so re-running
-/// would duplicate. A permanent LLM failure (bad key / no balance /
-/// malformed) is terminal — retrying can't help and only hides the problem.
-fn is_retryable_transient(entry: &ExtractorPipelineAuditEntry) -> bool {
-    entry.tier_llm == tier_status::FAILED && entry.failure_class != failure_class::PERMANENT
+/// Retryable only when the LLM tier itself failed, the failure is not
+/// classified permanent, and neither retry budget is spent. A pattern or
+/// classifier-only failure is never retryable: its rows already committed, so
+/// re-running would duplicate. A permanent LLM failure is terminal because
+/// retrying cannot help and only hides the problem.
+fn is_retryable_transient(
+    entry: &ExtractorPipelineAuditEntry,
+    budget: TransientRetryBudget,
+) -> bool {
+    entry.tier_llm == tier_status::FAILED
+        && entry.failure_class != failure_class::PERMANENT
+        && !transient_budget_spent(entry.attempts, entry.item_attributable_failures, budget)
 }
 
 /// Probe whether `memory_id`'s extraction is **terminal** — i.e. the
 /// worker should skip it on queue replay. Terminal means: it succeeded,
-/// there was nothing to extract, or it failed permanently / in a non-LLM
-/// tier. A retryable transient LLM failure returns `false` so the worker
-/// re-runs it (subject to backoff, see [`extraction_retry_due`]) rather
-/// than permanently abandoning the memory's typed graph. Absent row →
+/// there was nothing to extract, it failed permanently / in a non-LLM tier, or
+/// its transient retry budget is spent. An unspent transient LLM failure
+/// returns `false` so the worker re-runs it subject to backoff. Absent row →
 /// `false`.
 pub fn has_extracted(
     rtxn: &ReadTransaction,
     memory_id: MemoryId,
+    budget: TransientRetryBudget,
 ) -> Result<bool, ExtractorPipelineAuditError> {
     let table = rtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
     let Some(row) = table.get(&memory_id.to_be_bytes())? else {
@@ -309,7 +380,7 @@ pub fn has_extracted(
     let entry = row.value();
     let terminal = match entry.status {
         pipeline_status::SUCCESS | pipeline_status::SKIPPED => true,
-        _ => !is_retryable_transient(&entry),
+        _ => !is_retryable_transient(&entry, budget),
     };
     Ok(terminal)
 }
@@ -318,41 +389,27 @@ pub fn has_extracted(
 ///
 /// A memory with no audit row, or a non-failure / terminal row, is due
 /// (the terminal case is filtered separately by [`has_extracted`] and
-/// removed from the queue). A retryable transient failure is due only once
-/// its exponential backoff has elapsed since the last attempt — so a
-/// provider outage retries on a widening interval instead of every cycle,
-/// recovering on its own without burning calls. Absent row → due.
+/// removed from the queue). An unspent retryable transient failure is due only
+/// once its exponential backoff has elapsed since the last attempt. Absent row
+/// → due.
 pub fn extraction_retry_due(
     rtxn: &ReadTransaction,
     memory_id: MemoryId,
     now_unix_nanos: u64,
+    budget: TransientRetryBudget,
 ) -> Result<bool, ExtractorPipelineAuditError> {
     let table = rtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
     let Some(row) = table.get(&memory_id.to_be_bytes())? else {
         return Ok(true);
     };
     let entry = row.value();
-    if !is_retryable_transient(&entry) {
+    if !is_retryable_transient(&entry, budget) {
         return Ok(true);
     }
     let due_at = entry
         .extracted_at_unix_nanos
         .saturating_add(retry_backoff_nanos(entry.attempts));
     Ok(now_unix_nanos >= due_at)
-}
-
-/// Read a memory's prior extraction-attempt count (0 if no audit row
-/// exists yet). Used by the worker to increment `attempts` when
-/// re-recording a retryable failure.
-pub fn extraction_attempts(
-    rtxn: &ReadTransaction,
-    memory_id: MemoryId,
-) -> Result<u8, ExtractorPipelineAuditError> {
-    let table = rtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
-    Ok(table
-        .get(&memory_id.to_be_bytes())?
-        .map(|r| r.value().attempts)
-        .unwrap_or(0))
 }
 
 /// Read the full pipeline audit entry for `memory_id`, if one exists.
@@ -428,7 +485,7 @@ mod tests {
         let d = db(&dir);
         let rtxn = d.read_txn().unwrap();
         let id = MemoryId::pack(0, 1, 1);
-        assert!(!has_extracted(&rtxn, id).unwrap());
+        assert!(!has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap());
     }
 
     #[test]
@@ -443,15 +500,20 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let rtxn = d.read_txn().unwrap();
-        assert!(has_extracted(&rtxn, id).unwrap());
+        assert!(has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap());
         // A different id is still untouched.
-        assert!(!has_extracted(&rtxn, MemoryId::pack(0, 43, 1)).unwrap());
+        assert!(!has_extracted(
+            &rtxn,
+            MemoryId::pack(0, 43, 1),
+            TransientRetryBudget::default()
+        )
+        .unwrap());
     }
 
-    /// A transient LLM-tier failure stays retryable (never terminal) so a
-    /// passing provider outage can't permanently drop a memory's typed
-    /// graph — but it is rate-limited by backoff. A permanent LLM failure
-    /// (bad key / no balance) and a non-LLM failure are terminal at once.
+    /// A transient LLM-tier failure stays retryable while its bounded budgets
+    /// remain, so a passing provider outage has time to recover, and backoff
+    /// rate-limits attempts. A permanent LLM failure (bad key / no balance), a
+    /// spent transient budget, and a non-LLM failure are terminal.
     #[test]
     fn transient_llm_failure_retries_with_backoff_permanent_is_terminal() {
         let dir = TempDir::new().unwrap();
@@ -459,7 +521,7 @@ mod tests {
         let id = MemoryId::pack(0, 100, 1);
         let base = 1_700_000_000_000_000_000u64;
 
-        let llm_fail = |attempts: u8, class: u8| {
+        let llm_fail = |attempts: u8, class: u8, attributable: u8| {
             ExtractorPipelineAuditEntry::new(
                 id,
                 base,
@@ -473,6 +535,7 @@ mod tests {
             )
             .with_attempts(attempts)
             .with_failure_class(class)
+            .with_item_attributable_failures(attributable)
         };
         let put = |entry: &ExtractorPipelineAuditEntry| {
             let wtxn = d.write_txn().unwrap();
@@ -480,32 +543,82 @@ mod tests {
             wtxn.commit().unwrap();
         };
 
-        // Transient → never terminal, even after many attempts.
-        put(&llm_fail(7, failure_class::TRANSIENT));
+        // Transient remains retryable while neither bound is spent.
+        put(&llm_fail(7, failure_class::TRANSIENT, 0));
         {
             let rtxn = d.read_txn().unwrap();
-            assert!(!has_extracted(&rtxn, id).unwrap());
+            assert!(!has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap());
             // Not due immediately after the attempt (backoff in effect)…
-            assert!(!extraction_retry_due(&rtxn, id, base + 1).unwrap());
+            assert!(
+                !extraction_retry_due(&rtxn, id, base + 1, TransientRetryBudget::default())
+                    .unwrap()
+            );
             // …but due once the backoff window elapses.
             let due_at = base + retry_backoff_nanos(7);
-            assert!(extraction_retry_due(&rtxn, id, due_at).unwrap());
+            assert!(
+                extraction_retry_due(&rtxn, id, due_at, TransientRetryBudget::default()).unwrap()
+            );
+        }
+
+        put(&llm_fail(
+            TransientRetryBudget::default().max_attempts - 1,
+            failure_class::TRANSIENT,
+            TransientRetryBudget::default().max_item_attributable_failures - 1,
+        ));
+        {
+            let rtxn = d.read_txn().unwrap();
+            assert!(
+                !has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap(),
+                "attempts and attributable failures below both bounds remain retryable"
+            );
+        }
+
+        put(&llm_fail(
+            5,
+            failure_class::TRANSIENT,
+            TransientRetryBudget::default().max_item_attributable_failures,
+        ));
+        {
+            let rtxn = d.read_txn().unwrap();
+            assert!(
+                has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap(),
+                "the attributable-failure bound makes the row terminal"
+            );
+            assert!(
+                extraction_retry_due(&rtxn, id, base + 1, TransientRetryBudget::default()).unwrap(),
+                "a terminal attributable-failure row reports due for queue removal"
+            );
+        }
+
+        put(&llm_fail(
+            TransientRetryBudget::default().max_attempts,
+            failure_class::TRANSIENT,
+            0,
+        ));
+        {
+            let rtxn = d.read_txn().unwrap();
+            assert!(
+                has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap(),
+                "the absolute attempt bound ends an outage with no attributable failures"
+            );
         }
 
         // Unclassified LLM failure is treated as transient (retryable).
-        put(&llm_fail(1, failure_class::UNCLASSIFIED));
+        put(&llm_fail(1, failure_class::UNCLASSIFIED, 0));
         {
             let rtxn = d.read_txn().unwrap();
-            assert!(!has_extracted(&rtxn, id).unwrap());
+            assert!(!has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap());
         }
 
         // Permanent → terminal immediately (no retry loop).
-        put(&llm_fail(1, failure_class::PERMANENT));
+        put(&llm_fail(1, failure_class::PERMANENT, 0));
         {
             let rtxn = d.read_txn().unwrap();
-            assert!(has_extracted(&rtxn, id).unwrap());
+            assert!(has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap());
             // Terminal rows report "due" (the queue removes them separately).
-            assert!(extraction_retry_due(&rtxn, id, base + 1).unwrap());
+            assert!(
+                extraction_retry_due(&rtxn, id, base + 1, TransientRetryBudget::default()).unwrap()
+            );
         }
 
         // A non-LLM failure (classifier failed, llm ok) is terminal — its
@@ -525,7 +638,7 @@ mod tests {
         put(&classifier_fail);
         {
             let rtxn = d.read_txn().unwrap();
-            assert!(has_extracted(&rtxn, id).unwrap());
+            assert!(has_extracted(&rtxn, id, TransientRetryBudget::default()).unwrap());
         }
     }
 

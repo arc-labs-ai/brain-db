@@ -15,10 +15,12 @@
 # The admin endpoint (/v1/*) listens on 127.0.0.1:9092 inside the container and
 # is intentionally not published; reach it via `docker exec brain ...`.
 #
-# Memory: the full capability stack loads the embed (~130 MiB) + reranker
-# (~1.1 GiB) + gliner (~590 MiB) models into RAM. Give the Docker VM enough
-# headroom (≈12 GiB recommended) or the shard spawn OOMs while loading the
-# reranker.
+# Memory: the image loads the embedder (~130 MiB) and GLiNER classifier
+# (~590 MiB), for roughly 720 MiB of resident model weights. Beyond those
+# weights, the footprint is the WAL, arena, and index working set, which scales
+# with stored data rather than with model loading. Enabling [rerank] without a
+# cross-encoder model on disk is a hard boot failure: the shard refuses to start
+# rather than silently falling back when an opt-in rerank request arrives.
 #
 # Observability (prometheus / otel / grafana) is a separate concern and is not
 # bundled here; the dashboards/alerts live under config/monitoring/.
@@ -40,7 +42,9 @@ services:
       RUST_BACKTRACE: "1"
     volumes:
       - brain-data:/var/lib/brain/data
-      - brain-models:/var/lib/brain/models
+      # Both models ship inside the image at /opt/brain/models and are never
+      # written at runtime, so they need no volume. To use a different embedder,
+      # mount it here and set BRAIN_EMBED_MODEL_DIR to its path.
     healthcheck:
       retries: 3
       timeout: 3s
@@ -59,4 +63,3 @@ services:
 
 volumes:
   brain-data:
-  brain-models:

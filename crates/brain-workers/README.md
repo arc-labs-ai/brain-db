@@ -14,9 +14,9 @@ workers. It defines the `Worker` trait, scheduler, per-worker config, context
 each shard healthy: salience decay, consolidation, HNSW maintenance,
 idempotency cleanup, slot reclamation, WAL retention, snapshotting, statistics,
 plus the typed-graph workers (auto-edge, temporal-edge, causal-edge,
-statement-embed, extractor, entity/ambiguity resolution, confidence sweep,
-forget cascade, schema migration, …). The scheduler runs on Glommio with a
-per-worker run-now wakeup channel.
+statement-embed, extractor, HyPE question generation, entity/ambiguity
+resolution, confidence sweep, forget cascade, schema migration, …). The
+scheduler runs on Glommio with a per-worker run-now wakeup channel.
 
 ## Key modules
 
@@ -27,7 +27,7 @@ per-worker run-now wakeup channel.
 | `config` | `WorkerConfig`, `WorkerKind`, per-worker knobs/defaults. |
 | `context` / `metrics` / `error` | `WorkerContext`, `WorkerMetrics`, `WorkerError`. |
 | `summarizer` | `Summarizer` trait + `DisabledSummarizer`. |
-| `workers` | The concrete workers: `decay`, `consolidation`, `auto_edge`, `temporal_edge`, `causal_edge`, `statement_embed`, `extractor`, `hnsw_maint`, `slot_reclaim`, `wal_retention`, `snapshot`, `idempotency_cleanup`, `ambiguity_resolver`, `confidence_sweep`, `forget_cascade`, `schema_migration`, `entity_gc`, and more. |
+| `workers` | The concrete workers: `decay`, `consolidation`, `auto_edge`, `temporal_edge`, `causal_edge`, `statement_embed`, `extractor`, `hype`, `hnsw_maint`, `slot_reclaim`, `statement_reclaim`, `wal_retention`, `snapshot`, `idempotency_cleanup`, `ambiguity_resolver`, `confidence_sweep`, `forget_cascade`, `schema_migration`, `entity_gc`, `predicate_gc`, `backfill`, `access_boost`, `edge_scrub`, `statistics`, and the cache/log sweepers. |
 
 ## Where it fits
 

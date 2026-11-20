@@ -13,13 +13,8 @@ use crate::cost;
 use crate::error::PlanError;
 use crate::plan::encode::IdempotencyCheckStep;
 use crate::plan::forget::{ForgetApplyStep, ForgetPlan, ForgetResponseStep, ForgetWalStep};
-use crate::plan::ExecutionPlan;
 
 const NIL_REQUEST_ID: [u8; 16] = [0u8; 16];
-
-pub fn plan_forget(req: &ForgetRequest, ctx: &PlannerContext) -> Result<ExecutionPlan, PlanError> {
-    Ok(ExecutionPlan::Forget(plan_forget_inner(req, ctx)?))
-}
 
 pub fn plan_forget_inner(
     req: &ForgetRequest,
@@ -81,16 +76,9 @@ mod tests {
         }
     }
 
-    fn unwrap_forget(plan: ExecutionPlan) -> ForgetPlan {
-        match plan {
-            ExecutionPlan::Forget(p) => p,
-            other => panic!("expected Forget, got {other:?}"),
-        }
-    }
-
     #[test]
     fn soft_plan_shape() {
-        let plan = unwrap_forget(plan_forget(&base_request(), &PlannerContext::default()).unwrap());
+        let plan = plan_forget_inner(&base_request(), &PlannerContext::default()).unwrap();
         assert_eq!(plan.shard, 0);
         assert_eq!(plan.memory_id, MemoryId::from(7u128));
         assert_eq!(plan.mode, ForgetMode::Soft);
@@ -113,7 +101,7 @@ mod tests {
     fn hard_plan_zeroes() {
         let mut r = base_request();
         r.mode = ForgetMode::Hard;
-        let plan = unwrap_forget(plan_forget(&r, &PlannerContext::default()).unwrap());
+        let plan = plan_forget_inner(&r, &PlannerContext::default()).unwrap();
         assert_eq!(plan.mode, ForgetMode::Hard);
         assert!(plan.apply.arena_zero_vector, "hard zeroes vector");
         assert!(plan.apply.text_zero, "hard zeroes text");
@@ -123,7 +111,7 @@ mod tests {
     fn nil_request_id_rejected() {
         let mut r = base_request();
         r.request_id = [0u8; 16];
-        match plan_forget(&r, &PlannerContext::default()) {
+        match plan_forget_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => {
                 assert_eq!(field, "request_id");
             }
@@ -133,10 +121,10 @@ mod tests {
 
     #[test]
     fn hard_costs_more_than_soft() {
-        let soft = unwrap_forget(plan_forget(&base_request(), &PlannerContext::default()).unwrap());
+        let soft = plan_forget_inner(&base_request(), &PlannerContext::default()).unwrap();
         let mut r = base_request();
         r.mode = ForgetMode::Hard;
-        let hard = unwrap_forget(plan_forget(&r, &PlannerContext::default()).unwrap());
+        let hard = plan_forget_inner(&r, &PlannerContext::default()).unwrap();
         assert!(hard.estimated_cost_ms > soft.estimated_cost_ms);
     }
 }

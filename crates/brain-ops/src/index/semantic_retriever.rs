@@ -35,13 +35,14 @@ use brain_metadata::tables::statement::STATEMENTS_TABLE;
 use brain_metadata::MetadataDb;
 use parking_lot::RwLock;
 
-/// Cap on a space's live memory count for the exact brute-force lane. At
-/// or below this, a single-space memory query does an exact cosine scan of
-/// only that space's arena vectors (recall = 1.0, the filtered shared-HNSW
-/// walk misses a sparse tenant at high selectivity). Above it, the query
-/// falls through to the shared HNSW path — a lazy per-space HNSW for large
-/// spaces is Phase 2. Phase-1 constant (the `[index]` TOML surface does not
-/// yet carry an index-tuning block); calibrated by the recall probe.
+/// Cap on a space's live memory count for the exact brute-force lane. At or
+/// below this, a single-space memory query does an exact cosine scan of only
+/// that space's arena vectors (recall = 1.0, the filtered shared-HNSW walk
+/// misses a sparse tenant at high selectivity). Above it, the query falls
+/// through to the shared HNSW path because a lazy per-space HNSW for large
+/// spaces is not implemented yet; this threshold is a fixed constant because
+/// the `[index]` TOML surface does not yet carry an index-tuning block, and
+/// the value is calibrated by the recall probe.
 pub const SPACE_BRUTEFORCE_MAX: u64 = 20_000;
 
 /// Production `SemanticRetriever` impl.
@@ -251,7 +252,7 @@ impl BrainSemanticRetriever {
     /// live `memory_count` from the SPACES registry: absent or
     /// `> SPACE_BRUTEFORCE_MAX` returns `Ok(None)` (the caller falls
     /// through to the shared HNSW path — per-space HNSW for large spaces
-    /// is Phase 2). Otherwise it range-scans that space's
+    /// is not implemented yet). Otherwise it range-scans that space's
     /// `MEMORIES_BY_SPACE_TIMELINE_TABLE` keyspace, resolves each candidate's
     /// vector from the redb artifact store (the live by-id store — the arena
     /// mmap holds only WAL-recovered vectors and is empty for same-run
@@ -303,7 +304,7 @@ impl BrainSemanticRetriever {
                 namespace_id,
                 memory_count = count,
                 max = SPACE_BRUTEFORCE_MAX,
-                "brute-force fallthrough: space too large (per-space HNSW is Phase 2)",
+                "brute-force fallthrough: space too large (per-space HNSW not implemented)",
             );
             return Ok(None);
         }

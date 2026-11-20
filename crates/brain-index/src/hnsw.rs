@@ -403,11 +403,10 @@ mod tests {
         assert!(matches!(err, HnswError::MemoryIdNotFound { .. }));
     }
 
-    // ── ef derivation (accuracy plan §1) ──────────────────────────────────
+    // ── ef derivation ──────────────────────────────────────────────────────
 
-    /// The default MUST reproduce the prior behaviour exactly: `ef_factor = 1`
-    /// makes `resolve_ef` the old `max(ef_search, k)`. This is the guarantee
-    /// that shipping the knob changes nothing until an operator opts in.
+    /// At the shipped default `ef_factor = 1`, `resolve_ef` yields
+    /// `max(ef_search, k)`, so the knob costs nothing until an operator raises it.
     #[test]
     fn default_ef_factor_reproduces_prior_behaviour() {
         let idx = HnswIndex::new(IndexParams::default()).unwrap();

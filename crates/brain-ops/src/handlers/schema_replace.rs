@@ -18,18 +18,40 @@
 //! Requires `force_drop_existing: true`. The flag is the wire
 //! contract's explicit-confirmation step for an irreversible
 //! operation — a `false` value is rejected with `InvalidRequest` so
-//! a typo in a client can't accidentally wipe a deployment's schema.
+//! a typo in a client can't accidentally wipe a deployment's schema. A
+//! replace that would drop a predicate or relation type still named by rows
+//! is refused outright, whatever that flag says, because the dropped
+//! declaration would leave those rows unable to name their type.
 
 use crate::clock::now_unix_nanos;
 use brain_core::RequestId;
+use brain_metadata::relation::ops::relation_reference_count_by_type;
+use brain_metadata::relation::types::relation_type_schema_declared_victims;
+use brain_metadata::schema::predicate::predicate_schema_declared_victims;
+use brain_metadata::statement::crud::statement_reference_count_by_predicate;
 use brain_protocol::schema::{parse_schema, validate_located_with};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::handlers::limits::{check_byte_len, SCHEMA_DOCUMENT_MAX_BYTES};
 use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
+
+/// Cap on the per-type reference scan. The gate only needs enough of a count
+/// for an operator to recognise what is blocking them, so the scan stops
+/// early; a count that reaches the cap is rendered with a trailing `+` and is
+/// never presented as exact.
+const REFERENCING_ROW_SCAN_CAP: usize = 64;
+
+fn format_reference_count(count: usize) -> String {
+    if count >= REFERENCING_ROW_SCAN_CAP {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    }
+}
 
 /// Handle a `SCHEMA_REPLACE` request. Admin-only at the dispatch
 /// layer; this function trusts the caller to be authorised.
@@ -51,13 +73,11 @@ pub async fn handle_schema_replace(
             "schema_document must be non-empty".into(),
         ));
     }
-    if req.schema_document.len() > schema_scope::MAX_SCHEMA_DOCUMENT_BYTES {
-        return Err(OpError::InvalidRequest(format!(
-            "schema_document exceeds cap ({} > {} bytes)",
-            req.schema_document.len(),
-            schema_scope::MAX_SCHEMA_DOCUMENT_BYTES,
-        )));
-    }
+    check_byte_len(
+        "schema_document",
+        req.schema_document.len(),
+        SCHEMA_DOCUMENT_MAX_BYTES,
+    )?;
 
     // 3. Parse + validate. Failures don't return SchemaConflict /
     //    InvalidRequest — they ride on `validation_errors` in the
@@ -120,16 +140,8 @@ pub async fn handle_schema_replace(
         )));
     }
 
-    // 4. Route the destructive replace through the unified submit(Write)
-    //    path so it is WAL-durable and replayed on recovery: the WAL is the
-    //    source of truth, and a redb-only mutation is silently lost if redb is
-    //    ever rebuilt from the WAL. The `UpsertSchema` apply (with
-    //    `replace_all`) drops every declared predicate / relation type /
-    //    extractor in the namespace and then uploads the new document inside
-    //    one wtxn — atomic, so a failing upload leaves the prior schema
-    //    intact. submit also supplies the WriteId idempotency replay and the
-    //    post-commit OUTSIDE_ACTIVE_SCHEMA flag sweep this handler used to
-    //    hand-roll.
+    // These values are resolved before the gate so the gate and the submitted
+    // write agree on the scope and the version it is replacing.
     let now = now_unix_nanos();
     // The scope this replace narrows, resolved before any state-dependent
     // step: a scope the caller has no space for is a refusal that should
@@ -138,6 +150,83 @@ pub async fn handle_schema_replace(
     // The version superseded is the one THIS scope is on, not the tenant's —
     // a space on its own overlay must not be renumbered from the base.
     let from_version = schema_scope::current_active(ctx, &namespace, space)?.unwrap_or(0);
+
+    // 3b. Refuse a replace whose exact victim set is still named by rows.
+    //     This gate belongs in the handler, not apply_schema_delta: apply is
+    //     also the WAL-replay path, and refusing a replay would wedge recovery
+    //     on a write that was already acknowledged. The write txn is used
+    //     only for reads and temporary interning needed to resolve the
+    //     document; dropping it rolls back those writes before submit opens
+    //     its own transaction. Single-writer-per-shard means the gate cannot
+    //     become stale between this check and the submitted write.
+    //     `force_drop_existing` confirms that the caller means to replace the
+    //     document; it cannot authorise an unbounded unnamed set of orphans.
+    //     Re-declaring a type unchanged preserves its id, and removing rows
+    //     first is the non-destructive alternative.
+    let blockers = {
+        let wtxn = ctx
+            .executor
+            .metadata
+            .write_txn()
+            .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
+        let redeclared =
+            brain_metadata::schema::apply::resolve_redeclarations(&wtxn, &validated, space, now)
+                .map_err(|e| OpError::Internal(format!("resolve redeclarations: {e}")))?;
+        let scope = brain_metadata::DeclScope::space(&namespace, space);
+        let predicates = predicate_schema_declared_victims(&wtxn, scope, &redeclared.predicates)
+            .map_err(|e| OpError::Internal(format!("predicate victims: {e}")))?;
+        let relation_types =
+            relation_type_schema_declared_victims(&wtxn, scope, &redeclared.relation_types)
+                .map_err(|e| OpError::Internal(format!("relation type victims: {e}")))?;
+        let mut blockers = Vec::new();
+        for victim in predicates {
+            let count =
+                statement_reference_count_by_predicate(&wtxn, victim.id, REFERENCING_ROW_SCAN_CAP)
+                    .map_err(|e| OpError::Internal(format!("statement reference count: {e}")))?;
+            if count != 0 {
+                blockers.push(("predicate", victim.name, count));
+            }
+        }
+        for victim in relation_types {
+            let count =
+                relation_reference_count_by_type(&wtxn, victim.id, REFERENCING_ROW_SCAN_CAP)
+                    .map_err(|e| OpError::Internal(format!("relation reference count: {e}")))?;
+            if count != 0 {
+                blockers.push(("relation_type", victim.name, count));
+            }
+        }
+        drop(wtxn);
+        blockers
+    };
+    if !blockers.is_empty() {
+        let shown = blockers.iter().take(8).map(|(kind, name, count)| {
+            format!(
+                "{kind} {name:?} still has {} rows",
+                format_reference_count(*count)
+            )
+        });
+        let mut parts: Vec<String> = shown.collect();
+        if blockers.len() > 8 {
+            parts.push(format!("and {} more", blockers.len() - 8));
+        }
+        return Err(OpError::Conflict(format!(
+            "schema_replace: namespace {namespace:?} cannot drop vocabulary that rows \
+             still name: {}; re-declare each unchanged in the document, or remove \
+             those rows first",
+            parts.join(", ")
+        )));
+    }
+
+    // 4. Route the destructive replace through the unified submit(Write)
+    //    path so it is WAL-durable and replayed on recovery: the WAL is the
+    //    source of truth, and a redb-only mutation is silently lost if redb is
+    //    ever rebuilt from the WAL. The `UpsertSchema` apply (with
+    //    `replace_all`) drops every declared predicate / relation type /
+    //    extractor in the namespace and then uploads the new document inside
+    //    one wtxn — atomic, so a failing upload leaves the prior schema
+    //    intact. submit also supplies the WriteId idempotency replay and the
+    //    post-commit OUTSIDE_ACTIVE_SCHEMA flag sweep, which this handler
+    //    would otherwise hand-roll.
     let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -178,6 +267,15 @@ pub async fn handle_schema_replace(
             )))
         }
     };
+
+    // The replace dropped every declared extractor in the scope and
+    // re-declared whatever the new document carries, so the registry the
+    // shard is dispatching against no longer matches what is stored. Flag
+    // it dirty and let the extractor worker rebuild it off the request
+    // path; until it does, the shard would keep firing extractors whose
+    // rows this replace deleted.
+    ctx.extractors_dirty
+        .store(true, std::sync::atomic::Ordering::Release);
 
     Ok(SchemaReplaceResponse {
         namespace,
@@ -336,6 +434,219 @@ mod tests {
     fn active(metadata: &SharedMetadataDb) -> Option<u32> {
         let rtxn = metadata.read_txn().unwrap();
         schema_active(&rtxn, brain_metadata::DeclScope::base("acme")).unwrap()
+    }
+
+    /// Seed one statement on `acme:prefers` so the replace gate has a row to
+    /// find before it can remove the predicate registry entry.
+    fn seed_prefers_statement(
+        metadata: &SharedMetadataDb,
+        ns_id: brain_core::NamespaceId,
+    ) -> brain_core::StatementId {
+        use brain_core::{
+            Entity, EntityId, EntityType, EvidenceRef, ExtractorId, SessionId, Statement,
+            StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
+        };
+        use brain_metadata::entity::ops::{entity_put, normalize_name};
+        use brain_metadata::schema::predicate::predicate_id_by_qname;
+        use brain_metadata::statement::crud::statement_create;
+        use brain_metadata::tables::scope::RowScope;
+
+        let scope = RowScope::from_bytes(ns_id.raw(), [0x11; 16]);
+        let subject = EntityId::new();
+        let wtxn = metadata.write_txn().unwrap();
+        let entity = Entity::new_active(
+            subject,
+            EntityType::PERSON_ID,
+            "Priya".into(),
+            normalize_name("Priya"),
+            1_700_000_000_000_000_000,
+        );
+        entity_put(&wtxn, scope, SessionId::DEFAULT, &entity).unwrap();
+        let predicate =
+            predicate_id_by_qname(&wtxn, brain_metadata::DeclScope::base("acme"), "prefers")
+                .unwrap()
+                .expect("prefers declared by seed");
+        let statement = Statement::new_root(
+            StatementId::new(),
+            StatementKind::Preference,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Value(StatementValue::Text("tea".into())),
+            0.9,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            1_700_000_000_000_000_000,
+            1,
+        );
+        let id = statement_create(
+            &wtxn,
+            scope,
+            SessionId::DEFAULT,
+            &statement,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_replace_that_omits_a_predicate_rows_still_name_is_refused() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        seed_prefers_statement(&metadata, ctx.executor.caller_namespace);
+        let err = handle_schema_replace(replace_req(V2, [31u8; 16]), &ctx)
+            .await
+            .expect_err("rows naming an omitted predicate must refuse replace");
+        assert!(
+            matches!(err, OpError::Conflict(ref message) if message.contains("prefers")),
+            "the conflict names the blocking predicate"
+        );
+        assert_eq!(
+            active(&metadata),
+            Some(1),
+            "a refused replace must not re-version"
+        );
+        let rtxn = metadata.read_txn().unwrap();
+        assert!(
+            brain_metadata::schema::predicate::predicate_lookup_by_qname(
+                &rtxn,
+                brain_metadata::DeclScope::base("acme"),
+                "prefers",
+            )
+            .unwrap()
+            .is_some(),
+            "the referenced predicate remains registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replace_that_omits_an_unused_predicate_still_succeeds() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        handle_schema_replace(replace_req(V2, [32u8; 16]), &ctx)
+            .await
+            .expect("an unused predicate may be replaced");
+        assert_eq!(
+            active(&metadata),
+            Some(2),
+            "an unblocked replace advances the version"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replace_that_restates_its_vocabulary_succeeds_with_rows_present_and_keeps_ids() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        let sid = seed_prefers_statement(&metadata, ctx.executor.caller_namespace);
+        let before = {
+            let rtxn = metadata.read_txn().unwrap();
+            brain_metadata::schema::predicate::predicate_lookup_by_qname(
+                &rtxn,
+                brain_metadata::DeclScope::base("acme"),
+                "prefers",
+            )
+            .unwrap()
+            .unwrap()
+            .id
+        };
+        handle_schema_replace(replace_req(V1, [33u8; 16]), &ctx)
+            .await
+            .expect("an unchanged redeclaration preserves references");
+        let rtxn = metadata.read_txn().unwrap();
+        let after = brain_metadata::schema::predicate::predicate_lookup_by_qname(
+            &rtxn,
+            brain_metadata::DeclScope::base("acme"),
+            "prefers",
+        )
+        .unwrap()
+        .unwrap()
+        .id;
+        assert_eq!(before, after, "redeclaring a predicate preserves its id");
+        let statement = brain_metadata::statement::crud::statement_get(&rtxn, sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            statement.predicate, before,
+            "the existing statement keeps naming the preserved predicate id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_predicate_whose_statements_are_all_tombstoned_is_still_in_use() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        let sid = seed_prefers_statement(&metadata, ctx.executor.caller_namespace);
+        let wtxn = metadata.write_txn().unwrap();
+        brain_metadata::statement::tombstone::statement_tombstone(
+            &wtxn,
+            sid,
+            brain_core::TombstoneReason::UserRequest,
+            1_700_000_000_000_000_001,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        let err = handle_schema_replace(replace_req(V2, [34u8; 16]), &ctx)
+            .await
+            .expect_err("tombstoned history still pins its predicate");
+        assert!(
+            matches!(err, OpError::Conflict(_)),
+            "history and soft-FORGET restore still need the predicate name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_statement_in_another_namespace_still_pins_its_predicate() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        let other = {
+            let wtxn = metadata.write_txn().unwrap();
+            let id = brain_metadata::namespace::namespace_intern_or_get(&wtxn, "other", 0).unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        seed_prefers_statement(&metadata, other);
+        let err = handle_schema_replace(replace_req(V2, [35u8; 16]), &ctx)
+            .await
+            .expect_err("a cross-namespace statement still pins its predicate");
+        assert!(
+            matches!(err, OpError::Conflict(_)),
+            "a row namespace need not match the coined namespace"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_drop_existing_does_not_bypass_the_in_use_refusal() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        seed_prefers_statement(&metadata, ctx.executor.caller_namespace);
+        let err = handle_schema_replace(replace_req(V2, [36u8; 16]), &ctx)
+            .await
+            .expect_err("force confirms replacement but cannot orphan rows");
+        assert!(
+            matches!(err, OpError::Conflict(_)),
+            "force is not permission to leave rows unable to name their type"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_marks_the_extractor_registry_dirty() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed_schema(&metadata, V1);
+        assert!(!ctx
+            .extractors_dirty
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        handle_schema_replace(replace_req(V2, [21u8; 16]), &ctx)
+            .await
+            .expect("replace");
+
+        assert!(
+            ctx.extractors_dirty
+                .load(std::sync::atomic::Ordering::Acquire),
+            "without the dirty flag, the shard would keep dispatching extractors \
+             the replace deleted"
+        );
     }
 
     #[tokio::test]

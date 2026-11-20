@@ -4,6 +4,8 @@
 //! UpdateEmbedding, and Tombstone(Memory).
 
 use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
+use brain_metadata::extraction::queue::ExtractionQueueError;
+use brain_metadata::registry::RegistryError;
 use brain_metadata::tables::agg::put_memory;
 use brain_metadata::tables::memory::{
     space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
@@ -66,9 +68,9 @@ pub fn apply_upsert_memory(
     {
         let mut memories_t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         put_memory(wtxn, &mut memories_t, id.to_be_bytes(), &row)
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES insert: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("MEMORIES insert", &e))?;
     }
 
     // Timeline index. The TemporalEdgeStrategy walks this index in
@@ -76,7 +78,7 @@ pub fn apply_upsert_memory(
     {
         let mut timeline_t = wtxn
             .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open TIMELINE", &e))?;
         let key = space_timeline_key(
             namespace_id,
             space_id_bytes(write.space_id),
@@ -86,7 +88,7 @@ pub fn apply_upsert_memory(
         );
         timeline_t
             .insert(key.as_slice(), ())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TIMELINE insert", &e))?;
     }
 
     // Couple the raw text to the memory row inside the same wtxn.
@@ -95,10 +97,10 @@ pub fn apply_upsert_memory(
     {
         let mut texts_t = wtxn
             .open_table(TEXTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open TEXTS: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open TEXTS", &e))?;
         texts_t
             .insert(&id.to_be_bytes(), text.as_bytes())
-            .map_err(|e| ApplyError::Storage(format!("TEXTS insert: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TEXTS insert", &e))?;
     }
 
     // Durable extraction trigger. Enqueue this memory for asynchronous
@@ -107,14 +109,18 @@ pub fn apply_upsert_memory(
     // lose the work. This is the source of truth for "this memory needs
     // extraction"; the writer's flume channel is only a low-latency
     // wakeup hint. `created_at` is the enqueue stamp.
-    brain_metadata::extraction_queue_enqueue(wtxn, *id, *created_at_unix_nanos)
-        .map_err(|e| ApplyError::Storage(format!("extraction_queue enqueue: {e:?}")))?;
+    brain_metadata::extraction_queue_enqueue(wtxn, *id, *created_at_unix_nanos).map_err(
+        |e| match e {
+            ExtractionQueueError::Storage(e) => ApplyError::storage("extraction_queue enqueue", &e),
+            ExtractionQueueError::Table(e) => ApplyError::storage("extraction_queue enqueue", &e),
+        },
+    )?;
 
-    // Sync half of the durable write-artifact bundle (MEMORY_INSPECT): the
-    // embedding vector + the record fields, written into the SAME wtxn so
-    // they commit atomically with the memory row at no extra transaction
-    // cost. The async workers (extractor → graph, text-indexer → keywords,
-    // HyPE → questions) merge the rest of the bundle in later.
+    // Sync outputs of the write, in the SAME wtxn so they commit atomically
+    // with the memory row at no extra transaction cost: the embedding into
+    // the by-id vector table, and the record + analyzed terms into the
+    // durable artifact bundle (MEMORY_INSPECT). The async workers
+    // (extractor → graph, HyPE → questions) merge the rest in later.
     {
         let kind_byte = match kind {
             MemoryKind::Episodic => 0,
@@ -138,7 +144,7 @@ pub fn apply_upsert_memory(
             record,
             keyword_fields,
         )
-        .map_err(|e| ApplyError::Storage(format!("artifact sync write: {e}")))?;
+        .map_err(|e| ApplyError::storage("artifact sync write", &e))?;
     }
 
     // FINGERPRINTS_TABLE entry when the encode opted into content-
@@ -154,9 +160,9 @@ pub fn apply_upsert_memory(
             let entry = FingerprintEntry::new(*id, *created_at_unix_nanos);
             let mut fp_t = wtxn
                 .open_table(FINGERPRINTS_TABLE)
-                .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+                .map_err(|e| ApplyError::storage("open FINGERPRINTS", &e))?;
             fp_t.insert(&key, entry)
-                .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS insert: {e:?}")))?;
+                .map_err(|e| ApplyError::storage("FINGERPRINTS insert", &e))?;
         }
     }
 
@@ -172,7 +178,10 @@ pub fn apply_upsert_memory(
         session_id.raw(),
         *created_at_unix_nanos,
     )
-    .map_err(|e| ApplyError::Storage(format!("registry touch: {e}")))?;
+    .map_err(|e| match e {
+        RegistryError::Storage(e) => ApplyError::storage("registry touch", &e),
+        RegistryError::Table(e) => ApplyError::storage("registry touch", &e),
+    })?;
 
     Ok(PhaseAck::UpsertedMemory(*id))
 }
@@ -198,10 +207,10 @@ pub fn apply_tombstone_memory(
     let mut row = {
         let memories_t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         let row_guard = memories_t
             .get(&id.to_be_bytes())
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("MEMORIES get", &e))?;
         let Some(guard) = row_guard else {
             return Err(ApplyError::NotFound {
                 what: "memory",
@@ -255,9 +264,9 @@ pub fn apply_tombstone_memory(
     {
         let mut memories_t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         put_memory(wtxn, &mut memories_t, id.to_be_bytes(), &row)
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (tombstone): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("MEMORIES insert (tombstone)", &e))?;
     }
 
     // Remove the timeline-index entry — a tombstoned memory must not
@@ -265,11 +274,11 @@ pub fn apply_tombstone_memory(
     {
         let mut timeline_t = wtxn
             .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open TIMELINE", &e))?;
         let key = space_timeline_key(namespace_id, space_bytes, created_at, ctx_raw, mid_bytes);
         let _ = timeline_t
             .remove(key.as_slice())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE remove: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TIMELINE remove", &e))?;
     }
 
     // Evict the fingerprint row in the same wtxn as the tombstone —
@@ -280,7 +289,7 @@ pub fn apply_tombstone_memory(
         use brain_metadata::tables::fingerprint::{fingerprint_key, FINGERPRINTS_TABLE};
         let mut fp_t = wtxn
             .open_table(FINGERPRINTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open FINGERPRINTS", &e))?;
         let key = fingerprint_key(
             brain_core::SpaceId::from(space_bytes),
             SessionId(ctx_raw),
@@ -288,7 +297,7 @@ pub fn apply_tombstone_memory(
         );
         let _ = fp_t
             .remove(&key)
-            .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS remove: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("FINGERPRINTS remove", &e))?;
     }
 
     // Hard FORGET is the privacy escape hatch: the spec promises the
@@ -305,16 +314,16 @@ pub fn apply_tombstone_memory(
     if matches!(mode, crate::write::phase::TombstoneMode::Hard) {
         let mut texts_t = wtxn
             .open_table(TEXTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open TEXTS: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open TEXTS", &e))?;
         let _ = texts_t
             .remove(&id.to_be_bytes())
-            .map_err(|e| ApplyError::Storage(format!("TEXTS remove (hard forget): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TEXTS remove (hard forget)", &e))?;
 
-        // The write-artifact bundle carries the embedding vector + the
-        // derived graph — recoverable information about the memory — so a
-        // hard forget purges it in the same wtxn as the text.
+        // The derived graph and the stored embedding are recoverable
+        // information about the memory, so a hard forget purges the artifact
+        // bundle and the by-id vector row in the same wtxn as the text.
         crate::memory_artifact::delete_memory_artifact(wtxn, id.to_be_bytes())
-            .map_err(|e| ApplyError::Storage(format!("artifact remove (hard forget): {e}")))?;
+            .map_err(|e| ApplyError::storage("artifact remove (hard forget)", &e))?;
     }
 
     Ok(PhaseAck::Tombstoned {
@@ -345,10 +354,10 @@ pub fn apply_restore_memory(
     let mut row = {
         let memories_t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         let row_guard = memories_t
             .get(&id.to_be_bytes())
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("MEMORIES get", &e))?;
         let Some(guard) = row_guard else {
             return Err(ApplyError::NotFound {
                 what: "memory",
@@ -399,9 +408,9 @@ pub fn apply_restore_memory(
     {
         let mut memories_t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         put_memory(wtxn, &mut memories_t, id.to_be_bytes(), &row)
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (restore): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("MEMORIES insert (restore)", &e))?;
     }
 
     // Re-insert the timeline-index entry the tombstone removed so the
@@ -409,11 +418,11 @@ pub fn apply_restore_memory(
     {
         let mut timeline_t = wtxn
             .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open TIMELINE", &e))?;
         let key = space_timeline_key(namespace_id, space_bytes, created_at, ctx_raw, mid_bytes);
         timeline_t
             .insert(key.as_slice(), ())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (restore): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TIMELINE insert (restore)", &e))?;
     }
 
     // Restore the dedup fingerprint the forget evicted so a re-encode of
@@ -431,9 +440,9 @@ pub fn apply_restore_memory(
         let entry = FingerprintEntry::new(*id, created_at);
         let mut fp_t = wtxn
             .open_table(FINGERPRINTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open FINGERPRINTS", &e))?;
         fp_t.insert(&key, entry)
-            .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS insert (restore): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("FINGERPRINTS insert (restore)", &e))?;
     }
 
     Ok(PhaseAck::MemoryRestored {
@@ -494,7 +503,7 @@ pub fn apply_update_session(
     {
         let mut timeline_t = wtxn
             .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open TIMELINE", &e))?;
         let old_key = space_timeline_key(
             row.namespace_id,
             row.space_id_bytes,
@@ -504,7 +513,7 @@ pub fn apply_update_session(
         );
         let _ = timeline_t
             .remove(old_key.as_slice())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE remove (session change): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TIMELINE remove (session change)", &e))?;
         let new_key = space_timeline_key(
             row.namespace_id,
             row.space_id_bytes,
@@ -514,7 +523,7 @@ pub fn apply_update_session(
         );
         timeline_t
             .insert(new_key.as_slice(), ())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (session change): {e:?}")))?;
+            .map_err(|e| ApplyError::storage("TIMELINE insert (session change)", &e))?;
     }
 
     Ok(PhaseAck::ContextUpdated)
@@ -549,10 +558,10 @@ pub fn apply_update_embedding(
 fn load_memory(wtxn: &WriteTransaction, id: MemoryId) -> Result<MemoryMetadata, ApplyError> {
     let t = wtxn
         .open_table(MEMORIES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
     let row_guard = t
         .get(&id.to_be_bytes())
-        .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("MEMORIES get", &e))?;
     let Some(guard) = row_guard else {
         return Err(ApplyError::NotFound {
             what: "memory",
@@ -569,9 +578,9 @@ fn write_memory(
 ) -> Result<(), ApplyError> {
     let mut t = wtxn
         .open_table(MEMORIES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
     put_memory(wtxn, &mut t, id.to_be_bytes(), &row)
-        .map_err(|e| ApplyError::Storage(format!("MEMORIES insert: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("MEMORIES insert", &e))?;
     Ok(())
 }
 
@@ -629,6 +638,56 @@ mod tests {
             phases: Vec::new(),
             request_hash: None,
         }
+    }
+
+    /// The embedding a write carries must come back out of the apply path
+    /// bit-for-bit, read the way recall reads it (`get_artifact_vector`), and
+    /// the artifact bundle must not hold a second copy of it.
+    #[test]
+    fn upsert_memory_vector_round_trips_through_the_vector_table() {
+        use brain_metadata::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
+        use brain_protocol::envelope::response::EncodeStageArtifact;
+
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+
+        // A vector with a distinct value in every lane, so a transposed,
+        // truncated or zeroed decode cannot pass.
+        let mut vector = [0.0_f32; VECTOR_DIM];
+        for (i, slot) in vector.iter_mut().enumerate() {
+            *slot = ((i % 11) as f32).mul_add(0.125, -0.5);
+        }
+
+        let mut phase = fixture_phase(id);
+        if let Phase::UpsertMemory { vector: v, .. } = &mut phase {
+            **v = vector;
+        }
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &phase, &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let got = crate::memory_artifact::get_artifact_vector(&rtxn, id.to_be_bytes())
+            .expect("vector resolves by id");
+        assert_eq!(got, vector, "every float survives the write path");
+
+        let bundle: EncodeStageArtifact = rtxn
+            .open_table(MEMORY_ARTIFACTS_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .map(|g| serde_json::from_str(g.value()).unwrap())
+            .expect("bundle present");
+        assert!(
+            bundle.vector.is_empty(),
+            "the embedding has one home, and it is not the bundle"
+        );
+        assert!(bundle.record.is_some(), "the record is still bundled");
     }
 
     #[test]
@@ -818,8 +877,8 @@ mod tests {
     }
 
     /// Hard forget must leave no plaintext-derived embedding at rest in
-    /// redb: the artifact bundle's `vector` (the write-time embedding)
-    /// must be gone (invariant #6). Soft forget keeps it until grace.
+    /// redb: the write-time embedding must be gone (invariant #6). Soft
+    /// forget keeps it until grace.
     #[test]
     fn hard_forget_purges_artifact_vector_soft_keeps_it() {
         let (_dir, db) = open_db();

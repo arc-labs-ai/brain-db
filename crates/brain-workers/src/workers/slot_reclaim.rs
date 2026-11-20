@@ -12,10 +12,15 @@
 //!   pushed back onto the arena free list. v1 has no arena and never
 //!   reuses slots (each ENCODE mints a fresh slot from a monotonic
 //!   counter), so the push is a no-op for now.
-//! - **No SLOT_VERSIONS table / version bump.** v1 doesn't reuse
-//!   slots, so the version bump has no observable effect.
-//!   `MemoryId` already encodes the version, and stale references
-//!   already mismatch via the existing slot-version field.
+//! - **The vacated slot is retired, not freed.** Removing the memory row
+//!   takes the slot out of the high-water scan that seeds the writer's slot
+//!   counter at boot, so reclamation records the slot's next version in
+//!   SLOT_VERSIONS. That row holds the high-water mark above the freed slot
+//!   and, if the slot is ever minted again, forces a version above the one
+//!   just reclaimed. Without it a restart hands the next ENCODE the exact
+//!   `MemoryId` of the reclaimed memory, and the references reclamation
+//!   deliberately leaves behind — dangling forward edges, the tombstoned
+//!   HNSW node, any id a client still holds — resolve to a different memory.
 //! - **Adjacent edges only.**: we delete `EDGES_OUT` where
 //!   `source = id` and `EDGES_IN` where `target = id`. Other-direction
 //!   dangling edges (`EDGES_OUT` where `target = id`) survive — the
@@ -43,10 +48,11 @@ use brain_core::MemoryId;
 use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
 use brain_metadata::tables::forget_undo::FORGET_UNDO_LOG_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::slot_version::{retire_slot, SLOT_VERSIONS_TABLE};
 use brain_metadata::tables::statement::STATEMENTS_BY_EVIDENCE_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use redb::ReadableTable;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -195,6 +201,18 @@ fn reclaim_one(
     id: MemoryId,
     cutoff_nanos: u64,
 ) -> Result<bool, WorkerError> {
+    // A slot whose version field is already at its ceiling can name no
+    // further distinct memory. Freeing it would hand the next ENCODE an
+    // identifier this memory already used, so the slot stays occupied: the
+    // memory row is left in place and the slot is retired for good.
+    if id.version() == u32::MAX {
+        warn!(
+            slot = id.slot(),
+            "slot version exhausted; the memory row stays in place to keep the slot occupied"
+        );
+        return Ok(false);
+    }
+
     let wtxn = metadata
         .write_txn()
         .map_err(|e| WorkerError::Ops(format!("reclaim_one write_txn: {e:?}")))?;
@@ -229,6 +247,20 @@ fn reclaim_one(
     let did_remove = reclaimed_scope.is_some();
 
     if let Some((namespace_id, space_id_bytes)) = reclaimed_scope {
+        // The memory row was the only thing holding this slot inside the
+        // boot-time high-water scan, so retire the slot in the same
+        // transaction that removes the row. The stored version is what the
+        // writer packs into the next memory minted here, and it sits above
+        // the version just reclaimed, so the two can never share a
+        // `MemoryId`.
+        {
+            let mut versions = wtxn
+                .open_table(SLOT_VERSIONS_TABLE)
+                .map_err(|e| WorkerError::Ops(format!("open SLOT_VERSIONS: {e:?}")))?;
+            retire_slot(&mut versions, id.slot(), id.version())
+                .map_err(|e| WorkerError::Ops(format!("retire slot {}: {e}", id.slot())))?;
+        }
+
         purge_adjacent_edges(&wtxn, id)?;
 
         // Defensive backstop for the STATEMENTS_BY_EVIDENCE reverse
@@ -717,5 +749,72 @@ mod tests {
         let t = rtxn.open_table(FORGET_UNDO_LOG_TABLE).unwrap();
         assert!(t.get(&(mem, dep_a)).unwrap().is_none());
         assert!(t.get(&(mem, dep_b)).unwrap().is_none());
+    }
+
+    /// Reclamation must retire the slot it frees: the version row outlives
+    /// the memory row, so the slot stays inside the boot-time high-water
+    /// scan and its next occupant is minted one version higher.
+    #[test]
+    fn reclaim_retires_the_vacated_slot() {
+        use brain_metadata::tables::slot_version::SLOT_VERSIONS_TABLE;
+
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 9, 1);
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        assert!(reclaim_one(&db, id, tombstoned_at + 1).unwrap());
+
+        let rtxn = db.read_txn().unwrap();
+        let versions = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
+        assert_eq!(
+            versions.get(&id.slot()).unwrap().unwrap().value(),
+            id.version() + 1,
+            "the freed slot must carry the version its next occupant is minted with"
+        );
+    }
+
+    /// Reclaiming the highest-slot memory must not let a restart re-mint its
+    /// identifier. Boot seeds the writer's slot counter one past
+    /// `max_assigned_slot`, and the writer packs the slot's stored version
+    /// into every id it mints; replaying both here must land elsewhere.
+    #[test]
+    fn reclaimed_memory_id_is_not_reminted_after_restart() {
+        use brain_metadata::tables::slot_version::{max_assigned_slot, SLOT_VERSIONS_TABLE};
+
+        let (_dir, db) = open_shared();
+        // The highest-slot memory on the shard, soft-forgotten and past grace.
+        let reclaimed = MemoryId::pack(1, 9, 1);
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, reclaimed, tombstoned_at);
+        assert!(reclaim_one(&db, reclaimed, tombstoned_at + 1).unwrap());
+
+        let rtxn = db.read_txn().unwrap();
+        // Boot: the slot counter starts one past the persisted high-water mark.
+        let next_slot = max_assigned_slot(&rtxn).unwrap() + 1;
+        assert!(
+            next_slot > reclaimed.slot(),
+            "the freed slot must stay inside the high-water mark"
+        );
+        // Mint: the writer packs the slot's stored version, defaulting to 1.
+        let mint = |slot: u64| {
+            let version = rtxn
+                .open_table(SLOT_VERSIONS_TABLE)
+                .unwrap()
+                .get(&slot)
+                .unwrap()
+                .map_or(1u32, |v| v.value());
+            MemoryId::pack(1, slot, version)
+        };
+        assert_ne!(
+            mint(next_slot),
+            reclaimed,
+            "the slot the counter seeds to must not reproduce the reclaimed id"
+        );
+        assert_ne!(
+            mint(reclaimed.slot()),
+            reclaimed,
+            "even minting on the freed slot must not reproduce the reclaimed id"
+        );
     }
 }

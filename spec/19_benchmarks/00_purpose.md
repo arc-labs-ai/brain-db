@@ -78,11 +78,12 @@ This matches typical AI agent workloads.
 
 Memories:
 - Average text size: 1 KB (typical for a chat exchange or knowledge bullet).
-- Vector dimension: 1536 (OpenAI text-embedding-3-large).
+- Vector dimension: **384** — the output of the substrate's own embedder, BGE-small-en-v1.5, L2-normalised (`crates/brain-embed/src/model/forward.rs:24`, `crates/brain-embed/src/lib.rs:1-5`). Brain embeds server-side; it does not take vectors from a hosted embedding API, so the dimension is a property of the shipped model and not a benchmark choice.
+- Token cap per memory: 512 (`crates/brain-embed/src/model/tokenize.rs:23`). Text beyond it truncates, so a 1 KB average sits comfortably inside one full forward pass.
 - Salience: distributed [0.1, 1.0].
 - Edges: average 5 per memory, distributed (some have 0, some 50).
 
-This matches realistic data.
+This matches realistic data. The dimension matters to every downstream budget in this section: an arena slot is 1600 bytes (`crates/brain-storage/src/arena/file.rs:54`), of which the 384-float vector is 1536 — so vector width, not text, sets the storage floor.
 
 ## 7. The dataset sizes
 

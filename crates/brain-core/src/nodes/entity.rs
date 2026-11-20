@@ -25,6 +25,11 @@ use crate::ids::{EntityId, EntityTypeId};
 pub struct EntityAttributes(pub Vec<u8>);
 
 impl EntityAttributes {
+    /// Maximum bytes in the opaque per-entity attribute bag. Sixty-four KiB
+    /// bounds a free-form entity payload while leaving the larger opaque WAL
+    /// record and response-frame ceilings for the surrounding entity.
+    pub const MAX_BYTES: usize = 64 * 1024;
+
     /// An empty attribute bag.
     #[must_use]
     pub const fn empty() -> Self {
@@ -193,6 +198,11 @@ impl Entity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_attributes_cap_is_sixty_four_kib() {
+        assert_eq!(EntityAttributes::MAX_BYTES, 64 * 1024);
+    }
 
     #[test]
     fn entity_has_alias_scans_aliases() {

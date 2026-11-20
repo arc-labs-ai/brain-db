@@ -9,13 +9,14 @@ ultimately `brain-server`. Apache-2.0.
 ## What it does
 
 The redb-backed metadata and typed-graph store for a shard. It holds memory
-metadata, spaces/contexts, the idempotency table, and the durable LSN
-checkpoint, alongside the full typed-graph tables — entities, statements (with
-evidence overflow), relations, predicates, schema/predicate type interning, and
-the audit log. It encodes rows via `rkyv`/`bytemuck`, drives schema upload and
-the seeded system schema, exposes graph traversal and FORGET/supersession
-cascade logic, and implements `brain_storage::recovery::MetadataSink` so WAL
-recovery can rebuild every typed-graph table on restart.
+metadata, the namespace/space/session registries, the idempotency table, and the
+durable LSN checkpoint, alongside the full typed-graph tables — entities,
+statements (with evidence overflow), relations, predicates, schema/predicate
+type interning, and the audit log. It encodes rows via `rkyv`/`bytemuck`, drives
+schema upload and the seeded system schema, exposes graph traversal and
+FORGET/supersession cascade logic, and implements
+`brain_storage::recovery::MetadataSink` so WAL recovery can rebuild every
+typed-graph table on restart.
 
 ## Key modules
 
@@ -31,15 +32,21 @@ recovery can rebuild every typed-graph table on restart.
 | `cascade` | FORGET / supersession cascade across the graph. |
 | `recovery` | WAL recovery, one file per `WalPayload` family. |
 | `api_keys` | API-key create/lookup/revoke and scope resolution. |
+| `namespace` / `registry` | Namespace (tenant) interning, plus the space and session registries — derived, recomputable view state. |
+| `extraction` | The extraction queue: the durable trigger for the async extractor worker, and the backlog figure operators scrape. |
+| `hype` / `statement_question` | Durable question-bridge vectors the in-RAM HyPE and statement-question HNSWs are rebuilt from. |
 | `extractor` / `tables` | Extractor registry and pipeline-audit tables. |
 | `llm_cache` | Separate redb-backed LLM response cache. |
-| `storage_version` | On-disk storage-version stamping. |
+| `llm_credential` / `llm_spend` | Tenant provider credentials (sealed) and cumulative spend for the non-extraction model stages. |
+| `page_cache` | How much memory each redb page cache is opened with. |
+| `storage_version` | On-disk storage-version stamping. `CURRENT_SCHEMA_VERSION` is 1, and open-time refusal is symmetric: a newer *or* older stamp is rejected rather than converted. |
 
 ## Where it fits
 
-Depends on `brain-core`, `brain-storage` (recovery sink), and `brain-protocol`
-(schema AST), plus `redb`, `rkyv`, `blake3`, and `parking_lot`. Consumed by
-`brain-ops` and the shard runtime in `brain-server`.
+Depends on `brain-core`, `brain-storage` (recovery sink), `brain-protocol`
+(schema AST), and `brain-crypto` (sealing tenant provider keys), plus `redb`,
+`rkyv`, `blake3`, and `parking_lot`. Consumed by `brain-ops` and the shard
+runtime in `brain-server`.
 
 ## Spec
 

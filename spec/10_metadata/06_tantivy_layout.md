@@ -87,12 +87,25 @@ Group-commit discipline, matching the WAL group-commit (see
   documents are durable.
 
 **Loss bound at crash:** up to N-1 writes are unindexed at the
-moment of crash. Those writes are recovered by §5 §"Recovery"
-which replays from the authoritative redb tables and the WAL
-tail.
+moment of crash. Those writes are still in redb, which is
+authoritative, so nothing is lost from the database — but the
+lexical index is the one place they are missing, and the only thing
+that puts them back is a §5 rebuild from the redb tables. The
+indexer keeps no durable position to resume from, so a crash leaves
+no record of where its batch stopped.
 
-Configurable per shard via `BRAIN_TANTIVY_COMMIT_N` (default 256)
-and `BRAIN_TANTIVY_COMMIT_MS` (default 1000) env vars.
+This is why the gap does not close by itself. A directory that
+reopens cleanly at the current schema version reports `Ready`, and a
+`Ready` scope is not rebuilt (§6) — so an unindexed tail stays
+unindexed until a rebuild is triggered, and a lexical read over that
+window silently returns fewer hits than redb could support. Shrinking
+N shrinks the window.
+
+Both come from the `[index]` config section — `tantivy_commit_n`
+(default 256) and `tantivy_commit_ms` (default 1000) — and apply to
+every shard in the process. As with any config field, the environment
+override is `BRAIN__INDEX__TANTIVY_COMMIT_N`, with two underscores per
+level; there is no single-underscore `BRAIN_TANTIVY_*` variable.
 
 ## 4. Segment merge
 
@@ -102,17 +115,20 @@ tantivy's background merger threads, which participate in the
 shard's I/O budget via OS scheduling.
 
 Segment-merge windowing (running merges only during periodic
-low-traffic intervals) is a post-v1 improvement (tracked in
-[`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md)).
+low-traffic intervals) is a post-v1 improvement.
 
 ## 5. Rebuild from authoritative state
 
 A rebuild is the only path that mutates a tantivy directory
 without going through the live `IndexWriter`. It runs:
 
-- On startup if `Index::open` returns `Err` (corrupt segments,
-  missing files, schema-version mismatch).
+- On startup, for any scope whose open reports `NeedsRebuild` —
+  the directory would not open, its stamped schema version is not
+  the current one, or its payload would not parse (§6).
 - On explicit admin trigger.
+
+An absent or empty scope directory is **not** a rebuild trigger: it
+is a fresh index, created in place and reported ready.
 
 Algorithm:
 
@@ -129,17 +145,42 @@ Algorithm:
      text repr at index time.
 4. Bulk-add into the rebuild writer; commit on the standard
    cadence (§3).
-5. After all rows are indexed, fsync the directory and **atomic
-   rename**: `<live>` → `<live>.old`, `<live>.rebuild` →
-   `<live>`. Then remove `<live>.old`.
-6. Re-open the live index. Readers that held a handle to the
-   old `Index` keep operating against in-memory segments; new
-   readers via the standard `Index::open` pick up the new tree.
+5. After all rows are indexed, fsync the directory and swap it in
+   with two renames: `<live>` → `<live>.old`, then
+   `<live>.rebuild` → `<live>`. Then remove `<live>.old`.
+6. Re-open the live index and publish the new reader bundle.
 
-During step 1–5, `LexicalRetriever::retrieve()` on that scope
-returns `LexicalError::IndexUnavailable`. The rebuild worker
-emits progress metrics (rows indexed, ETA) and a final completion
-log line.
+The swap in step 5 is **two renames, not one atomic operation**, so
+a crash can land between them and leave `<live>` missing or empty
+with the real data stranded in a sibling. Every open therefore
+reconciles that state first, before deciding whether to create or
+open, resolving to the newest *complete* index: promote
+`<live>.rebuild` if it is complete (the swap had got as far as
+committing the new index), otherwise restore `<live>.old`, then
+remove whatever siblings remain. Reconciling before the
+create-or-open decision is what matters — an open that mistook the
+missing live directory for a fresh shard would create an empty
+index and silently discard the completed rebuild.
+
+"Complete" here means the directory opens as a tantivy index **and**
+carries a stamped brain schema-version payload. Tantivy writes a
+`meta.json` at creation but the payload is stamped only at the final
+commit, so a half-built rebuild is never mistaken for a finished
+one.
+
+Reads are never interrupted by a rebuild. The retriever holds its
+open shard and both cached `IndexReader`s in one `ArcSwap`, and the
+swap that publishes a rebuilt index builds the whole bundle —
+shard plus both readers — *before* storing it. So a `retrieve`
+straddling the swap sees either the complete pre-rebuild index or
+the complete post-rebuild index, never a mixed or empty one, and a
+bundle that fails to build leaves the prior one serving untouched.
+A reader is bound to the `Index` it was opened from, which is why a
+post-rebuild index needs fresh readers rather than a reload of the
+old ones.
+
+The rebuild worker emits progress metrics (rows indexed, ETA) and a
+final completion log line.
 
 Idempotency: a rebuild is safe to restart from scratch at any
 point — the `<live>.rebuild/` directory is truncated on entry.
@@ -150,15 +191,37 @@ On shard spawn:
 
 1. `Index::open(memory_text.tantivy)` and `Index::open(statements.tantivy)`.
 2. If both succeed AND schema version matches: ready.
-3. Replay WAL tail — any post-commit memory or statement writes
-   that landed in redb but not yet in tantivy (because the
-   indexer was mid-batch). The indexer drains them through the
-   standard write path; `delete_term(id)` then `add_document(...)`
-   ensures idempotency on replay of an already-committed write.
-4. If `Index::open` fails for either index: schedule §5 rebuild
-   for the failed index. The other scope remains available.
-5. Reads on a scope under rebuild return `IndexUnavailable`
-   until the rebuild commits.
+3. Each scope's open returns its `Index` paired with a status:
+   `Ready`, or `NeedsRebuild` carrying why. The reason is
+   `SchemaVersionMismatch { found, expected }` or `PayloadCorrupt`
+   when the directory opened but its stamped payload is not the
+   current one or will not parse, and `OpenFailed` when the
+   directory would not open at all. In that last case there is no
+   real index to hand back, so the open yields a RAM-backed
+   placeholder to satisfy the type contract. The two scopes' statuses
+   are independent, so one scope needing a rebuild leaves the other
+   available.
+4. Any scope reporting `NeedsRebuild` is rebuilt **inline, here**,
+   before the shard serves anything, and the directory is then
+   re-opened. Recovery's contract is that it returns a shard whose
+   scopes are both `Ready`; it asserts that on the re-open rather
+   than trusting it. A shard therefore never begins serving with a
+   scope in a non-ready state, and the placeholder from step 3 is
+   replaced before any read could reach it.
+
+Recovery has exactly one repair, and it is the §5 rebuild from the
+redb tables. There is no WAL replay on this path: the lexical indexes
+take no part in the WAL's durability story, so recovery has no log
+position to resume from and no per-write replay to perform. A scope is
+either `Ready` and left alone, or rebuilt whole. (The memory HNSW is
+the opposite case — its snapshot records the LSN it was taken at and
+recovery replays the WAL past that point — so the two derived indexes
+do not recover the same way.)
+
+An empty scope directory is a fresh index, not a broken one: only a
+directory holding a committed `meta.json` is a previously-built
+index, and a newly created index that has never committed reports
+`Ready` because the first writer commit is what stamps the payload.
 
 ## 7. Size budgets (informational)
 
@@ -176,7 +239,16 @@ hence smaller per-doc.
 
 The two `*.tantivy/` directories are **safe to back up** with
 filesystem snapshot tools while the shard is running, but the
-backup will reflect only committed segments. Brain
-recovery path treats any missing or stale tantivy backup as
-"rebuild on next start" (§6) — operators do NOT need a
-quiesce-before-snapshot ritual.
+backup will reflect only committed segments. Operators do NOT need a
+quiesce-before-snapshot ritual: a backup that comes back *stale* —
+stamped at an older schema version, or unopenable — reports
+`NeedsRebuild` and is rebuilt from redb on next start (§6), so it
+self-heals.
+
+A backup that comes back **missing** does not. An absent or empty
+scope directory is indistinguishable from a fresh shard, so it is
+created empty and reported `Ready`, and a `Ready` scope is never
+rebuilt. The shard then serves lexical reads against an empty index
+without complaining. Restoring a shard without its `*.tantivy/`
+directories therefore needs an explicit rebuild, and restoring them
+is the cheaper path.

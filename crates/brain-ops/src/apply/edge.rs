@@ -58,10 +58,10 @@ pub fn apply_link(
 
     let mut edges_t = wtxn
         .open_table(EDGES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("open EDGES: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("open EDGES", &e))?;
     let mut edges_rev_t = wtxn
         .open_table(EDGES_REVERSE_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("open EDGES_REVERSE: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("open EDGES_REVERSE", &e))?;
 
     // Detect "already-existed" inside the wtxn so we don't double-
     // count the denormalised edge counters. edge::link is upsert
@@ -77,7 +77,7 @@ pub fn apply_link(
     .encode();
     let already_existed = edges_t
         .get(fwd_key.as_slice())
-        .map_err(|e| ApplyError::Storage(format!("EDGES get: {e:?}")))?
+        .map_err(|e| ApplyError::storage("EDGES get", &e))?
         .is_some();
 
     edge::link(
@@ -126,10 +126,10 @@ pub fn apply_unlink(
     let removed = {
         let mut edges_t = wtxn
             .open_table(EDGES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open EDGES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open EDGES", &e))?;
         let mut edges_rev_t = wtxn
             .open_table(EDGES_REVERSE_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open EDGES_REVERSE: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open EDGES_REVERSE", &e))?;
 
         edge::unlink(
             &mut edges_t,
@@ -166,10 +166,10 @@ fn memory_in_space(
 ) -> Result<bool, ApplyError> {
     let t = wtxn
         .open_table(MEMORIES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
     let Some(g) = t
         .get(memory_id.to_be_bytes())
-        .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?
+        .map_err(|e| ApplyError::storage("MEMORIES get", &e))?
     else {
         return Ok(false);
     };
@@ -191,10 +191,10 @@ fn bump_edge_count(
     let mut row: MemoryMetadata = {
         let t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         let Some(g) = t
             .get(key)
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?
+            .map_err(|e| ApplyError::storage("MEMORIES get", &e))?
         else {
             return Ok(());
         };
@@ -219,9 +219,9 @@ fn bump_edge_count(
 
     let mut t = wtxn
         .open_table(MEMORIES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
     brain_metadata::tables::agg::put_memory(wtxn, &mut t, key, &row)
-        .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (edge count): {e:?}")))?;
+        .map_err(|e| ApplyError::storage("MEMORIES insert (edge count)", &e))?;
     Ok(())
 }
 

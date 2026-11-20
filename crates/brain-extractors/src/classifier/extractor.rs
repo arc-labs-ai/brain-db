@@ -9,6 +9,7 @@ use brain_protocol::schema::ExtractorTarget;
 
 use super::gliner_label;
 use super::model::{ClassifiedSpan, ClassifierModel};
+use super::offload::ClassifierOffload;
 use crate::framework::extractor::{
     ExtractionContext, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
 };
@@ -29,6 +30,10 @@ pub struct ClassifierExtractor {
     /// entity-type registry. Empty → degraded (no labels = nothing
     /// to classify against).
     target_labels: Arc<Vec<String>>,
+    /// Where the batched forward pass runs. `None` runs it on the calling
+    /// thread, which is correct for a caller with no reactor to protect and
+    /// ruinous for one that has: see [`ClassifierOffload`].
+    offload: Option<Arc<dyn ClassifierOffload>>,
     /// Reason captured at construction time when the model couldn't
     /// load — surfaces in every degraded dispatch.
     degraded_reason: Option<String>,
@@ -54,6 +59,7 @@ impl ClassifierExtractor {
             confidence_threshold,
             model: Some(model),
             target_labels,
+            offload: None,
             degraded_reason: None,
         }
     }
@@ -76,8 +82,21 @@ impl ClassifierExtractor {
             confidence_threshold,
             model: None,
             target_labels: Arc::new(Vec::new()),
+            offload: None,
             degraded_reason: Some(reason.into()),
         }
+    }
+
+    /// Attach the offloader the batched forward pass runs on.
+    ///
+    /// Separate from the constructors because which executor should carry the
+    /// pass is a property of the deployment, not of the extractor definition:
+    /// a shard supplies one to keep its reactor answering, a test or a
+    /// benchmark supplies `None` and the pass runs inline.
+    #[must_use]
+    pub fn with_offload(mut self, offload: Option<Arc<dyn ClassifierOffload>>) -> Self {
+        self.offload = offload;
+        self
     }
 
     /// True iff a model is wired in.
@@ -410,18 +429,38 @@ impl Extractor for ClassifierExtractor {
             }
 
             let (label_owned, qname_by_label) = self.resolve_labels(labels);
-            let label_refs: Vec<&str> = label_owned.iter().map(String::as_str).collect();
-
-            // Hold an owned String for each memory's text so the
-            // `&str` refs we hand to predict_batch outlive the call.
-            let texts: Vec<&str> = mems
+            let texts: Vec<String> = mems
                 .iter()
-                .map(|m| m.text.as_deref().unwrap_or(""))
+                .map(|m| m.text.as_deref().unwrap_or("").to_string())
                 .collect();
-            let batch_inputs: Vec<(&str, &[&str])> =
-                texts.iter().map(|t| (*t, label_refs.as_slice())).collect();
 
-            let batched = match model.predict_batch(&batch_inputs) {
+            // The forward pass is uninterruptible CPU work — 3.82 s per
+            // micro-batch, 97% of an extraction cycle — and this tier is
+            // driven from a worker that shares its shard's reactor thread
+            // with every request that shard serves. Run on that thread it
+            // stalls all of them: against a 1.80 ms median, two writes in a
+            // ten-second window took 3.93 s and 3.86 s, one per one-second
+            // tick. An offloader moves the pass to a thread the reactor does
+            // not wait on. With none attached — a test, a benchmark, an
+            // offline tool, none of which has a reactor to protect — the pass
+            // runs here, as the single-input path does.
+            let outcome = match &self.offload {
+                Some(offload) => {
+                    offload
+                        .predict_batch(Arc::clone(model), texts, label_owned)
+                        .await
+                }
+                None => {
+                    let label_refs: Vec<&str> = label_owned.iter().map(String::as_str).collect();
+                    let batch_inputs: Vec<(&str, &[&str])> = texts
+                        .iter()
+                        .map(|t| (t.as_str(), label_refs.as_slice()))
+                        .collect();
+                    model.predict_batch(&batch_inputs)
+                }
+            };
+
+            let batched = match outcome {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(

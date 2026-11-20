@@ -1,6 +1,6 @@
-# 14.03 Lock-Free Primitives (ArcSwap + crossbeam-epoch)
+# 14.03 Lock-Free Primitives (ArcSwap + Arc)
 
-> **TL;DR.** Two concrete crates do the lock-free heavy lifting: ArcSwap for atomic snapshot publication, crossbeam-epoch for safe memory reclamation. This section covers both — usage patterns, lifetimes, and the discipline that keeps them sound.
+> **TL;DR.** One crate does the lock-free heavy lifting: ArcSwap, for atomic publication of immutable snapshots. Reclamation falls out of `Arc`'s refcount — Brain runs no epoch protocol — and deletion is a tombstone bitmap plus a pending overlay, filtered at search time. This section covers the usage patterns, the lifetimes, and the discipline that keeps them sound.
 
 ## ArcSwap
 
@@ -61,26 +61,29 @@ These are read-mostly: reads happen per-request; stores happen rarely (publicati
 ## 5. The HNSW use case
 
 ```rust
-struct ShardState {
-    hnsw: ArcSwap<HnswState>,
-    // ...
+struct SharedHnsw {
+    main: Arc<ArcSwap<MainEpoch>>,      // immutable published index + generation
+    pending: Arc<RwLock<PendingBuffer>>, // inserts/tombstones not yet folded in
 }
 
 // Read path
 fn search(&self, query: &[f32]) -> Vec<...> {
-    let hnsw = self.hnsw.load_full();
-    // hnsw is an Arc; valid for the duration of this function
-    hnsw.search(query, ...)
+    let epoch = self.main.load();
+    // epoch is an Arc guard; the index it names is immutable
+    epoch.index.search(query, ...)
 }
 
 // Write path
-fn publish_new_hnsw(&self, new_state: HnswState) {
-    let new_arc = Arc::new(new_state);
-    self.hnsw.store(new_arc);
+fn publish(&self, new_index: HnswIndex) {
+    let prev = self.main.load();
+    self.main.store(Arc::new(MainEpoch {
+        index: new_index,
+        epoch_id: prev.epoch_id.wrapping_add(1),
+    }));
 }
 ```
 
-The reader's `load_full()` returns an Arc; while held, the Arc keeps the HnswState alive. Even if the writer publishes a new state, the reader's old state remains valid until dropped.
+The reader's `load()` yields a reference-counted handle; while held, it keeps that generation alive. Even if the writer publishes a replacement, the reader's generation stays valid — and unmodified — until dropped. The published index is never edited in place, which is what makes the refcount sufficient for reclamation.
 
 ## 6. The Arc semantics
 
@@ -90,9 +93,9 @@ The reader's `load_full()` returns an Arc; while held, the Arc keeps the HnswSta
 - `Drop`: decrements refcount; if reaches zero, drops the inner T.
 
 For Brain's HNSW:
-- The writer holds one Arc (for ongoing mutations or as the current "active" state).
-- Each in-flight reader holds an Arc (returned by load_full).
-- When old states are no longer referenced, they're freed.
+- The writer holds a reference to the published slot solely to keep it alive regardless of reader cloning. It never mutates the published index.
+- Each in-flight reader holds a reference to the generation it loaded.
+- When a superseded generation is no longer referenced, it's dropped — the graph and its tombstone bitmap together.
 
 ## 7. The "load vs load_full" choice
 
@@ -220,253 +223,93 @@ ArcSwap gives Brain:
 - Simple API.
 - Compatible with Rust's ownership model via Arc.
 
-It's the right primitive for "atomically swap the current version of this data structure". Combined with the single-writer-per-shard discipline and Arc's automatic refcounting, it provides Brain's publication mechanism.
+It's the right primitive for "atomically swap the current version of this data structure". Combined with the one-writer-per-shard discipline and Arc's automatic refcounting, it provides Brain's publication mechanism.
 
 ---
 
-## crossbeam-epoch
+## Reclamation and Tombstones
 
-[`crossbeam-epoch`](https://github.com/crossbeam-rs/crossbeam) provides epoch-based reclamation for lock-free data structures.
+The second half of the index's concurrency story: how superseded state is freed, and how deletions are represented given that the graph cannot efficiently remove a node.
 
-## 1. The library
+## 1. There is no reclamation library
 
-Part of the crossbeam project. Provides:
+Brain runs no epoch-based reclamation protocol and uses no reclamation crate. There are no reader pins, no guards to scope, no `defer_destroy`, no garbage queue, no global reclamation counter, and no writer-side wait for readers to leave an interval.
 
-- `Atomic<T>`: an atomic pointer with safe reclamation semantics.
-- `Owned<T>`: ownership of an unpublished item.
-- `Shared<'g, T>`: a shared reference within a guard.
-- `Guard`: a reader's pin to an epoch.
-- `pin()`: enter an epoch (returns a Guard).
+Reclamation is `Arc`'s reference count over whole published generations, as described under ArcSwap above. That is the entire mechanism.
 
-GitHub: [crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam).
+## 2. Why no protocol is needed
 
-## 2. The use case in Brain
+Epoch-based reclamation exists to solve a specific problem: a structure is mutated in place while lock-free readers walk it, so an interior node becomes unreachable at a moment when a reader may still be standing on it. The refcount cannot help, because nothing holds a reference to the node itself.
 
-Brain uses crossbeam-epoch primarily for:
+Brain never creates that situation. The published index is immutable. A publish builds a new one and swaps the pointer; it does not edit the structure a reader is inside. Once the unit of reclamation is the whole published generation, the refcount already tracks exactly the thing that must be protected — and tracks it precisely, rather than conservatively bounding it by an interval.
 
-- Internal HNSW node management during incremental cleanup.
-- Other lock-free data structures within a single shard's scope (e.g., free lists for slot allocation).
+A protocol here would add pins, grace periods, stuck-reader diagnostics and unsafe deferred-destroy calls, in exchange for nothing Brain needs. The design's answer to fine-grained reclamation is to not have fine-grained reclamation.
 
-For most Brain code, ArcSwap + Arc handle reclamation. crossbeam-epoch is for cases where Arc isn't ergonomic (e.g., for plain pointers or for fine-grained items within a structure).
+## 3. What "epoch" means in Brain
 
-## 3. The basic pattern
+The name survives, attached to a different idea. The published main is a `MainEpoch`: an immutable index plus an `epoch_id` generation number, bumped on each publish.
 
-```rust
-use crossbeam_epoch::{self as epoch, Atomic, Owned, Shared};
+The generation number is reconciliation and observability state — a flush reports which generation it published, and a reader can ask which one it is seeing. Nothing pins to it, nothing waits on it, and no reader consults it to decide whether it may proceed.
 
-struct LockFreeStructure {
-    head: Atomic<Node>,
-}
+It is deliberately a wrapping counter. No code orders two generation numbers across a wrap or holds one as a capability, so wrap-around is a non-event rather than a hazard to size a counter against.
 
-// Reader
-fn read(&self) {
-    let guard = epoch::pin();
-    let head = self.head.load(Ordering::Acquire, &guard);
-    // ... use head ...
-}
+## 4. Tombstones: the bitmap
 
-// Writer (single-writer per shard in Brain)
-fn write(&self, item: Node) {
-    let guard = epoch::pin();
-    let new = Owned::new(item);
-    let old = self.head.swap(new, Ordering::AcqRel, &guard);
-    unsafe {
-        guard.defer_destroy(old);   // Deferred free
-    }
-}
-```
+The graph has no efficient eager deletion, so a forgotten memory is **tombstoned**: its node stays in the graph and is filtered out at search time.
 
-The reader pins to an epoch. The writer swaps in a new value and tags the old for deferred destruction. The old is freed once all readers have advanced past the current epoch.
+The filter state is a bit-packed bitmap over the internal `u32` ids the graph library returns:
 
-## 4. The slot free list
+- `Vec<u64>`, 64 bits per word. At the per-shard ceiling of 10M memories this is ~1.25 MB; a `Vec<bool>` would be 10 MB.
+- Grown lazily — a fresh bitmap allocates nothing.
+- Every operation is idempotent. Setting an already-set bit, or clearing an already-clear one, is a no-op and does not perturb the count.
+- The count is a running counter, updated only on real bit transitions, so reading it is O(1). The tombstone ratio is exposed per request, and an O(N/64) population count per call would be wasteful.
 
-One concrete use: the arena's slot free list.
+The bitmap deliberately knows nothing about `MemoryId`; the translation lives on the index via its id map.
 
-When a slot is reclaimed, it's added to the free list. Allocators take from the list.
+## 5. Tombstones: the pending overlay
 
-```rust
-struct FreeList {
-    head: Atomic<FreeNode>,
-}
+Above the published bitmap sits a set of ids tombstoned since the last publish. The overlay wins everywhere:
 
-fn push(&self, slot: SlotId) {
-    let guard = epoch::pin();
-    let new = Owned::new(FreeNode { slot, next: Atomic::null() });
-    loop {
-        let head = self.head.load(Ordering::Acquire, &guard);
-        new.next.store(head, Ordering::Release);
-        if self.head.compare_exchange(head, new, Ordering::AcqRel, Ordering::Acquire, &guard).is_ok() {
-            break;
-        }
-    }
-}
-```
+- A search excludes overlay ids from the main graph's candidates before merging in the pending tier.
+- The presence and tombstone predicates consult the overlay before the published bitmap.
+- The combined tombstone count adds overlay ids not already counted in main.
 
-(In Brain, the writer-per-shard discipline obviates the CAS loop — the writer is the only mutator. Simplified accordingly.)
+So a forget takes effect immediately, without waiting for a publish.
 
-## 5. The single-writer simplification
+## 6. Tombstoned nodes are never individually freed
 
-With single-writer-per-shard, much of crossbeam-epoch's complexity goes unused:
+There is no per-node free to schedule, and therefore no window in which a reader could visit a node whose memory has been released.
 
-- No CAS loops needed (no concurrent writers).
-- The writer can use simple atomics with the writer-only access pattern.
+A tombstoned node's memory goes away when its generation does. The next rebuild simply omits the tombstoned memories, so the freshly built index starts with an empty bitmap, and the old nodes are dropped along with the old `MainEpoch` when its last reader lets go.
 
-Brain uses crossbeam-epoch for the **reclamation** aspect — its tracking of "when is it safe to free?" — even though Brain does not need its full lock-free machinery.
+This is also why the bitmap is snapshot-persisted byte-for-byte rather than recomputed: it is state belonging to one published generation, and it is restored with the generation it describes.
 
-## 6. The epoch advance
+## 7. The cost model
 
-The library maintains a global epoch counter. Periodically:
+- Taking a reference to the published generation: an atomic read plus a refcount bump.
+- Publishing: an atomic pointer swap. Lock-free and wait-free — a publish never blocks a reader, a read never blocks a publish, and a publish completes in bounded time regardless of reader count.
+- Freeing a superseded generation: one deallocation of the whole graph, paid by whichever reader drops last.
+- Testing a tombstone: one indexed word load and a mask.
 
-- The library advances the global epoch.
-- Threads' "old epoch" values can be advanced.
-- Memory tagged for deferred destruction in epochs that all threads have left can be freed.
+The dominant cost of a publish is *building* the new index, not publishing it.
 
-The advance is automatic (every few hundred operations) but can be triggered explicitly if Brain wants forced cleanup.
+## 8. The cost this model does carry
 
-## 7. The "guard scope" rule
+Between a publish and the moment the last reader drops the previous generation, both indexes are resident. Memory peaks across that window by about one extra copy of the graph.
 
-A Guard's lifetime defines what's safe to access:
+The window is bounded by the longest in-flight search, and each publish leaves at most one superseded generation behind, so a slow reader costs a bounded amount rather than accumulating garbage. Shards are sized for that peak.
 
-```rust
-let guard = epoch::pin();
-let shared: Shared<'_, T> = atomic.load(Ordering::Acquire, &guard);
-// shared is valid here
-drop(guard);
-// shared is invalid here (compiler enforces via lifetime)
-```
+## 9. The type-level discipline
 
-The `'g` lifetime on `Shared<'g, T>` is bound by the Guard. The compiler prevents using a `Shared` after its Guard is dropped.
+The reader handle is `Clone`; the writer handle deliberately is not. One writer per shard is enforced by the type system rather than by a runtime check.
 
-This is part of Rust's safe-by-default API for unsafe-ish concurrent code.
+The writer also holds a reference to the published slot purely to keep it alive regardless of how readers clone themselves. It never reads it to mutate the published index — there is no in-place mutation to make.
 
-## 8. The "unsafe defer_destroy" caveat
+## 10. The summary
 
-`Guard::defer_destroy` is an unsafe operation:
-
-```rust
-unsafe {
-    guard.defer_destroy(old);
-}
-```
-
-The unsafety is because the caller asserts that the data won't be freed multiple times. Brain's writer-per-shard discipline ensures this — only one task is calling defer_destroy on any given item.
-
-Every use of `defer_destroy` in the codebase is audited. There's no place where it could be called twice.
-
-## 9. The cost of pinning
-
-`epoch::pin()`:
-- Atomic load + atomic store (track per-thread state).
-- ~20-50 ns.
-
-Cheap enough to call per-operation. Brain calls it per-search and per-write.
-
-## 10. The cost of advance
-
-Epoch advance:
-- Check all threads' epochs (~10 ns × thread count).
-- Atomic increment of global counter.
-- Possibly free a batch of deferred items.
-
-The cost is amortized across many operations. Per-advance: ~50-100 ns.
-
-## 11. The "garbage queue"
-
-Each thread maintains a per-thread garbage queue:
-
-- Items defer_destroy'd while pinned in epoch E go to the thread's queue with epoch tag E.
-- When the global epoch advances past E (and all threads have advanced), items in queue with tag E can be freed.
-
-This is per-thread to avoid contention. The library handles the bookkeeping.
-
-## 12. The "retire" pattern
-
-For dropping non-pointer resources (e.g., closing a file when no readers reference the descriptor):
-
-```rust
-guard.defer(|| close_file(fd));
-```
-
-The closure runs after the epoch advances. Equivalent to defer_destroy but for arbitrary cleanup.
-
-## 13. The interaction with Loom
-
-Loom is a Rust concurrency model checker. crossbeam-epoch has Loom-tested versions for verifying correctness in test environments.
-
-Brain's tests run under Loom for the lowest-level concurrent code paths. This catches subtle ordering bugs.
-
-## 14. The "epoch bound" trade-off
-
-Epoch-based reclamation has a delay: items aren't freed immediately when defer_destroy'd. They wait for the epoch to advance.
-
-For typical Brain workloads:
-- Average delay: ~10-100 µs (until next epoch advance).
-- Worst case: bounded by the slowest reader's pin duration.
-
-For most use cases, this delay is fine. For memory-pressured workloads, the delay can cause peak memory to be slightly higher than steady-state.
-
-## 15. The "no GC pause" claim, revisited
-
-crossbeam-epoch doesn't have stop-the-world pauses:
-
-- Readers proceed without waiting.
-- Writers proceed without waiting (with one exception: if reclamation must happen and all readers are pinned, the writer waits — but this is rare).
-
-Compared to traditional GC, no large pauses; just small periodic increments.
-
-## 16. The "memory ordering" awareness
-
-crossbeam-epoch APIs require explicit memory orderings:
-
-```rust
-let head = self.head.load(Ordering::Acquire, &guard);
-self.head.store(new, Ordering::Release, &guard);
-```
-
-The orderings:
-- Acquire: prevents reordering of subsequent reads.
-- Release: prevents reordering of preceding writes.
-- AcqRel: both.
-- SeqCst: full barrier (most expensive; rarely needed).
-
-Brain uses Acquire/Release for normal paths; SeqCst for extra-careful cases.
-
-## 17. The "default features" choice
-
-crossbeam-epoch has features for:
-
-- `std`: standard library (default; Brain uses this).
-- `nightly`: nightly compiler features (Brain does not use).
-- `loom`: Loom integration for testing (enabled in test builds).
-
-Brain enables std and loom-in-test.
-
-## 18. The library version
-
-Brain pins to a specific version of crossbeam-epoch in Cargo.toml. The library has been stable for years; updates are mostly bug fixes and performance improvements.
-
-## 19. The alternative: hazard pointers
-
-Hazard pointers are an alternative to epochs:
-
-- Each reader publishes a "hazard pointer" to the data it's about to read.
-- Writers check all hazard pointers before freeing.
-
-Pros: more precise (only the specific item is protected, not all data in an epoch).
-
-Cons: more complex API; harder to use safely.
-
-Brain chose epochs over hazards for ergonomics. The precision difference doesn't matter for Brain's workload.
-
-## 20. The summary
-
-crossbeam-epoch provides safe lock-free reclamation:
-
-- Readers pin cheaply.
-- Writers tag old data for deferred free.
-- Memory is freed when no readers can possibly access it.
-
-Brain uses it for fine-grained reclamation within data structures. The high-level publication uses ArcSwap. Together, they form Brain's no-locks reader path.
+- Reclamation: `Arc` refcount over immutable published generations. No epoch protocol, no pins, no unsafe deferred destruction.
+- Deletion: a tombstone bitmap plus a pending overlay, filtered at search time. Nodes are never individually removed or freed.
+- Both choices follow from the same decision — replace the structure, never edit it under readers — and that decision is what makes the concurrency story small enough to state in full.
 
 ---
 

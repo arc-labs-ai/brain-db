@@ -30,15 +30,15 @@ What can go wrong in the embedding layer and how Brain responds.
 
 **Client action.** Treat as a transient error; retry once. If reproducible, escalate — likely indicates a bug or hardware issue.
 
-## 3. Inference timeout
+## 3. Inference takes much longer than expected
 
-**Failure mode.** The model's forward pass takes much longer than expected.
+**Failure mode.** The model's forward pass runs far past its 5–10 ms envelope — a saturated CPU, or a pathological input.
 
-**Detection.** A per-inference timeout (default 5 seconds — far longer than any normal inference). Exceeded timeouts cancel the inference.
+**Response.** It runs to completion. There is **no per-inference timeout** and no `EmbeddingTimeout`: a forward pass is pure compute with no I/O to hang on, so a slow one is slow rather than stuck, and cancelling it would discard work that was about to finish while leaving the condition that caused the slowness untouched. The pass is on the shard's blocking thread, so the shard's reactor stays schedulable throughout ([`02_inference_pipeline.md`](02_inference_pipeline.md) §19) and the delay is confined to the operation waiting on that embed.
 
-**Response.** The encode operation fails with `EmbeddingTimeout`. Brain logs the event with the input text length.
+**Detection.** Latency, not an error — the operation's own p99 and `brain_extractor_cycle_duration_seconds` for worker-side embeds. A truly pathological input is bounded another way: sequences are truncated at the model's maximum (§5), so there is no unbounded-length case to time out.
 
-**Operator action.** Investigate whether Brain is overloaded (CPU saturated) or whether the model has a pathological case. Adjust the timeout if a deployment legitimately has long-running inference (very long sequences on slow hardware).
+**Operator action.** Treat it as saturation, not as a fault: check whether the shard's CPU is contended, then scale out on the shard axis.
 
 ## 4. Tokenization produces zero tokens
 
@@ -62,6 +62,8 @@ What can go wrong in the embedding layer and how Brain responds.
 **Response.** The encode succeeds but with a truncation warning. The metadata indicates that truncation occurred.
 
 **Client action.** For long content, chunk before encoding, or accept the truncation if the lead is what matters.
+
+> **§6 and §7 describe the GPU path, which is not available.** The model loader refuses any device other than `Device::Cpu` with `EmbedError::UnsupportedDevice` before it does any I/O, so neither failure mode can occur and neither named error exists. They are kept as the shape of that path's failure handling. See [`02_inference_pipeline.md`](02_inference_pipeline.md) §14.2.
 
 ## 6. GPU OOM
 
@@ -132,41 +134,39 @@ Move the model to local fast storage; ensure no contention.
 
 **Failure mode.** Operator changes the model without migrating, then queries return few or no results.
 
-**Detection.** This is observable, not flagged automatically: the `ADMIN_STATS` shows the fingerprint distribution and a high "excluded by fingerprint mismatch" rate.
+**Detection.** This is observable, not flagged automatically: `GET /metrics` carries the fingerprint distribution and the "excluded by fingerprint mismatch" rate.
 
 **Response.** Continue serving (queries match the subset that has the new fingerprint, which may be empty if no encodes have happened).
 
-**Operator action.** Run `ADMIN_MIGRATE_EMBEDDINGS` to convert old-fingerprint memories to the new fingerprint. See [`06_migration.md`](06_migration.md).
+**Operator action.** Converting old-fingerprint memories needs a re-embedding migration, which [`06_migration.md`](06_migration.md) specifies and nothing implements. Until it exists, the way out is to keep the model that wrote the corpus, or to re-ingest.
 
-## 12. Unsupported model file format
+## 12. Weights absent or in an unsupported format
 
-**Failure mode.** The model files are in a format Brain doesn't support (e.g., an old PyTorch pickle that candle can't load, or a custom format).
+**Failure mode.** The model directory has no `model.safetensors` — it holds a `pytorch_model.bin`, a custom format, or nothing.
 
-**Detection.** Candle's load function returns an error.
+**Detection.** The loader looks for `model.safetensors` by name.
 
-**Response.** Startup fails with `UnsupportedModelFormat`.
+**Response.** Shard spawn fails with `EmbedError::WeightsMissing`, whose message names the directory and states that pickle (`.bin`) weights are refused.
 
-**Operator action.** Convert the model to a supported format (safetensors). HuggingFace provides conversion tools.
+**Operator action.** Convert the model to safetensors. HuggingFace provides conversion tools; the conversion is offline and produces an equivalent file with no execution risk.
 
-## 13. Pickle weights with security warning
+## 13. Pickle weights
 
-**Failure mode.** The operator configures a `pytorch_model.bin` (pickle format), which has arbitrary code execution risk.
+**Failure mode.** The operator points the model directory at `pytorch_model.bin`, a format whose load executes arbitrary code from the file.
 
-**Detection.** File extension or magic-byte check on load.
+**Response.** It does not load. There is no warning-and-proceed path and no configuration option that permits it — a refusal an operator can switch off is not a mitigation. The failure is §12's `WeightsMissing`: from the loader's point of view, a directory with only pickle weights is a directory with no weights.
 
-**Response.** Brain logs a warning ("loading pickle weights; this format can execute arbitrary code"). It still proceeds with the load. If `embedding.refuse_pickle = true` (a configuration option, default `false`), Brain refuses to load pickle and fails startup with `PickleRefused`.
+**Operator action.** Convert to safetensors before the model reaches Brain.
 
-**Operator action.** Convert to safetensors format. The conversion is offline and produces an equivalent file with no execution risk.
+## 14. Concurrent embedding load
 
-## 14. Concurrent embedding overload
+**Failure mode.** More embedding work arrives than the shard can keep up with.
 
-**Failure mode.** Too many concurrent embedding requests; the system can't keep up.
+**Response.** Nothing is rejected. There is no embedding queue, no depth limit and no `EmbeddingOverloaded` — concurrency is bounded structurally rather than by admission control. Each shard has one in-flight embed at a time, on its own blocking thread, with the forward pass's fan-out confined to the shard's core ([`02_inference_pipeline.md`](02_inference_pipeline.md) §19). Work past that queues behind the shard's own channel, which is where backpressure already lives, and a saturated shard slows down instead of shedding embeds.
 
-**Detection.** Per-shard queue depth. If a queue exceeds `embed_queue_max` (default 1000), Brain is overloaded.
+**What this costs.** Latency, visibly: a shard under embedding load serves its own ENCODEs more slowly. What it does not cost is a shard's neighbours — measured p95 scheduling-latency inflation from a concurrent embed is 1.00–1.02 (§19) — or correctness, since no embed is ever dropped for load.
 
-**Response.** New embedding requests are rejected with `EmbeddingOverloaded`. The operations that already have requests in flight continue to completion.
-
-**Client action.** Back off and retry. Clients should do this with exponential backoff plus jitter.
+**Operator action.** Scale out. Throughput scales on the shard axis (2.2× from 4 shards to 9 on a 10-CPU box), not by widening one forward pass.
 
 ## 15. Determinism violations
 
@@ -190,7 +190,3 @@ Move the model to local fast storage; ensure no contention.
 **Response.** None automatic.
 
 **Mitigation.** Choose a model that matches the deployment's content distribution. For specialized domains, a domain-specific model.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

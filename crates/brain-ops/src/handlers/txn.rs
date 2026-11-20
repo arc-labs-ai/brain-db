@@ -48,6 +48,11 @@ pub const MAX_TXN_OPS: u32 = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
     Active,
+    /// The commit has claimed the buffer and its write is in flight. The
+    /// outcome belongs to that commit: the buffered work is on its way to
+    /// durability, so nothing else may abort, expire or re-commit the txn
+    /// until the submit resolves into `Committed` or `Aborted`.
+    Committing,
     Committed,
     Aborted,
     Expired,
@@ -250,13 +255,28 @@ pub struct TxnStore {
     entries: Mutex<HashMap<TxnId, TxnEntry>>,
 }
 
+/// What a `TXN_COMMIT` found when it tried to claim the transaction.
+pub(crate) enum CommitClaim {
+    /// The txn already committed; the cached response answers the retry.
+    Replay(TxnCommitResponse),
+    /// This call owns the commit. The buffer is out of the entry and the
+    /// entry is `Committing`. The buffer is boxed so a `Replay` — the
+    /// common retry path — doesn't pay for the buffer's footprint.
+    Claimed {
+        buffer: Box<TxnBuffer>,
+        started_at_unix_nanos: u64,
+        delegated: Option<DelegatedIdentity>,
+    },
+}
+
 impl TxnStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sweep expired entries (state Active but past their expiry).
+    /// Sweep expired entries (state Active but past their expiry). A commit
+    /// in flight remains Committing until its write resolves.
     /// Called inline on every TXN_BEGIN; cheap (one pass over the map).
     fn sweep_expired_locked(entries: &mut HashMap<TxnId, TxnEntry>, now_unix_nanos: u64) {
         for entry in entries.values_mut() {
@@ -303,7 +323,13 @@ impl TxnStore {
                             now.saturating_add(u64::from(e.timeout_seconds) * 1_000_000_000);
                         Ok(e.expires_at_unix_nanos)
                     }
-                    _ => Err(OpError::TxnExpired),
+                    TxnState::Committing => {
+                        // A txn whose commit is in flight accepts no further operations.
+                        Err(OpError::TxnExpired)
+                    }
+                    TxnState::Committed | TxnState::Aborted | TxnState::Expired => {
+                        Err(OpError::TxnExpired)
+                    }
                 }
             }
         }
@@ -316,6 +342,7 @@ impl TxnStore {
     /// is too lazy:
     /// the entries would otherwise occupy RAM for up to
     /// `timeout_seconds` after the socket closed.
+    /// A dropped connection must not discard a commit whose write is in flight.
     ///
     /// `connection_id == [0u8; 16]` is treated as a no-op so in-process
     /// callers (tests, embedded harnesses) can't accidentally wipe
@@ -373,10 +400,104 @@ impl TxnStore {
                             now.saturating_add(u64::from(entry.timeout_seconds) * 1_000_000_000);
                         Ok(r)
                     }
+                    (TxnState::Committing, _) => {
+                        // A txn whose commit is in flight accepts no further operations.
+                        Err(OpError::TxnExpired)
+                    }
                     _ => Err(OpError::TxnExpired),
                 }
             }
         }
+    }
+
+    /// Claim `txn_id` for commit: take its buffer and move it to
+    /// `Committing`, both under the one lock, so a concurrent abort can
+    /// never observe an `Active` entry whose writes are already in flight.
+    pub(crate) fn claim_for_commit(
+        &self,
+        txn_id: TxnId,
+        caller_connection_id: [u8; 16],
+    ) -> Result<CommitClaim, OpError> {
+        let mut entries = self.entries.lock();
+        let now = now_unix_nanos();
+        Self::sweep_expired_locked(&mut entries, now);
+        let entry = entries.get_mut(&txn_id).ok_or(OpError::TxnNotFound)?;
+        // Connection ownership: only the connection that opened the txn
+        // may commit it. A foreign connection is turned away as
+        // TxnNotFound before it can learn the txn's state or apply the
+        // opener's buffered writes under its own identity.
+        if !txn_owned_by(entry.connection_id, caller_connection_id) {
+            return Err(OpError::TxnNotFound);
+        }
+        // Replay support.
+        if let Some(TxnFinalResponse::Commit(c)) = entry.final_response {
+            return Ok(CommitClaim::Replay(TxnCommitResponse {
+                txn_id,
+                committed_at_unix_nanos: c.committed_at_unix_nanos,
+                operations_applied: c.operations_applied,
+            }));
+        }
+        if !matches!(entry.state, TxnState::Active) {
+            return Err(OpError::TxnExpired);
+        }
+        let buffer = entry.buffer.take().ok_or(OpError::TxnExpired)?;
+        entry.state = TxnState::Committing;
+        let started_at_unix_nanos = entry.started_at_unix_nanos;
+        // The identity frozen at begin. `None` for a non-delegated txn.
+        let delegated = entry.delegated.clone();
+        Ok(CommitClaim::Claimed {
+            buffer: Box::new(buffer),
+            started_at_unix_nanos,
+            delegated,
+        })
+    }
+
+    /// Abort `txn_id` on behalf of `caller_connection_id`.
+    pub(crate) fn abort(
+        &self,
+        txn_id: TxnId,
+        caller_connection_id: [u8; 16],
+    ) -> Result<TxnAbortResponse, OpError> {
+        let mut entries = self.entries.lock();
+        let now = now_unix_nanos();
+        Self::sweep_expired_locked(&mut entries, now);
+
+        let entry = entries.get_mut(&txn_id).ok_or(OpError::TxnNotFound)?;
+        // Connection ownership: only the opening connection may abort. A
+        // foreign connection is rejected as TxnNotFound so it can neither
+        // discard another connection's buffered work nor probe for its
+        // existence.
+        if !txn_owned_by(entry.connection_id, caller_connection_id) {
+            return Err(OpError::TxnNotFound);
+        }
+        if let Some(TxnFinalResponse::Abort(a)) = entry.final_response {
+            return Ok(TxnAbortResponse {
+                txn_id,
+                operations_discarded: a.operations_discarded,
+            });
+        }
+        match entry.state {
+            TxnState::Active => {}
+            // A commit already claimed this txn's buffer and its write is in
+            // flight. The buffered work will be durable, so the abort is refused:
+            // answering Ok here would tell the client its writes were discarded
+            // while every one of them lands.
+            TxnState::Committing | TxnState::Committed | TxnState::Aborted | TxnState::Expired => {
+                return Err(OpError::TxnExpired)
+            }
+        }
+
+        let ops = entry.buffer.as_ref().map(TxnBuffer::ops_count).unwrap_or(0);
+        entry.state = TxnState::Aborted;
+        entry.buffer = None;
+        entry.final_response = Some(TxnFinalResponse::Abort(TxnFinalAbort {
+            operations_discarded: ops,
+        }));
+
+        Ok(TxnAbortResponse {
+            txn_id,
+            operations_discarded: ops,
+        })
     }
 }
 
@@ -461,36 +582,15 @@ pub async fn handle_txn_commit(
 ) -> Result<TxnCommitResponse, OpError> {
     let store = &*ctx.txn_store;
 
-    // Take the buffer + mark in-progress while we apply (under lock).
-    let (buffer, started_at, delegated) = {
-        let mut entries = store.entries.lock();
-        let now = now_unix_nanos();
-        TxnStore::sweep_expired_locked(&mut entries, now);
-        let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
-        // Connection ownership: only the connection that opened the txn
-        // may commit it. A foreign connection is turned away as
-        // TxnNotFound before it can learn the txn's state or apply the
-        // opener's buffered writes under its own identity.
-        if !txn_owned_by(entry.connection_id, ctx.caller_connection_id) {
-            return Err(OpError::TxnNotFound);
-        }
-        // Replay support.
-        if let Some(TxnFinalResponse::Commit(c)) = entry.final_response {
-            return Ok(TxnCommitResponse {
-                txn_id: req.txn_id,
-                committed_at_unix_nanos: c.committed_at_unix_nanos,
-                operations_applied: c.operations_applied,
-            });
-        }
-        if !matches!(entry.state, TxnState::Active) {
-            return Err(OpError::TxnExpired);
-        }
-        let buf = entry.buffer.take().ok_or(OpError::TxnExpired)?;
-        let started_at = entry.started_at_unix_nanos;
-        // The identity frozen at begin. `None` for a non-delegated txn.
-        let delegated = entry.delegated.clone();
-        (buf, started_at, delegated)
-    };
+    let (buffer, started_at, delegated) =
+        match store.claim_for_commit(req.txn_id, ctx.caller_connection_id)? {
+            CommitClaim::Replay(resp) => return Ok(resp),
+            CommitClaim::Claimed {
+                buffer,
+                started_at_unix_nanos,
+                delegated,
+            } => (*buffer, started_at_unix_nanos, delegated),
+        };
 
     let ops_applied = buffer.ops_count();
 
@@ -614,40 +714,7 @@ pub async fn handle_txn_abort(
     req: TxnAbortRequest,
     ctx: &OpsContext,
 ) -> Result<TxnAbortResponse, OpError> {
-    let store = &*ctx.txn_store;
-    let mut entries = store.entries.lock();
-    let now = now_unix_nanos();
-    TxnStore::sweep_expired_locked(&mut entries, now);
-
-    let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
-    // Connection ownership: only the opening connection may abort. A
-    // foreign connection is rejected as TxnNotFound so it can neither
-    // discard another connection's buffered work nor probe for its
-    // existence.
-    if !txn_owned_by(entry.connection_id, ctx.caller_connection_id) {
-        return Err(OpError::TxnNotFound);
-    }
-    if let Some(TxnFinalResponse::Abort(a)) = entry.final_response {
-        return Ok(TxnAbortResponse {
-            txn_id: req.txn_id,
-            operations_discarded: a.operations_discarded,
-        });
-    }
-    if !matches!(entry.state, TxnState::Active) {
-        return Err(OpError::TxnExpired);
-    }
-
-    let ops = entry.buffer.as_ref().map(TxnBuffer::ops_count).unwrap_or(0);
-    entry.state = TxnState::Aborted;
-    entry.buffer = None;
-    entry.final_response = Some(TxnFinalResponse::Abort(TxnFinalAbort {
-        operations_discarded: ops,
-    }));
-
-    Ok(TxnAbortResponse {
-        txn_id: req.txn_id,
-        operations_discarded: ops,
-    })
+    ctx.txn_store.abort(req.txn_id, ctx.caller_connection_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -886,5 +953,71 @@ mod tests {
             space_id: brain_core::SpaceId(uuid::Uuid::nil()),
         });
         assert_eq!(buf.ops_count(), 5);
+    }
+
+    #[test]
+    fn abort_during_commit_refuses_and_leaves_the_txn_committing() {
+        let store = TxnStore::new();
+        let id = [1u8; 16];
+        let mut buffer = TxnBuffer::default();
+        fill_buffer(&mut buffer, 2);
+        store.entries.lock().insert(
+            id,
+            TxnEntry {
+                state: TxnState::Active,
+                started_at_unix_nanos: 1,
+                expires_at_unix_nanos: u64::MAX,
+                timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                final_response: None,
+                buffer: Some(buffer),
+                delegated: None,
+                connection_id: [0u8; 16],
+            },
+        );
+
+        match store
+            .claim_for_commit(id, [0u8; 16])
+            .expect("active txn must be claimable")
+        {
+            CommitClaim::Claimed { buffer, .. } => assert_eq!(buffer.ops_count(), 2),
+            CommitClaim::Replay(_) => panic!("active txn must not replay a commit"),
+        }
+
+        assert!(matches!(
+            store.abort(id, [0u8; 16]),
+            Err(OpError::TxnExpired)
+        ));
+
+        let entries = store.entries.lock();
+        let entry = entries.get(&id).expect("claimed txn must remain present");
+        assert_eq!(entry.state, TxnState::Committing);
+        assert!(entry.final_response.is_none());
+    }
+
+    #[test]
+    fn abort_active_txn_succeeds_and_reports_buffered_ops() {
+        let store = TxnStore::new();
+        let id = [2u8; 16];
+        let mut buffer = TxnBuffer::default();
+        fill_buffer(&mut buffer, 2);
+        store.entries.lock().insert(
+            id,
+            TxnEntry {
+                state: TxnState::Active,
+                started_at_unix_nanos: 1,
+                expires_at_unix_nanos: u64::MAX,
+                timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                final_response: None,
+                buffer: Some(buffer),
+                delegated: None,
+                connection_id: [0u8; 16],
+            },
+        );
+
+        let response = store
+            .abort(id, [0u8; 16])
+            .expect("active txn must be abortable");
+        assert_eq!(response.txn_id, id);
+        assert_eq!(response.operations_discarded, 2);
     }
 }

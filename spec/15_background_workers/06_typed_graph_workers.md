@@ -69,7 +69,7 @@ Queue defaults (operator-configurable):
 
 | Queue | Capacity | Overflow |
 |---|---|---|
-| Per-shard extractor queue (feeds all three tiers) | 1 000 | `Drop` + metric |
+| Per-shard extractor queue (feeds all three tiers) | 1 024 | `Drop` + metric |
 
 There is **one** physical queue per shard: the memory is enqueued once and the worker runs every eligible tier on it. Overflow policy `Drop` records a metric counter and emits a warn-level trace event so the operator sees pressure. The dropped extraction writes an audit row `Skipped(reason: "queue full")`.
 
@@ -131,6 +131,80 @@ On classifier queue overflow:
 
 Brain does not implement adaptive throttling.
 
+### Bounded extraction retries
+
+A memory whose extraction fails is retried, but never forever and never at the cycle rate. The worker runs two independent ladders, because the two failure populations have different evidence available about whose fault they are.
+
+Both are bounded by policy rather than by hardware: nothing about the machine determines any of these numbers, so they are four operator-settable `[workers.extractor]` keys with documented defaults.
+
+| Key | Default | Bounds |
+|---|---|---|
+| `max_apply_attempts_per_memory` | `3` | apply / gate infra-failure attempts for one memory |
+| `provider_reachable_window_ms` | `900000` | how recently the LLM tier must have answered for a failure to be the memory's fault |
+| `max_item_attributable_failures` | `5` | transient failures charged to the memory itself |
+| `max_transient_attempts` | `48` | absolute attempts for one memory, whatever the cause |
+
+All four are validated non-zero at startup. Zero is a configuration error, not a way to disable a ladder: a memory with no attempt budget would be abandoned on its first failure, and "retry nothing, ever" is not a setting worth making reachable by typo.
+
+#### Ladder 1 — apply and gate infra failures
+
+The apply transaction rolled back, or the idempotency gate errored before any tier ran. This ladder lives in a per-shard in-memory map of `{ attempts, last_attempt_unix_nanos, next_due_unix_nanos }`.
+
+- **Backoff** is `min(60 s, 5 s << (attempts − 1))`. The cycle interval is one second, so without a ladder a rolled-back apply re-runs at 1 Hz; the 5 s base sits well above the interval so a busy shard or a contended write transaction gets room to clear before the budget is spent on it.
+- **A deterministic failure spends the whole budget at once.** A redb failure that reproduces byte-for-byte on every retry — the store reporting the file damaged, a value over redb's 3 GiB per-value ceiling, or engine/migration misuse such as a wrong-typed table open, a table opened twice in one write transaction, or an invalid savepoint — would only delay the same verdict while re-running the pipeline each time. Everything else, including every failure nobody has classified, is treated as transient and retryable: a misclassification then costs retries rather than grounding.
+- **The map is bounded by construction**, not by the assumption that few memories fail: at most 4 096 tracked memories, entries older than one hour expired first, then the least-recently-failed entry evicted, so a memory still actively walking its ladder is the last thing dropped.
+- **It is deliberately in-memory.** A restart clears the ladder, and that is the behaviour worth having — a process restart is exactly the kind of event that clears the conditions this ladder exists for. The worst case it allows is `max_apply_attempts_per_memory` further attempts per restart, never the unbounded 1 Hz replay an absent ladder gives.
+- **A committed apply clears the entry**, so attempts count *consecutive* failures. A memory that fails twice, succeeds, and fails again starts from zero rather than inheriting a nearly spent budget from an unrelated earlier incident.
+
+#### Ladder 2 — transient LLM-tier failures
+
+Durable, carried as two counters on the memory's `ExtractorPipelineAuditEntry`: `attempts` and `item_attributable_failures`. Backoff is `min(1 h, 1 s << (attempts − 1))`, and a memory is due again only once that interval has elapsed since its last attempt.
+
+**Two counters, not one, and that is the point.** One counter cannot tell a memory that keeps failing on its own content from a memory caught behind a dead provider. With a single budget, a provider outage would walk every queued memory to exhaustion and convert a transient outage into permanent derivation loss across the whole shard.
+
+- A failure is **attributable to the memory** only when the provider was demonstrably reachable: an LLM tier ran successfully on this shard within `provider_reachable_window_ms` of it. The success timestamp is recorded before the apply loop, so a failure in the same batch as a success is charged to the memory. The evidence is in-memory, so a restart falls back to charging the provider — the direction that preserves a memory's grounding.
+- An attributable failure increments both counters; a failure with no such evidence increments only `attempts`. It still widens the backoff, but leaves the per-item budget intact.
+- **Either bound alone ends the retries.** `max_item_attributable_failures` (5) catches a memory failing on its own content — a failure landing while other memories' calls are succeeding is the memory's own, and the same text fails the same way next time, so this is small by choice. `max_transient_attempts` (48) catches a provider that never comes back; it is derived, not chosen: the ladder widens to one attempt per capped hour, so covering a stated two-day outage window is 48 hours ÷ 1 hour.
+- A **permanent** classification — bad or absent key, no balance, malformed request, schema mismatch — is terminal on the first failure. Retrying cannot help and only hides the problem from the operator.
+
+#### Exhaustion is durable and visible
+
+When either ladder gives up, the memory leaves the extraction queue and the fact is written down rather than inferred:
+
+- A durable audit row with `status = FAILURE` and `failure_class = PERMANENT`. That pairing is what makes the idempotency gate report the memory terminal, so the queue row can be dropped without the next cycle re-queueing it.
+- On the apply ladder, all three tier bytes are `SKIPPED` — the transaction rolled back or the gate errored before a tier was reached, so no tier's output survives to describe — and item counts and spend are zero, because the batch reports its provider spend whole and double-counting it on the memory's own row would misattribute it. On the LLM ladder the status keeps describing what the pattern and classifier tiers did commit; only the failure class carries terminality.
+- The abandonment record is committed in its own small write transaction, ahead of the queue-row removal, so the two cannot be made atomic. That ordering is safe: a crash between them leaves a stale queue row that the next cycle's gate folds into `AlreadyExtracted` and removes. Writing it is best-effort — a failure to record must not fail the cycle that is making progress on every other memory in the batch.
+- `brain_extractor_apply_dropped_total{reason}` counts the drop. Any nonzero value is signal loss. The reasons distinguish the five ways a memory can be abandoned: `apply_abandoned_deterministic`, `apply_abandoned_exhausted`, `gate_abandoned`, and — from the LLM ladder — `llm_abandoned_item` when the per-item bound tripped first, `llm_abandoned_provider` when the absolute bound did. The split is operationally load-bearing: the first says to look at the memory, the second says to look at the provider.
+- An `error`-level event names the memory, the attempt counts and the reason, and states that backfill is the recovery path. `max_apply_attempts_per_memory` **defaults** to the backfill worker's own per-item cap, deliberately: sharing the number is what makes the two paths give up together, so an operator reasoning about one is reasoning about both. Overriding the key breaks that correspondence, which is a reason to override it knowingly rather than a reason not to.
+
+### HyPE generation and the refresh sweep
+
+HyPE rides inside the extractor worker rather than running as a worker of its own: a server shard wires it unconditionally at spawn and it shares the extractor's cycle. There is no operator flag that turns it off. A deployment that provides no generator at all — a bare substrate embedding, a test fixture — leaves the worker's slot empty and both the generation and the sweep become no-ops. For each freshly-encoded memory it asks the namespace's model for several diverse questions whose answer is that memory, embeds each locally with the same BGE model the rest of the write path uses, persists the vectors and inserts them into the live per-shard HyPE HNSW. At read time the query vector probes that pool, and a hit maps back to the owning memory.
+
+The credential is the owning tenant's, resolved per namespace. HyPE is mandatory and runs on every write, so it is the largest model cost on the write path and the one most visibly mis-billed if the key is wrong. A namespace with no registered key still writes — the tier reports that it could not run rather than failing the write.
+
+HyPE is best-effort throughout. Any failure — transport, empty reply, embed error, redb error — is logged and yields a zero outcome rather than failing the surrounding extraction cycle. It is a recall enhancement, never a correctness dependency.
+
+#### The refresh sweep
+
+A memory is first HyPE'd against whatever neighborhood existed at encode time, which is often empty: the connecting facts arrive in later memories. The bridge question a multi-hop read needs — "Where did Niraj's manager work before?" — can only be written once both the reports-to and the prior-employer facts exist, and they landed in different memories at different times.
+
+So the worker also sweeps already-encoded memories in round-robin, recomputes each one's current neighborhood, and regenerates only when it actually changed. Eight memories are examined per cycle, with a cursor advancing across cycles. The number is compiled in rather than exposed as a TOML key: examining a memory is one cheap hash check, and the only thing a larger window buys is more LLM calls in the one cycle where a neighborhood changed — a trickle is the point. Internally `0` disables the sweep, which is also what an empty generator slot amounts to.
+
+A window that does not fill wraps to the start of the table to complete the round — so on a small corpus **every memory is examined every cycle**, and the cycle is one second.
+
+#### The refresh gate stores the input, not the outcome
+
+That cadence is what makes the gate's exact contents load-bearing. The gate is a stored hash of `(text, neighborhood)`: on each pass the worker recomputes the hash and, unless it differs from the stored one, returns without calling the model — one redb point read and no spend. A changed neighborhood misses, which is the intent, and the LLM cache is keyed on the same pair so a genuinely-changed neighborhood misses there too.
+
+**The hash stored is the hash of the input already put to the model** — not the hash of an input that produced questions. A model can answer for an exact input and the answer can hold no usable question; the call was still billed. Storing the hash only on a question-producing reply would leave that input ungated, so the next pass one second later would put the identical question to the model and be billed again, every second, for as long as the memory and its neighborhood sit unchanged. Recording the input as answered is what makes a billed-but-empty reply cost exactly once.
+
+Both paths do it: a first generation whose reply parses to zero questions, and a refresh whose reply does the same. A failure to record is logged at `warn` and does not fail the cycle.
+
+Spend from both paths lands in the `llm_spend` ledger under distinct stages — `HYPE_GENERATE` and `HYPE_REFRESH` — keyed by namespace, because neither produces an extraction audit row to carry a cost. Regeneration spend is also folded into the same cost metric the extraction tiers report.
+
+Generated questions are clamped to 16 per memory. The storage key's index byte allows 256; the clamp is defensive, so a runaway reply cannot overflow the index.
+
 ### Always-on extractors
 
 Extraction is always-on and non-configurable — there is no per-tier enable flag and no `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE` op. Every registered extractor runs on every eligible item; there is no "disabled" eligibility-filter branch. A tier whose model can't load is a hard shard-spawn failure, not a silent skip (see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)).
@@ -148,10 +222,17 @@ Brain ships steps 1+2; step 3 (timeout stub-writing) is deferred to avoid touchi
 
 Per [`./00_purpose.md`](./00_purpose.md) (Observability) plus extractor-specific:
 
-- `extractor_dispatch_total{tier, extractor_id}` — items dispatched.
-- `extractor_skipped_total{tier, extractor_id, reason}` — filter / queue-full / dep-not-ready.
-- `extractor_run_seconds{tier, extractor_id}` — histogram.
-- `extractor_audit_writes_total{status}` — Success / Failure / Skipped* / SkippedDuplicate.
+Every family below is labelled `shard`, since each shard owns its own `ExtractorWorker`.
+
+- `brain_extractor_tier_runs_total{shard, tier, status}` — per-tier outcome for each memory processed. `tier` ∈ `{pattern, classifier, llm}`, `status` ∈ `{ran, skipped, failed}`.
+- `brain_extractor_drops_total{shard}` — encode-side enqueues dropped because the extractor channel was full.
+- `brain_extractor_apply_dropped_total{shard, reason}` — real extracted items the apply pass could not persist. **Any nonzero value is signal loss.** `reason` carries both the per-item discard reasons (`subject_unresolved`, `predicate_invalid`, `object_missing`, `nil_endpoint`, `self_reference`, `create_rejected`, `declared_value_type_mismatch`, `relation_type_invalid`, `endpoint_unresolved`, `statement_low_confidence`, `vague_object`, `clause_object`, `relation_value_object`, `artifact_edge_endpoint_unresolved`) and the whole-memory abandonment reasons from the retry ladders (`apply_abandoned_deterministic`, `apply_abandoned_exhausted`, `gate_abandoned`, `llm_abandoned_item`, `llm_abandoned_provider`).
+- `brain_extractor_schema_filtered_total{shard, predicate}` — items dropped because their predicate or relation type is not in the active schema.
+- `brain_extractor_items_written_total{shard, item_kind}` — typed-graph rows persisted. `item_kind` ∈ `{entity, statement, relation, mention, hype}`.
+- `brain_extractor_resolver_outcome_total{shard, tier}` — which resolver tier satisfied each entity mention. `tier` ∈ `{exact, alias, fuzzy, embedding, disambiguated, create}`.
+- `brain_extractor_predicate_consolidated_total{shard}` — open-vocab predicate surface forms folded onto an existing near-synonym predicate id.
+- `brain_extractor_llm_micro_usd_spent_total{shard}` — LLM-tier spend reported by extractors, in dollar micro-units (1e-6 USD). A counter, not a budget: nothing reads it to refuse a call.
+- `brain_extractor_cycle_duration_seconds{shard}` — histogram over worker cycles.
 
 ### Extractor tests
 
@@ -161,6 +242,12 @@ Brain's tests verify:
 - Classifier queue overflow drops + writes audit + emits metric.
 - `depends_on` chain blocks dequeue until parent's audit row appears.
 - Shutdown drains within 30 s timeout.
+- A deterministic storage fault abandons on the first failure; a transient one walks the ladder to `max_apply_attempts_per_memory` and then abandons.
+- The deterministic/transient split is read off the redb error value itself, not guessed from a message.
+- A committed apply clears the memory's ladder entry, so a later failure starts from zero.
+- The apply backoff widens and saturates at its cap, and the apply-failure map stays within its bound.
+- A `FAILURE` row whose transient budget is unspent is **not** terminal and is due only after its backoff; one that has spent either budget is terminal, and so is a `PERMANENT` row on its first failure.
+- A HyPE input recorded as answered closes the refresh gate, and a changed neighborhood reopens it.
 
 ## Text indexer workers
 
@@ -271,14 +358,14 @@ Matches [`../13_retrievers/00_purpose.md`](../13_retrievers/00_purpose.md).
 
 `commit_due(batch_size, last_commit_at)` returns `true` when:
 
-- `batch_size >= BRAIN_TANTIVY_COMMIT_N` (default 256), OR
-- `now() - last_commit_at >= BRAIN_TANTIVY_COMMIT_MS` (default 1000 ms).
+- `batch_size >= [index] tantivy_commit_n` (default 256), OR
+- `now() - last_commit_at >= [index] tantivy_commit_ms` (default 1000 ms).
 
 On `commit()` returning `Err`:
 - Retry once after a 10 ms backoff.
 - On second failure: **fail the shard** (text indexing is required correctness, per "Two workers, one discipline"). The shard supervisor logs a fatal error, drains other workers, and surfaces the failure to the operator via the shard health endpoint.
 
-This contrasts with the LLM extractor (see [`../11_extractors/01_extractor_tiers.md`](../11_extractors/01_extractor_tiers.md)) which retries once on validation failure and then drops — the LLM tier is best-effort, the text indexer is not.
+This contrasts with the LLM extractor (see [`../11_extractors/01_extractor_tiers.md`](../11_extractors/01_extractor_tiers.md)), which retries a schema-validation failure once and then gives up on that memory, and walks a bounded backoff ladder on a transient provider failure before abandoning it with a terminal audit row. Either way the memory loses its grounding and the shard keeps serving: the LLM tier is best-effort, the text indexer is not.
 
 ### WAL integration
 
@@ -354,7 +441,10 @@ Low priority lane per [`./00_purpose.md`](./00_purpose.md) (≤ 5% of shard time
 
 #### Cadence
 
-Clock-triggered. Configurable per worker via `BRAIN_<NAME>_PERIOD_SECONDS`. The scheduler computes the next tick from the previous tick's completion time; a slow tick doesn't accumulate backlog beyond one cycle.
+Clock-triggered, from the built-in cadence table (`WorkerConfig::defaults_for`). A worker's
+cadence is operator-settable only where its own `[workers.<name>]` section
+declares a key for it — see the configuration summary at the end of this
+file. The scheduler computes the next tick from the previous tick's completion time; a slow tick doesn't accumulate backlog beyond one cycle.
 
 #### Bounded batches
 
@@ -391,9 +481,9 @@ Sweepers are stateless. On shard restart they re-attach to the scheduler and run
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention) — superseded statements + relations are retained "Forever" by default; operators opt in to sweeping.
 
-**Cadence default:** daily (`BRAIN_SUPERSESSION_SWEEPER_PERIOD_SECONDS = 86400`).
+**Cadence default:** daily (`[workers.supersession_sweeper] period_seconds`).
 
-**Retention default:** `0` seconds — disabled. The worker checks the config at the top of each tick; if zero, returns `Ok(())` immediately.
+**Retention default:** `0` seconds, which sweeps nothing: a zero makes the cycle return immediately. Set `[workers.supersession_sweeper] retention_seconds` to arm it, and `dry_run = true` first to see what a cycle would delete. So the worker has two gates — `enabled` decides whether it is registered at all, and a non-zero retention decides whether a registered cycle does anything.
 
 **Batch cap default:** 256 rows.
 
@@ -418,9 +508,12 @@ for entry in STATEMENTS_TABLE.iter():
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention) — extraction + resolution audit logs at 90 d default; merge logs forever.
 
-**Cadence default:** daily (`BRAIN_AUDIT_SWEEPER_PERIOD_SECONDS = 86400`).
+**Cadence default:** daily (built-in, 86 400 s; no config key).
 
-**Retention default:** 90 d (`BRAIN_AUDIT_RETENTION_SECONDS = 7_776_000`).
+**Retention default:** 90 d (`DEFAULT_AUDIT_RETENTION_SECONDS`). The worker
+exposes `with_retention_seconds`, but the server constructs it with
+`AuditLogSweeper::new()` and wires nothing to it, so the default is the only
+value a deployment can have today. A retention of `0` disables the sweep.
 
 **Batch cap default:** 1024 rows (audit rows are small; larger batches are cheap).
 
@@ -446,21 +539,22 @@ UUIDv7 keys make the audit table time-ordered. A range-scan optimisation (`[`0..
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention) — LLM cache 90 d default; [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) — table layout.
 
-**Cadence default:** hourly (`BRAIN_LLM_CACHE_SWEEPER_PERIOD_SECONDS = 3600`).
+**Cadence default:** hourly (`[workers.llm_cache_sweep] interval_secs = 3600`,
+with `enabled` alongside it).
 
-**Two passes per tick:**
+**One pass per tick.** `sweep_expired` deletes every row whose expiry is
+`<= now`, from the response table and the TTL secondary index, in a single
+`WriteTransaction`. Each candidate row carries its own authoritative expiry
+and is deleted only when *that* expiry has passed, because re-caching an input
+writes a fresh row and leaves the earlier TTL hint behind.
 
-1. **TTL expiry pass.** Drop rows with `created_at_ns <= now_ns - ttl_seconds * 1e9`.
-2. **Capacity enforcement pass.** Sum total bytes of the `LLM_CACHE_TABLE`. If `> max_bytes`, evict by ascending `last_used_at_ns` (or `created_at_ns` — see eviction note below) until under cap.
+**There is no capacity pass.** Nothing sums the table's bytes and nothing
+evicts by recency: the cache is bounded by TTL alone, and a deployment with
+many distinct inputs inside one TTL window holds all of them.
 
-Both passes share a single `WriteTransaction` per tick.
-
-**Defaults:**
-
-- `BRAIN_LLM_CACHE_TTL_SECONDS = 7_776_000` (90 d).
-- `BRAIN_LLM_CACHE_MAX_BYTES = 1_073_741_824` (1 GiB). `0` disables capacity enforcement.
-
-**Batch cap default:** 1024 per pass.
+**Expiry** is set per row at insert, from the extractor's own `cache_ttl`
+declaration in the extractor document; the default when a document omits it is
+**7 days**, not 90. It is a schema value, not an operator knob.
 
 **No-op when slot is None.** If `OpsContext.llm_cache` is `None` (schemaless deployment — no LLM extractors configured), the worker returns `Ok(())` immediately.
 
@@ -470,42 +564,43 @@ Both passes share a single `WriteTransaction` per tick.
 
 ### Stale extraction detector
 
-**Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) — flag statements whose `schema_version` or `extractor_version` is behind the current registry.
+**Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) — surface statements whose `schema_version` is behind the current schema.
 
-**Cadence default:** hourly (`BRAIN_STALE_DETECTOR_PERIOD_SECONDS = 3600`).
+**Cadence default:** hourly (built-in, 3 600 s; no config key).
 
-**Batch cap default:** 512 rows.
+**Batch cap default:** 512 rows scanned per tick.
 
 **Predicate:**
 
 ```
-fn is_stale(stmt, current_versions) -> bool {
-    let ns = predicate_namespace_of(stmt.predicate_id);
-    stmt.schema_version < current_versions.schema_for(ns)
-    || stmt.extractor_version
-       < current_versions.extractor_for(stmt.extractor_id)
+fn is_stale(stmt, current_version) -> bool {
+    stmt.tombstoned == 0 && stmt.schema_version < current_version
 }
 ```
 
-`current_versions` is loaded once per tick by reading `SCHEMA_ACTIVE_VERSIONS_TABLE` and the extractor registry, then cached for the scan.
+`current_version` is read once per tick as the **maximum** active version across every namespace's `SCHEMA_ACTIVE_VERSIONS_TABLE` row. On a multi-tenant shard that over-counts: one tenant uploading their ninth schema makes every other tenant's v1-era rows read as stale. The count is an operator hint and nothing gates on it, so read it as an upper bound rather than a total. A precise per-`(memory, namespace)` lookup is post-v1. A shard with no active schema at all reads version 0 and the tick is a no-op.
 
-**Effect:** sets `STATEMENT_FLAG_STALE_EXTRACTION = 1 << 3` on `StatementRow.flags`. **Does not re-extract.** The schema-migration worker (see "Schema migration worker" below) is the side that re-extracts when an operator triggers a migration plan.
-
-**Transition counting:** `SweepSummary.flagged_now` counts only `false → true` transitions (rows already flagged are counted as `flagged_already` for observability).
+**Effect: this worker counts, and does nothing else.** It writes no per-row flag — that would need a `StatementRow.flags` schema bump — writes no audit row, and does not re-extract. The count is logged and exposed through `sweeper_swept_total{worker="stale_extraction_detector"}`.
 
 **Scope:** active rows only. Tombstoned statements are skipped.
 
-**No audit row** for staleness flagging — the flag itself is the audit signal; the schema-migration worker emits `AuditOp::SchemaUpgraded` when re-extraction happens.
+**What re-extracts:** the schema-migration worker, and only when `[workers.extractor] reextract_on_schema_change` is on — it is off by default, because re-extraction is one LLM call per memory. With it off, that worker logs how many memories fell outside the new schema and the operator re-aligns them with `POST /v1/extract/backfill`. See "Schema migration re-extraction gate" below.
 
 ### Entity GC sweeper
 
 **Spec source:** [`../02_data_model/06_entity_lifecycle.md`](../02_data_model/06_entity_lifecycle.md) + [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention).
 
-**Cadence default:** daily (`BRAIN_ENTITY_GC_PERIOD_SECONDS = 86400`).
+**Cadence default:** daily (built-in, 86 400 s; no config key).
 
-**Off by default** (`BRAIN_ENTITY_GC_ENABLED = false`). The worker checks the flag at the top of each tick; if false, returns `Ok(())` immediately and logs `debug` once at startup.
+**Off by default**, in two places that agree: `EntityGcWorker::new()` sets
+`enabled = false` and `defaults_for(EntityGc)` carries `enabled = false`. There
+is no config key — a deployment turns it on by building it enabled, or by the
+admin `POST /v1/workers/entity_gc/start`. The worker checks the flag at the top
+of each tick; if false, returns `Ok(())` immediately.
 
-**Grace period default:** 30 d (`BRAIN_ENTITY_GC_GRACE_SECONDS = 2_592_000`).
+**Grace period default:** 30 d (`DEFAULT_ENTITY_GC_GRACE_SECONDS`). Settable
+through the worker's builder, which the server does not call, so the default is
+the only value a deployment can have today.
 
 **Eligibility predicate:**
 
@@ -535,7 +630,8 @@ Tombstoned-but-within-grace inbound rows count as references (prevents flapping;
 
 **Spec source:** [`../02_data_model/07_statement.md`](../02_data_model/07_statement.md) §"Confidence aggregation" — stored confidence is a snapshot; decay manifests via periodic refresh.
 
-**Cadence default:** hourly (`BRAIN_CONFIDENCE_SWEEP_PERIOD_SECONDS = 3600`).
+**Cadence default:** hourly (`[workers.confidence_sweep] interval_secs`, with
+`enabled` alongside it; on by default).
 
 **Batch cap default:** 512 rows.
 
@@ -559,34 +655,51 @@ The `0.05` threshold mirrors the index-churn gate — small drifts don't pay for
 
 ### Sweeper configuration summary
 
-| Env var | Default | Worker |
+Brain reads configuration from a TOML file, with environment overrides in the
+form `BRAIN__<SECTION>__<FIELD>` (double underscore per level). **No sweeper
+knob is a single-underscore `BRAIN_*` variable**; the only ones of that shape
+in the tree are test and benchmark switches.
+
+What an operator can actually set:
+
+| Knob | Default | Worker |
 |---|---|---|
-| `BRAIN_SUPERSESSION_RETENTION_SECONDS` | `0` (disabled) | Supersession sweeper |
-| `BRAIN_SUPERSESSION_SWEEPER_PERIOD_SECONDS` | `86400` | Supersession sweeper |
-| `BRAIN_AUDIT_RETENTION_SECONDS` | `7_776_000` (90 d) | Audit log sweeper |
-| `BRAIN_AUDIT_SWEEPER_PERIOD_SECONDS` | `86400` | Audit log sweeper |
-| `BRAIN_AUDIT_SWEEPER_BATCH_CAP` | `1024` | Audit log sweeper |
-| `BRAIN_LLM_CACHE_TTL_SECONDS` | `7_776_000` (90 d) | LLM cache sweeper |
-| `BRAIN_LLM_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | LLM cache sweeper |
-| `BRAIN_LLM_CACHE_SWEEPER_PERIOD_SECONDS` | `3600` | LLM cache sweeper |
-| `BRAIN_STALE_DETECTOR_PERIOD_SECONDS` | `3600` | Stale extraction detector |
-| `BRAIN_ENTITY_GC_ENABLED` | `false` | Entity GC sweeper |
-| `BRAIN_ENTITY_GC_GRACE_SECONDS` | `2_592_000` (30 d) | Entity GC sweeper |
-| `BRAIN_ENTITY_GC_PERIOD_SECONDS` | `86400` | Entity GC sweeper |
-| `BRAIN_CONFIDENCE_SWEEP_PERIOD_SECONDS` | `3600` | Confidence sweep |
-| `BRAIN_CONFIDENCE_SWEEP_BATCH_CAP` | `512` | Confidence sweep |
+| `[workers.supersession_sweeper] enabled` | `false` | Supersession sweeper |
+| `[workers.supersession_sweeper] retention_seconds` | `0` (sweeps nothing) | Supersession sweeper |
+| `[workers.supersession_sweeper] period_seconds` | `86400` | Supersession sweeper |
+| `[workers.supersession_sweeper] dry_run` | `false` | Supersession sweeper |
+| `[workers.llm_cache_sweep] enabled` | `true` | LLM cache sweeper |
+| `[workers.llm_cache_sweep] interval_secs` | `3600` | LLM cache sweeper |
+| `[workers.confidence_sweep] enabled` | `true` | Confidence sweep |
+| `[workers.confidence_sweep] interval_secs` | `3600` | Confidence sweep |
+| `[workers.statement_reclaim] enabled` | `false` | Statement reclaim |
+| `[workers.statement_reclaim] grace_seconds` / `period_seconds` | 30 d / `86400` | Statement reclaim |
+| `[workers.predicate_gc] enabled` | `false` | Predicate GC |
+| `[workers.predicate_gc] grace_seconds` / `period_seconds` | 7 d / `86400` | Predicate GC |
 
-All values are operator-overridable. Tests use small values (seconds, not days) to keep wall-time bounded.
+What is a code default with no configuration surface:
 
-### Sweeper open questions
+| Value | Default | Worker |
+|---|---|---|
+| Cadence | daily | Audit log sweeper, entity GC |
+| Cadence | hourly | Stale extraction detector |
+| Batch cap | 1024 | Audit log sweeper, LLM cache sweeper |
+| Batch cap | 256 | Supersession sweeper, entity GC |
+| Audit retention | 90 d | Audit log sweeper |
+| Entity GC grace | 30 d | Entity GC |
+| Entity GC enabled | `false` | Entity GC |
+| Forget-cascade confidence threshold | `0.2` | Forget cascade |
 
-Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md):
+Response-cache TTL belongs to neither table: it is `cache_ttl` on the
+extractor definition, defaulting to 7 days.
 
-- Secondary indexes on `last_used_at_ns` (LLM cache) and `timestamp_ns` (audit table) for faster scans.
-- Touch-on-read for `last_used_at_ns` to make LLM cache LRU exact.
-- Watermark optimisation for stale extraction (skip re-flagging already-flagged rows).
+A worker can also be paused and resumed at runtime without a restart, through
+`POST /v1/workers/{name}/{stop|start|run-now}` on the admin plane. Tests set
+small values (seconds, not days) by constructing workers directly.
 
-Per-statement-kind retention windows are **implemented** (no longer an open question): a predicate declares `retention: <duration>` in the schema DSL, and the `statement_reclaim` worker soft-tombstones expired statements (reason `RetentionExpired`) which then reclaim through the normal tombstone-grace flow.
+### Per-statement-kind retention
+
+A predicate declares `retention: <duration>` in the schema DSL. The `statement_reclaim` worker soft-tombstones statements past that window with reason `RetentionExpired`, and they then reclaim through the normal tombstone-grace flow.
 
 ## State-carrying workers
 
@@ -668,7 +781,7 @@ A cancelled plan leaves a mix of `Completed` + `Pending` rows; a subsequent admi
 
 #### Checkpoint cleanup
 
-Completed checkpoints accumulate. Brain keeps them indefinitely today (audit value). A future sweeper similar to the audit log sweeper hard-deletes `Completed` rows past a configurable retention; tracked as an open question.
+Completed checkpoints accumulate. Brain keeps them indefinitely for their audit value; no sweeper deletes them.
 
 ### Shared state-carrying discipline
 
@@ -732,9 +845,13 @@ pub enum BackfillRange {
 
 `(memory_id, extractor_id)` — the smallest replayable unit. Two memories × three extractors → six checkpoint rows.
 
-#### Bad-extractor abort
+#### Per-item failure accounting
 
-After the first 100 items, if `failed / processed > 0.5`, the worker aborts the plan with a single `warn` log + a `BackfillAborted { reason: HighFailureRate }` event on the change feed. Prevents a misconfigured extractor from spending hours hammering a million memories.
+Resilience is per item, not per run: **one bad item never aborts the whole backfill.** There is no aggregate failure-rate abort, no `BackfillAborted` event and no `HighFailureRate` reason — a plan runs to the end of its items or until it is cancelled.
+
+An item is retried on later cycles up to `MAX_ATTEMPTS_PER_ITEM` (3). Once its checkpoint reads `Failed` with the cap reached, it is permanently failed: counted as `failed` in the run's progress — deliberately not as `skipped_already_completed`, so a resume cannot mask a bad item as a skip — and never retried again, while the rest of the run continues.
+
+The operator-facing signal is therefore the run's own `failed` count, not an abort. The extractor worker's apply ladder shares this cap by default, so a memory that cannot be applied gives up at the same point on both paths (see §"Bounded extraction retries").
 
 #### Backfill concurrency
 
@@ -799,7 +916,7 @@ pub struct ForgetCascadeJob {
 
 #### Confidence threshold
 
-`BRAIN_CASCADE_CONFIDENCE_THRESHOLD = 0.2` default. Below this, an empty-evidence statement is tombstoned; above this, it survives with the `stale_evidence` flag set (operator can re-extract or accept the staleness).
+`DEFAULT_CASCADE_CONFIDENCE_THRESHOLD = 0.2`, a code default with no config key. Below this, an empty-evidence statement is tombstoned; above this, it survives with the `stale_evidence` flag set (operator can re-extract or accept the staleness).
 
 #### Continuation jobs
 
@@ -841,9 +958,15 @@ for item in plan.items:
 - `PotentiallyRetracted { statement_id }` — old statement no longer produced by the new extractor; flagged for operator review.
 - `NoOp` — checkpoint state says already-done; skip.
 
-#### Schema migration cost budget
+#### Schema migration re-extraction gate
 
-Schema migrations that touch LLM extractors respect the per-extractor cost budget. Items over budget are skipped with a `skipped_over_budget` metric; operators can re-run after raising the budget.
+Nothing refuses a migration on cost — spend is tracked, never rationed (see [`../11_extractors/01_extractor_tiers.md`](../11_extractors/01_extractor_tiers.md) §22). What stands between a `SCHEMA_UPLOAD` and a large provider bill is a deliberate operator decision, not a ceiling.
+
+`[workers.extractor] reextract_on_schema_change` defaults to **off**, and that default is the control. Re-extraction costs one LLM call per affected memory, so a single upload against a large corpus would otherwise turn into thousands of paid calls with no operator in the loop.
+
+With it off, the worker still completes its flag sweep and then logs — at `info`, because staying flagged is the configured behaviour and not a fault — the namespace, the new version, how many memories carry statements outside it, and the instruction to run `POST /v1/extract/backfill` to re-align them. The operator sees the size of the bill before choosing to pay it.
+
+With it on, a namespace becomes self-healing: each stale memory's text is re-enqueued for extraction. A memory that is tombstoned, hard-forgotten or has lost its text row is skipped — there is nothing left to re-extract from. An enqueue that finds the channel full is also skipped rather than retried in place, which would spin against a full channel; the statement keeps its flag, so the next upload or an admin backfill picks it up. Either way the work is bounded by the extractor's own `channel_capacity`: enabling this cannot outrun that ceiling, only fill it.
 
 #### Schema migration cancellation
 
@@ -853,14 +976,11 @@ Schema migrations that touch LLM extractors respect the per-extractor cost budge
 
 One `AuditOp::SchemaUpgraded` per plan, written once at plan start. Per-item audit rows per the `ReextractOutcome`'s normal extraction-audit semantics (`AuditOp::Extracted` / `AuditOp::Superseded`).
 
-### State-carrying open questions
+### State-carrying limits
 
-Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md):
-
-- Sweep of `Completed` checkpoint rows past retention.
-- Multi-item-per-txn batching for backfill / schema-migration (current: one item per txn for clean isolation; batching is a perf optimisation).
-- Concurrent backfill / migration plans within a shard.
-- Per-extractor parallelism within a single migration plan.
+- Backfill and schema-migration process **one item per transaction**, which keeps each item's checkpoint isolated from its neighbours' failures.
+- A shard runs **one** backfill or migration plan at a time; plans do not run concurrently within a shard.
+- A single migration plan runs its extractors serially — there is no per-extractor parallelism inside one plan.
 
 ## Entity garbage collection
 
@@ -910,7 +1030,7 @@ A tombstoned entity:
 
 Statements / relations are **not** automatically tombstoned or rewritten. They retain their references to the tombstoned id. Queries that follow the references see a tombstoned row.
 
-Operators may use `ADMIN_LIST_STALE_STATEMENTS` ([`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md) §"ADMIN_LIST_STALE_STATEMENTS") to find statements whose subject / object is now tombstoned and decide whether to tombstone the statements too.
+Listing them was specified as `ADMIN_LIST_STALE_STATEMENTS` — a way to find statements whose subject or object is now tombstoned and decide whether to tombstone the statements too. **It was never built**, on either plane, and the typed-graph admin range holds no such opcode. What exists is the detection side: the stale-extraction detector flags affected rows, and the forget cascade tombstones a statement whose evidence is gone when its confidence falls below the cascade threshold.
 
 ### GC eligibility
 

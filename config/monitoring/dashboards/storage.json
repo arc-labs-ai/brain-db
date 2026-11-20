@@ -32,27 +32,17 @@
       "id": 3,
       "title": "HNSW Tombstone Ratio",
       "type": "gauge",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "max(brain_hnsw_tombstone_ratio)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
     },
     {
-      "id": 4,
-      "title": "Schema Version",
-      "type": "stat",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "expr": "max(brain_schema_version)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
-      ]
-    },
-    {
       "id": 5,
       "title": "Open File Descriptors",
       "type": "stat",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "process_open_fds", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }

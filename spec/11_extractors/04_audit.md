@@ -1,72 +1,74 @@
 # 11.04 Extraction Audit
 
 Every extraction call — success, failure, or skip — writes one
-`ExtractionAuditRow` to the `extractor_audit` redb table. Audits
+`ExtractionAudit` to the `extractor_audit` redb table. Audits
 are Brain's source of truth for "what did extractor X
 do to memory Y?".
 
 Cross-references:
 - [`./00_purpose.md`](./00_purpose.md) §"Audit log" — narrative.
 - [`../10_metadata/05_failure_and_audit.md`](../10_metadata/05_failure_and_audit.md)
-  — concrete redb shape.
+  §1–§3a — the concrete redb shape for this table, its indexes, the
+  per-memory pipeline audit and the spend ledger. That file is the single
+  owner of all four; this one defers to it for every key type and field type.
 
-## 1. The audit row
+## 1. What the row records
 
-```rust
-#[derive(Archive, Serialize, Deserialize, ...)]
-pub struct ExtractionAuditRow {
-    pub audit_id: u128,               // UUIDv7 — ordered by time.
-    pub memory_id: u128,
-    pub extractor_id: u32,
-    pub extractor_version: u32,
-    pub schema_version: u32,
-    pub started_at_unix_nanos: u64,
-    pub completed_at_unix_nanos: u64,
-    pub status: u8,                   // enum byte; see §3.
-    pub status_reason: String,        // "" on Success.
-    pub outputs: Vec<OutputRefRow>,   // 0..N produced records.
-    pub cost_micro_usd: u64,          // 0 for pattern/classifier; LLM here.
-    pub model_metadata: Vec<u8>,      // rkyv-archived `ModelMetadata` blob; empty for non-LLM.
-    pub input_hash: [u8; 32],         // BLAKE3 of memory.text — for idempotency probe.
-}
+One row is the durable account of one extraction call: what ran, how it went,
+what it produced and what it cost. Its field set, types and key encoding are in
+[`../10_metadata/05_failure_and_audit.md`](../10_metadata/05_failure_and_audit.md)
+§1; what each field is *for* is here.
 
-pub struct OutputRefRow {
-    pub kind: u8,                     // 1=Entity, 2=Statement, 3=Relation, 4=EntityMention.
-    pub id: u128,                     // EntityId / StatementId / RelationId.
-}
-```
+| Field | What it records |
+|---|---|
+| `audit_id_bytes` | Identity, and the table's key. |
+| `memory_id_bytes`, `extractor_id`, `extractor_version`, `schema_version` | What ran over what, under which versions. The same four values the idempotency contract holds an extractor to ([`./05_idempotency.md`](./05_idempotency.md) §1). |
+| `started_at_unix_nanos`, `completed_at_unix_nanos` | How long the call took — the only durable record of an LLM round trip's latency. |
+| `status`, `status_reason` | The outcome (§3). `status_reason` is empty on success and carries the operator-actionable text on every other outcome. |
+| `outputs` | The entity / statement / relation ids this call produced — the only durable link from an extraction back to the rows it created. Capped at 64 per row. |
+| `cost_micro_usd` | What the call was billed. Zero for the pattern and classifier tiers; the LLM tier fills it, including when the reply was billed but unusable. |
+| `model_metadata` | Model version, token counts and the cache-hit flag. Empty for non-LLM tiers. |
+| `input_hash` | BLAKE3 of the memory text as it was when this call ran. Comparing it against the memory's current text is what detects an **edit** — outputs describing text that no longer exists (§8). |
+| `namespace` | The tenant billed. See below. |
 
-`audit_id` is UUIDv7 to give time-ordered iteration without a
-separate timestamp index. Same convention as the
-`entity_resolution_audit` table.
+`audit_id` is a UUIDv7 so iteration is time-ordered without a separate
+timestamp index — the same convention the `entity_resolution_audit` table
+uses. The key is the id's bytes rather than an integer, and the owning file
+explains why that is what preserves the ordering.
+
+`namespace` names the tenant the row's `cost_micro_usd` is billed to, spelled
+exactly as the `llm_spend` ledger spells it (see
+[`./01_extractor_tiers.md`](./01_extractor_tiers.md) §22). A namespace's durable
+model spend is this field summed across audit rows **plus** that ledger; neither
+store subsumes the other. A row the writer did not attribute carries the empty
+string and is counted toward no namespace rather than toward a guessed one.
 
 ## 2. Where it's stored
 
-`spec/10_metadata/05_failure_and_audit.md` defines:
+In `EXTRACTOR_AUDIT_TABLE`, keyed by audit id, with three `()`-valued
+secondary indexes for the per-memory, per-extractor and time-window lookups
+§4 exposes. One extraction writes the primary row and all three index entries
+in the same write transaction.
 
-```rust
-pub const EXTRACTOR_AUDIT_TABLE:
-    TableDefinition<'static, u128, ExtractionAuditRow> =
-    TableDefinition::new("extractor_audit");
-```
+**The table definitions, key encodings and field types live in
+[`../10_metadata/05_failure_and_audit.md`](../10_metadata/05_failure_and_audit.md)
+§1–§2, and only there.** That file owns the redb shape; this one owns what the
+rows mean. Transcribing the shape into both is how the two drift apart, and a
+reader who needs a key type needs the owning file open anyway.
 
-Plus three index tables:
+Two neighbouring tables are worth knowing about, both also defined there:
 
-```rust
-pub const EXTRACTOR_AUDIT_BY_MEMORY:
-    TableDefinition<'static, (u128, u128), ()> =      // (memory_id, audit_id)
-    TableDefinition::new("extractor_audit_by_memory");
+- `EXTRACTOR_PIPELINE_AUDIT_TABLE` (§3) — the per-**memory** dispatch audit,
+  distinct from this one. This table records each individual
+  `Extractor::run` invocation; that one records the outcome the worker
+  committed for a memory, including the retry counters that decide when a
+  failing memory is abandoned (§3.1 there, and
+  [`../15_background_workers/06_typed_graph_workers.md`](../15_background_workers/06_typed_graph_workers.md)
+  §"Bounded extraction retries").
+- `LLM_SPEND_TABLE` (§3a) — the `(namespace, stage)` ledger this row's
+  `cost_micro_usd` is summed with to get a tenant's durable model spend.
 
-pub const EXTRACTOR_AUDIT_BY_EXTRACTOR:
-    TableDefinition<'static, (u32, u128), ()> =       // (extractor_id, audit_id)
-    TableDefinition::new("extractor_audit_by_extractor");
-
-pub const EXTRACTOR_AUDIT_BY_TIME:
-    TableDefinition<'static, (u64, u128), ()> =       // (started_at, audit_id)
-    TableDefinition::new("extractor_audit_by_time");
-```
-
-The `EXTRACTOR_AUDIT_TABLE` and its three indexes are part of the substrate redb tables
+All of them are substrate redb tables
 (see [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md)).
 
 ## 3. Status enum
@@ -76,40 +78,60 @@ The `EXTRACTOR_AUDIT_TABLE` and its three indexes are part of the substrate redb
 pub enum ExtractionStatus {
     Success = 1,
     Failure = 2,
-    SkippedBudget = 3,        // LLM only.
     SkippedFilter = 4,        // trigger condition was false.
     SkippedDuplicate = 5,     // idempotent re-run probe matched.
     SkippedDisabled = 6,      // extractor was disabled at dispatch time.
 }
 ```
 
-Discriminants are stable — never reassigned. New variants append.
+Discriminants are stable — never reassigned. New variants append. Discriminant
+`3` is unassigned: no status means "refused on cost", because nothing in Brain
+refuses an LLM call on cost (§22 of
+[`./01_extractor_tiers.md`](./01_extractor_tiers.md)). The storage layer holds
+the same values as named byte constants rather than as this enum, since a row
+on disk carries a byte; the two representations are required to agree, and the
+byte side is listed in
+[`../10_metadata/05_failure_and_audit.md`](../10_metadata/05_failure_and_audit.md)
+§1. This enum is the extractor-facing form — it is what an extractor returns,
+and it converts to and from the byte at the storage boundary.
 
 ## 4. Audit query API
 
 ```rust
+pub fn audit_get(
+    rtxn: &ReadTransaction,
+    audit_id: AuditId,
+) -> Result<Option<ExtractionAudit>, AuditOpError>;
+
 pub fn audit_by_memory(
     rtxn: &ReadTransaction,
     memory_id: MemoryId,
-) -> Result<Vec<ExtractionAuditRow>, AuditError>;
+    limit: usize,
+) -> Result<Vec<ExtractionAudit>, AuditOpError>;
 
 pub fn audit_by_extractor(
     rtxn: &ReadTransaction,
-    extractor_id: ExtractorId,
+    extractor_id: u32,
     limit: usize,
-) -> Result<Vec<ExtractionAuditRow>, AuditError>;
+) -> Result<Vec<ExtractionAudit>, AuditOpError>;
 
 pub fn audit_recent_failures(
     rtxn: &ReadTransaction,
     since_unix_nanos: u64,
     limit: usize,
-) -> Result<Vec<ExtractionAuditRow>, AuditError>;
+) -> Result<Vec<ExtractionAudit>, AuditOpError>;
 ```
 
-Returned vectors are newest-first.
+Every listing query takes a `limit` and returns **newest-first**, which the
+UUIDv7 key gives for free: the index range is collected, sorted and reversed,
+so recency ordering needs no timestamp index.
 
-Wire surface for these queries lands in a post-v1 admin op
-(`ADMIN_GET_EXTRACTION_AUDIT`) the API
+`audit_recent_failures` has no status-indexed table behind it. It fans out over
+the time index, filters, and stops at `limit`, so in the worst case it scans
+more rows than it returns.
+
+The operator surface for these queries is `GET /v1/audit` on the admin
+plane (bulk: `GET /v1/audit/export`); the API
 internally only.
 
 ## 5. Retention
@@ -117,12 +139,8 @@ internally only.
 Default 90 days, configurable per deployment. A periodic worker
 (`audit_log_sweeper`, see
 [`../15_background_workers/06_typed_graph_workers.md`](../15_background_workers/06_typed_graph_workers.md))
-iterates `EXTRACTOR_AUDIT_BY_TIME` and deletes rows older than the
+iterates `EXTRACTOR_AUDIT_BY_TIME_TABLE` and deletes rows older than the
 cutoff plus their index entries.
-
-Brain ships the audit-write path and the read API; the sweeper
-itself is deferred (tracked in
-[`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md)).
 
 ## 6. Atomicity
 
@@ -133,7 +151,7 @@ outputs:
 wtxn = db.begin_write()
   extractor produces ExtractedItem[]
   for each item: entity_put / statement_create / relation_create
-  write_audit_row(wtxn, ExtractionAuditRow { outputs, ... })
+  write_audit_row(wtxn, ExtractionAudit { outputs, ... })
 wtxn.commit()
 ```
 
@@ -152,32 +170,37 @@ Per [`../19_benchmarks/02_performance_targets.md`](../19_benchmarks/02_performan
 Three index inserts + one primary insert. Verified by the
 audit-table criterion bench.
 
-## 8. Idempotency probe
+## 8. What stops repeated work
 
-Before running an extractor, the dispatcher probes:
+Two gates stop repeated work, and neither reads this table.
 
-```rust
-audit_lookup(
-    rtxn,
-    memory_id,
-    extractor_id,
-    extractor_version,
-    input_hash,
-) -> Option<ExtractionAuditRow>
-```
+**Queue replay, per memory.** With `[workers.extractor] skip_already_extracted`
+on (the default), the worker consults the per-memory pipeline audit before
+running anything: a memory whose extraction is **terminal** is dropped from the
+queue, and one carrying an unspent transient-failure budget is re-run once its
+backoff elapses. That probe reads `EXTRACTOR_PIPELINE_AUDIT_TABLE`, not the
+per-call rows here, because the question it asks — "is this memory done with?" —
+is about the memory, not about one extractor's invocation. Turning the flag off
+is what lets a backfill drive a second pass over an already-audited memory.
 
-If `Some(row)` returns AND the caller didn't request replay, the
-dispatcher skips the extractor entirely and re-emits the cached
-outputs (or, for `Skipped*` audit rows, re-skips). One new audit
-row with `status = SkippedDuplicate` is written so the operator can
-see the probe fired.
+**The LLM call, per input.** The LLM tier's own cache is keyed
+`(input_hash, extractor_id, extractor_version, model_id, credential_scope)`
+and is what makes a repeated extraction free rather than merely harmless
+(§20 of [`./01_extractor_tiers.md`](./01_extractor_tiers.md)).
+
+`input_hash` on this row serves a narrower purpose: it is BLAKE3 over the
+memory text, so comparing it against the memory's current text detects an
+**edit** — a case where the stored outputs describe text that no longer
+exists. That is a diagnostic, not a gate.
+
+Nothing re-emits an audit row's `outputs` in place of re-running an extractor.
+When a retry does re-run the pipeline, duplication is prevented at the apply
+layer instead; [`./05_idempotency.md`](./05_idempotency.md) §4 has the
+mechanism.
 
 ## 9. Open questions
 
-See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:
-
-- Q-audit-size — `outputs: Vec<OutputRefRow>` could be unbounded;
-  v1 caps at 64 entries per row, overflow written to a follow-on
-  row.
-- Q-cost-tracking — `cost_micro_usd` is 0 for pattern and
-  classifier extractors; the LLM tier fills it.
+- `outputs` could be unbounded; v1 caps at 64 entries per row,
+  overflow written to a follow-on row.
+- `cost_micro_usd` is 0 for pattern and classifier extractors;
+  the LLM tier fills it.

@@ -37,33 +37,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::config;
 
 mod support_harness;
 
@@ -235,7 +209,7 @@ async fn inspect_found(client: &mut TcpStream, stream_id: u32, memory_id: u128) 
         // Absent. `MEMORY_INSPECT` reports a missing memory with the
         // `NotFound` category now, like every sibling read, rather than a
         // success carrying `found: false`.
-        ResponseBody::Error(e) if e.category == ErrorCategoryWire::NotFound => false,
+        ResponseBody::Error(e) if e.category == ErrorCategoryWire::NotFound as u8 => false,
         other => panic!("expected MEMORY_INSPECT_RESP or a NotFound error, got {other:?}"),
     }
 }
@@ -346,9 +320,10 @@ async fn acknowledged_writes_survive_graceful_shutdown_and_restart() {
 
         // Then searchability, which is a different property with a different
         // failure mode. The lexical index is repopulated asynchronously after
-        // restart, so this is a latency assertion — and it used to be the ONLY
-        // assertion, reporting "DATA LOSS" whenever a loaded machine took
-        // longer than its budget. The whole 6491-test suite reproduced that.
+        // restart, so this is a latency assertion, and it must not be the ONLY
+        // assertion: on its own it reports "DATA LOSS" whenever a loaded
+        // machine takes longer than its budget, and the whole 6491-test suite
+        // running alongside is load enough to do that.
         // Crying wolf on the flagship durability criterion is worse than not
         // checking it: people learn to ignore the failure, and a real
         // regression then hides in the noise.
@@ -438,7 +413,8 @@ async fn burst_encode_then_graceful_shutdown_does_not_panic_and_flushes() {
     const BURST: u32 = 16;
     const ACKED_BEFORE_STOP: u32 = 4;
 
-    let mut durable_ids = Vec::new();
+    // Each acknowledged write, paired with the burst index that produced it.
+    let mut durable_ids: Vec<(u32, u128)> = Vec::new();
     {
         let server = start_in(dir.path(), 1).await;
         let mut client = TcpStream::connect(server.data_plane_addr)
@@ -477,6 +453,11 @@ async fn burst_encode_then_graceful_shutdown_does_not_panic_and_flushes() {
         }
 
         // Read only the first few acks: those are fsynced-durable by contract.
+        // WHICH of the sixteen they are is not fixed — a shard processes the
+        // streams on one connection concurrently, so acks arrive in completion
+        // order, not send order. `stream_id` is what pairs a response with its
+        // request (every SDK demuxes on it for the same reason), so recover the
+        // burst index from the header rather than from arrival position.
         for _ in 0..ACKED_BEFORE_STOP {
             let resp = read_one_frame(&mut client).await;
             assert_eq!(
@@ -484,13 +465,20 @@ async fn burst_encode_then_graceful_shutdown_does_not_panic_and_flushes() {
                 Opcode::EncodeResp.as_u16(),
                 "burst encode must ack with EncodeResp"
             );
+            let stream_id = resp.header.stream_id_u32();
+            assert!(
+                stream_id % 2 == 1 && stream_id < 1 + BURST * 2,
+                "ack carried stream_id {stream_id}, which is not one of the \
+                 {BURST} client streams this burst opened"
+            );
+            let index = (stream_id - 1) / 2;
             if let ResponseBody::Encode(r) = ResponseBody::decode(
                 Opcode::from_u16(resp.header.opcode_u16()).expect("known opcode"),
                 &resp.payload,
             )
             .expect("decode resp")
             {
-                durable_ids.push(r.memory_id);
+                durable_ids.push((index, r.memory_id));
             }
         }
         drop(client);
@@ -520,13 +508,14 @@ async fn burst_encode_then_graceful_shutdown_does_not_panic_and_flushes() {
         )
         .await;
 
-        for (i, id) in durable_ids.iter().enumerate() {
-            let cue = format!("burst drain memory number {i} sentinel zebra{i}");
-            let got = recall_ids_until_contains(&mut client, 1 + (i as u32) * 2, &cue, *id).await;
+        for (slot, &(index, id)) in durable_ids.iter().enumerate() {
+            let cue = format!("burst drain memory number {index} sentinel zebra{index}");
+            let got = recall_ids_until_contains(&mut client, 1 + (slot as u32) * 2, &cue, id).await;
             assert!(
-                got.contains(id),
-                "DATA LOSS: acknowledged burst write {id} was not recoverable after \
-                 graceful shutdown; recall for \"{cue}\" returned {got:?}"
+                got.contains(&id),
+                "DATA LOSS: acknowledged burst write {id} (client stream {}) was not \
+                 recoverable after graceful shutdown; recall for \"{cue}\" returned {got:?}",
+                1 + index * 2
             );
         }
         drop(client);

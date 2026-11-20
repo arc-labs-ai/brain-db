@@ -174,15 +174,12 @@ the system's own registry rows only).
 `SCHEMA_LIST` (`0x0122`) returns the version history of the caller's
 namespace. There is no cross-namespace listing on the user surface.
 
-## 8. Open questions
+## 8. Cross-namespace reads
 
-See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
-`OQ-V2-4` (per-tenant schemas + isolated entity spaces) is **resolved by
-this contract** (tenant = namespace). Remaining:
-
-- Q7 — Cross-namespace traversal filter syntax (still N/A; cross-namespace
-  reads are forbidden, not merely discouraged).
-- Q8 — Namespace renaming.
+There is no cross-namespace traversal filter syntax, because cross-namespace
+reads are forbidden outright rather than merely discouraged. A namespace is
+the tenant boundary; per-tenant schemas and isolated entity spaces follow from
+that one contract.
 
 ## 9. Tests
 

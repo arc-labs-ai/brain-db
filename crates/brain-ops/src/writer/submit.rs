@@ -35,13 +35,38 @@ use brain_storage::wal::record::{Lsn, WalRecord};
 
 use crate::apply::{dispatch, ApplyError};
 use crate::handlers::subscribe::{edge_payload_to_event, EventEnvelope};
-use crate::metrics::{IdempotencyOutcome, SubmitOutcome, WriterMetrics};
+use crate::metrics::{IdempotencyOutcome, SubmitOutcome, WriteStage, WriterMetrics};
 use crate::state::ack_codec;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteAck, WriteId};
 use brain_metadata::tables::idempotency::{response_kind, IdempotencyEntry, IDEMPOTENCY_TABLE};
 
 use super::wal_map::phase_to_wal_payload;
-use super::RealWriterHandle;
+use super::{RealWriterHandle, RedbCommittedWatermark};
+use crate::writer::wal_sink::WalSinkError;
+
+/// Closes the reservation the WAL drain opened for this write's LSNs, so a
+/// write that fails after its records are durable in the WAL cannot hold the
+/// contiguous frontier below them forever.
+struct LsnReservation<'a> {
+    watermark: &'a RedbCommittedWatermark,
+    range: Option<(u64, u64)>,
+}
+
+impl LsnReservation<'_> {
+    fn commit(mut self) {
+        if let Some((first, last)) = self.range.take() {
+            self.watermark.commit(first, last);
+        }
+    }
+}
+
+impl Drop for LsnReservation<'_> {
+    fn drop(&mut self) {
+        if let Some((first, last)) = self.range {
+            self.watermark.abandon(first, last);
+        }
+    }
+}
 
 /// Durable idempotency cache for the unified write path.
 ///
@@ -49,7 +74,7 @@ use super::RealWriterHandle;
 /// metadata file. Every successful `submit(Write)` writes one row into
 /// the same `WriteTransaction` as the apply phases, so the row commits
 /// atomically with the data — a server restart between commit and
-/// "stamp the cache" can no longer drop the idempotency record.
+/// "stamp the cache" cannot drop the idempotency record.
 ///
 /// A small in-memory hot cache fronts the table to keep replays in the
 /// same shard cheap; the in-memory entries are best-effort and rebuild
@@ -251,8 +276,11 @@ impl RealWriterHandle {
     /// path. Applies all phases atomically against one redb wtxn.
     ///
     /// # Errors
+    /// - [`WriterError::NotFound`] for missing rows.
     /// - [`WriterError::Internal`] for storage / apply failures (the
     ///   wtxn auto-rolls-back on drop).
+    /// - [`WriterError::StorageFaulted`] when the shard WAL is terminally
+    ///   broken and requires an operator restart.
     /// - [`WriterError::Conflict`] for idempotency mismatch — same
     ///   `WriteId`, different phases. (Not yet wired; the cache
     ///   just returns the cached ack on hit.)
@@ -291,8 +319,9 @@ impl RealWriterHandle {
         write.started_at_unix_nanos = started_at;
         let wal_span = tracing::info_span!("brain.wal.append", phases = write.phases.len());
         // `(first, last)` LSN of this write's WAL records, or `None`
-        // when the write mapped no WAL payloads. `last` drives the
-        // post-commit redb-committed watermark advance below.
+        // when the write mapped no WAL payloads. The WAL drain reserves
+        // this range, and the reservation is committed or abandoned when
+        // the redb transaction resolves.
         let wal_lsns = match tracing::Instrument::instrument(
             wal_append_for_write(self, &write, started_at),
             wal_span,
@@ -307,6 +336,10 @@ impl RealWriterHandle {
         };
         let lsn_first = wal_lsns.map(|(f, _)| f);
         let lsn_last = wal_lsns.map(|(_, l)| l);
+        let lsn_reservation = LsnReservation {
+            watermark: self.redb_committed_watermark(),
+            range: wal_lsns.map(|(first, last)| (first.raw(), last.raw())),
+        };
 
         // 3. HNSW side effects. Run before the redb wtxn opens
         // so the wtxn lifetime stays minimal and a HNSW failure
@@ -347,6 +380,14 @@ impl RealWriterHandle {
 
             // Counter changes of all phases land in one flush.
             let counter_batch = brain_metadata::tables::agg::begin_batch(&wtxn);
+            // Stage timer: every phase applied into this transaction plus
+            // the idempotency stamp. A guard, not a bare `Instant`: this
+            // region returns early on a phase-apply failure and on an
+            // idempotency-stamp failure, and a write that spent its time
+            // applying before failing is precisely the one worth seeing.
+            // Dropped explicitly below so apply and commit partition the
+            // redb work rather than overlap.
+            let apply_timer = metrics.stages().start(WriteStage::RedbApply);
             let mut acks = Vec::with_capacity(write.phases.len());
             for phase in &write.phases {
                 match dispatch(&wtxn, phase, &write) {
@@ -395,20 +436,25 @@ impl RealWriterHandle {
                 return Err(e);
             }
 
-            if let Err(e) = wtxn.commit() {
+            drop(apply_timer);
+
+            // Stage timer: the redb commit — B-tree page writes plus
+            // redb's durability fsync for every phase in this write.
+            let commit_started = Instant::now();
+            let commit_result = wtxn.commit();
+            metrics
+                .stages()
+                .record(WriteStage::RedbCommit, commit_started.elapsed());
+            if let Err(e) = commit_result {
                 record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
                 return Err(WriterError::Internal(format!("commit: {e:?}")));
             }
-            // Redb is now durable for this write. Advance the shared
-            // redb-committed watermark to this write's highest WAL LSN
-            // so the checkpoint path can promise a `durable_lsn` that
-            // metadata has actually committed — never the WAL-appended
-            // tail, which advances before this commit. Writes with no
-            // WAL records (`None`) leave the watermark untouched: there
-            // is nothing for recovery to skip on their behalf.
-            if let Some(last) = lsn_last {
-                self.redb_committed_watermark().advance_to(last.raw());
-            }
+            // Redb is now durable for this write. Resolve its reserved
+            // range so the shared watermark publishes only the highest
+            // contiguous prefix of committed writer records. WAL-appended
+            // records are not sufficient: an out-of-order commit or a
+            // failed write must not let recovery skip an unapplied record.
+            lsn_reservation.commit();
             durable_ack
         };
 
@@ -486,6 +532,11 @@ impl RealWriterHandle {
                 // silently-dropped doc would make the memory permanently
                 // unsearchable by keyword.
                 if let Some(dispatcher) = &self.memory_text_dispatcher {
+                    // Stage timer: the hand-off, not the tantivy write
+                    // (the indexer commits off the ack path). It is on
+                    // the ack path because it backpressures, so a
+                    // saturated indexer shows up here as a real wait.
+                    let dispatch_started = Instant::now();
                     dispatcher
                         .dispatch(crate::index::text_indexer::MemoryTextOp::Upsert {
                             id: *id,
@@ -496,6 +547,9 @@ impl RealWriterHandle {
                             session: session_id.raw(),
                         })
                         .await;
+                    metrics
+                        .stages()
+                        .record(WriteStage::TantivyIndex, dispatch_started.elapsed());
                 }
             }
             // Tombstone(Memory) fans out to the FORGET cascade. Both
@@ -552,8 +606,8 @@ impl RealWriterHandle {
                 );
             }
             // UpsertSchema fans out to the SchemaMigrationWorker. The
-            // OUTSIDE_ACTIVE_SCHEMA flag-sweep was previously inline
-            // inside the upload wtxn; moving it post-commit keeps the
+            // OUTSIDE_ACTIVE_SCHEMA flag-sweep runs post-commit rather
+            // than inline inside the upload wtxn, which keeps the
             // upload ack latency bounded (the sweep is a full-table
             // STATEMENTS_TABLE scan and grows linearly with corpus
             // size). A dropped enqueue is recoverable — pre-existing
@@ -697,9 +751,10 @@ async fn wal_append_for_write(
 
     // Build the full record batch up front (TxnBegin + payloads +
     // TxnCommit for multi-phase, single payload for single-phase) and
-    // issue ONE `append_many`. Multi-phase writes previously cost
-    // 2 + N channel hops + 2 + N fsyncs; the batched path collapses
-    // to 1 channel hop + 1 fsync (group-commit folds the whole batch).
+    // issue ONE `append_many`. Appending record by record costs a
+    // multi-phase write 2 + N channel hops and 2 + N fsyncs; the batched
+    // path collapses to 1 channel hop + 1 fsync (group-commit folds the
+    // whole batch).
     let records: Vec<WalRecord> = if mapped.len() == 1 {
         vec![WalRecord::from_typed(
             Lsn(0),
@@ -746,14 +801,33 @@ async fn wal_append_for_write(
         batch
     };
 
-    let lsns = sink
-        .append_many(records)
-        .await
-        .map_err(|e| WriterError::Internal(format!("wal append_many: {e}")))?;
+    // Stage timer: the durable WAL hand-off — one channel hop to the
+    // drain plus whatever share of a group-commit fsync this batch
+    // pays for. Observed whether the append succeeds or fails; a slow
+    // failure is latency the ack still spent.
+    let append_started = Instant::now();
+    let append_result = sink.append_many(records).await;
+    metrics
+        .stages()
+        .record(WriteStage::WalAppend, append_started.elapsed());
+    let lsns = append_result.map_err(writer_error_from_wal_sink)?;
     Ok(match (lsns.first().copied(), lsns.last().copied()) {
         (Some(first), Some(last)) => Some((first, last)),
         _ => None,
     })
+}
+
+/// Classify a WAL-sink failure for the caller. A latched terminal fault keeps
+/// its own variant all the way to the wire so clients are told to stop; every
+/// other sink failure stays an ordinary internal fault they may retry.
+pub fn writer_error_from_wal_sink(e: WalSinkError) -> WriterError {
+    match e {
+        WalSinkError::StorageFaulted { detail } => WriterError::StorageFaulted { detail },
+        WalSinkError::Internal(msg) => WriterError::Internal(format!("wal append_many: {msg}")),
+        WalSinkError::Disconnected => {
+            WriterError::Internal("wal append_many: drain task gone".into())
+        }
+    }
 }
 
 /// HNSW writes per phase. Runs after WAL append and before the
@@ -779,10 +853,16 @@ fn execute_hnsw_side_effects(writer: &RealWriterHandle, write: &Write) -> Result
                 id,
                 new_vector: vector,
             } => {
+                // Stage timer: wraps the lock acquisition as well as
+                // the graph insert, because contention on the single
+                // HNSW writer is latency the ack pays either way.
+                let insert_started = Instant::now();
+                let inserted = writer.hnsw_writer_lock().insert(*id, vector.as_ref());
                 writer
-                    .hnsw_writer_lock()
-                    .insert(*id, vector.as_ref())
-                    .map_err(|e| WriterError::Internal(format!("hnsw insert: {e:?}")))?;
+                    .writer_metrics()
+                    .stages()
+                    .record(WriteStage::HnswInsert, insert_started.elapsed());
+                inserted.map_err(|e| WriterError::Internal(format!("hnsw insert: {e:?}")))?;
             }
             Phase::Tombstone {
                 target: TombstoneTarget::Memory { id, .. },
@@ -1030,24 +1110,26 @@ fn memory_id_from_node_ref(n: NodeRef) -> MemoryId {
     }
 }
 
-/// Map [`ApplyError`] into [`WriterError`].
+/// Map [`ApplyError`] into [`WriterError`] at the writer's boundary.
 ///
-/// Storage / metadata / phase mis-shape all surface as `Internal` — the
-/// writer is the boundary at which apply errors become wire errors. The
-/// schema-admission and not-found variants get richer wire mappings
-/// once the handler-side projection lands.
+/// The three classifications the caller can act on — a missing row, a
+/// conflict with committed state, and a refusal of the caller's input — keep
+/// their structure so the wire layer can route on it without re-parsing a
+/// message. Storage, metadata and phase mis-shape are the engine's own faults
+/// and collapse into `Internal`.
 fn map_apply_err(e: ApplyError) -> WriterError {
     match e {
-        ApplyError::Storage(s) => WriterError::Internal(format!("storage: {s}")),
-        ApplyError::NotFound { what, detail } => {
-            WriterError::Internal(format!("{what} not found: {detail}"))
+        ApplyError::Storage { fault, detail } => {
+            WriterError::Internal(format!("storage ({fault}): {detail}"))
         }
+        ApplyError::NotFound { what, detail } => WriterError::NotFound { what, detail },
         ApplyError::Invariant(s) => WriterError::Internal(format!("invariant: {s}")),
-        ApplyError::SchemaAdmission(s) => WriterError::Internal(format!("schema: {s}")),
+        ApplyError::SchemaAdmission(s) => WriterError::InvalidRequest(format!("schema: {s}")),
         // The one apply error that is the caller's, not ours. `WriterError::
         // Conflict` already maps to `ErrorCode::Conflict` on the wire, which
         // the edge renders as 409 — a status clients do not retry.
         ApplyError::Conflict(s) => WriterError::Conflict(s),
+        ApplyError::InvalidRequest(s) => WriterError::InvalidRequest(s),
         ApplyError::Metadata(s) => WriterError::Internal(format!("metadata: {s}")),
         ApplyError::PhaseMisShape(s) => WriterError::Internal(format!("phase mis-shape: {s}")),
     }
@@ -1056,16 +1138,17 @@ fn map_apply_err(e: ApplyError) -> WriterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apply::StorageFault;
 
     /// A duplicate canonical name is the caller's doing, so it must leave the
     /// writer as a conflict — not an internal error.
     ///
-    /// It used to be flattened into `ApplyError::Metadata`, which maps to
-    /// `WriterError::Internal` and reaches a client as 500/502. A client that
-    /// reads the status then retries a write the engine refuses every time:
-    /// observed live as `create_entity` returning 502 with
+    /// Flattening it into `ApplyError::Metadata` maps it to
+    /// `WriterError::Internal`, which reaches a client as 500/502. A client
+    /// that reads the status then retries a write the engine refuses every
+    /// time: observed live as `create_entity` returning 502 with
     /// `brain Internal: writer rejected: ... duplicate canonical_name "ada"`,
-    /// which told the agent the failure might be transient.
+    /// which tells the agent the failure might be transient.
     #[test]
     fn a_duplicate_canonical_name_leaves_the_writer_as_a_conflict() {
         let err = map_apply_err(ApplyError::Conflict(
@@ -1077,6 +1160,54 @@ mod tests {
         }
     }
 
+    /// A client that reads a retryable status retries a write the engine
+    /// refuses every time, so an invalid relation endpoint must stay invalid.
+    #[test]
+    fn an_invalid_relation_endpoint_leaves_the_writer_as_an_invalid_request() {
+        let err = map_apply_err(ApplyError::InvalidRequest(
+            "relation_create: entity type violation on from".into(),
+        ));
+        match err {
+            WriterError::InvalidRequest(detail) => {
+                assert_eq!(detail, "relation_create: entity type violation on from")
+            }
+            other => panic!("expected WriterError::InvalidRequest, got {other:?}"),
+        }
+    }
+
+    /// A client that reads a retryable status retries a write the engine
+    /// refuses every time, so schema admission refusals must stay invalid.
+    #[test]
+    fn a_schema_admission_refusal_leaves_the_writer_as_an_invalid_request() {
+        let err = map_apply_err(ApplyError::SchemaAdmission(
+            "predicate acme:knows not declared".into(),
+        ));
+        match err {
+            WriterError::InvalidRequest(detail) => {
+                assert!(detail.contains("predicate acme:knows not declared"));
+            }
+            other => panic!("expected WriterError::InvalidRequest, got {other:?}"),
+        }
+    }
+
+    /// A missing row crosses the writer boundary as a missing row. The
+    /// `what` tag is what the wire layer routes on, so it has to survive
+    /// the hop intact rather than being rebuilt from the message text.
+    #[test]
+    fn an_apply_not_found_crosses_the_writer_boundary_intact() {
+        let err = map_apply_err(ApplyError::NotFound {
+            what: "entity",
+            detail: "EntityId(9)".into(),
+        });
+        match err {
+            WriterError::NotFound { what, detail } => {
+                assert_eq!(what, "entity");
+                assert_eq!(detail, "EntityId(9)");
+            }
+            other => panic!("expected WriterError::NotFound, got {other:?}"),
+        }
+    }
+
     /// The sibling that must NOT change: a genuine engine fault stays internal.
     #[test]
     fn an_engine_fault_is_still_internal() {
@@ -1085,7 +1216,10 @@ mod tests {
             WriterError::Internal(_)
         ));
         assert!(matches!(
-            map_apply_err(ApplyError::Storage("disk".into())),
+            map_apply_err(ApplyError::Storage {
+                fault: StorageFault::Transient,
+                detail: "disk".into(),
+            }),
             WriterError::Internal(_)
         ));
     }
@@ -1447,10 +1581,10 @@ mod tests {
         assert_eq!(revert_job.forgot_at_unix_nanos, 1_700_000_002_000);
     }
 
-    /// Regression: fresh-DB encode with `deduplicate=true` used to
-    /// panic on the read-side lookup with
-    /// `Table 'fingerprints' does not exist` because redb doesn't
-    /// create the table until something writes it. Constructing
+    /// A fresh-DB encode with `deduplicate=true` reaches a read-side
+    /// lookup before anything has written the table, and redb doesn't
+    /// create a table until something writes it — the lookup panics with
+    /// `Table 'fingerprints' does not exist`. Constructing
     /// `RealWriterHandle` must materialise every table that any
     /// read-side path touches; otherwise the first opt-in dedup
     /// encode 500s.
@@ -2058,5 +2192,417 @@ mod tests {
             "expired durable row must be classified as a miss",
         );
         assert_eq!(snap.idempotency_hit, 0);
+    }
+
+    /// Every stage of the ack path must be observed by a real submit.
+    ///
+    /// The four stage histograms exist to attribute write latency, so
+    /// the thing worth asserting is that a write that actually does
+    /// WAL, redb, HNSW and lexical work leaves a non-zero count in
+    /// each one — a struct-shape assertion would pass against a
+    /// histogram nothing ever records into.
+    #[tokio::test]
+    async fn a_real_submit_observes_every_ack_path_stage() {
+        use crate::index::text_indexer::MemoryTextDispatcher;
+        use crate::metrics::WriteStage;
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(RecordingWalSink::new()));
+        // Hold the receiver for the life of the test: a dropped
+        // receiver turns the dispatch into an immediate error path
+        // rather than the enqueue the stage is meant to measure.
+        let (dispatcher, _text_rx) = MemoryTextDispatcher::default_channel();
+        writer.set_memory_text_dispatcher(Arc::new(dispatcher));
+
+        // UpsertMemory is the one phase that touches all four stages:
+        // it maps to a WAL payload, applies + commits through redb,
+        // inserts its vector into HNSW, and dispatches its text to the
+        // lexical indexer.
+        let upsert = Phase::UpsertMemory {
+            id: MemoryId::pack(0, 7, 0),
+            text: "the ack path pays for four stages".into(),
+            vector: Box::new([0.25_f32; VECTOR_DIM]),
+            kind: MemoryKind::Episodic,
+            salience: brain_core::Salience::default(),
+            session_id: SessionId(3),
+            created_at_unix_nanos: 1_700_000_000_000,
+            arena_slot: 7,
+            embedding_model_fp: [0xCD; 16],
+            content_hash: None,
+            occurred_at_unix_nanos: None,
+            deduplicate: false,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), SpaceId::default(), upsert))
+            .await
+            .expect("submit");
+
+        let snap = writer.writer_metrics().snapshot();
+        for stage in [
+            WriteStage::WalAppend,
+            WriteStage::RedbCommit,
+            WriteStage::HnswInsert,
+            WriteStage::TantivyIndex,
+            WriteStage::RedbApply,
+        ] {
+            assert_eq!(
+                snap.stages.count(stage),
+                1,
+                "stage {} must be observed exactly once by one UpsertMemory submit",
+                stage.label(),
+            );
+            // The observation must also land in a bucket, not just
+            // bump the count — a histogram whose buckets never move
+            // renders as a flat line in Prometheus.
+            let h = &snap.stages.latency_ms[stage as usize];
+            assert_eq!(
+                h.buckets.last().expect("+Inf bucket").cumulative_count,
+                1,
+                "stage {} observation must be bucketed",
+                stage.label(),
+            );
+        }
+
+        // The per-phase family the ack path already paid atomics for
+        // ticks on the same submit.
+        assert_eq!(snap.submit_ok_total(), 1);
+        assert_eq!(snap.idempotency_miss, 1);
+    }
+
+    /// A write with no HNSW-bearing phase and no lexical dispatcher
+    /// must leave those two stages untouched. Recording a zero there
+    /// would make every Link write look like a free HNSW insert and
+    /// drag the percentile floor down.
+    #[tokio::test]
+    async fn stages_that_did_not_run_are_not_observed() {
+        use crate::metrics::WriteStage;
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(RecordingWalSink::new()));
+
+        let link = Phase::Link {
+            from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
+            to: NodeRef::Memory(MemoryId::pack(0, 2, 0)),
+            kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.42,
+            origin: 0,
+            derived_by: 0,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: 1_700_000_000_000,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), SpaceId::default(), link))
+            .await
+            .expect("submit");
+
+        let snap = writer.writer_metrics().snapshot();
+        assert_eq!(snap.stages.count(WriteStage::WalAppend), 1);
+        assert_eq!(snap.stages.count(WriteStage::RedbCommit), 1);
+        assert_eq!(snap.stages.count(WriteStage::HnswInsert), 0);
+        assert_eq!(snap.stages.count(WriteStage::TantivyIndex), 0);
+        assert_eq!(snap.stages.count(WriteStage::RedbApply), 1);
+    }
+
+    /// Helper: one `UpsertMemory` phase distinguished by `n`.
+    fn upsert_phase(n: u64) -> Phase {
+        Phase::UpsertMemory {
+            id: MemoryId::pack(0, n, 0),
+            text: format!("stage scenario {n}"),
+            vector: Box::new([0.25_f32; VECTOR_DIM]),
+            kind: MemoryKind::Episodic,
+            salience: brain_core::Salience::default(),
+            session_id: SessionId(3),
+            created_at_unix_nanos: 1_700_000_000_000,
+            arena_slot: n,
+            embedding_model_fp: [0xCD; 16],
+            content_hash: None,
+            occurred_at_unix_nanos: None,
+            deduplicate: false,
+        }
+    }
+
+    /// A WAL failure must still leave its own stage observed, and must
+    /// leave every later stage untouched.
+    ///
+    /// The ordering assertion is the point: WAL precedes HNSW and redb,
+    /// so a write that died at the WAL cannot have paid for them. A
+    /// histogram that showed otherwise would be attributing cost to a
+    /// stage that never ran.
+    #[tokio::test]
+    async fn a_failed_wal_append_observes_its_own_stage_and_no_later_one() {
+        use crate::metrics::WriteStage;
+        use crate::writer::wal_sink::FailingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(FailingWalSink::new("disk gone")));
+
+        let err = writer
+            .submit(Write::single(
+                WriteId::new(),
+                SpaceId::default(),
+                upsert_phase(11),
+            ))
+            .await
+            .expect_err("a failing WAL sink must fail the submit");
+        assert!(format!("{err:?}").contains("disk gone"), "{err:?}");
+
+        let snap = writer.writer_metrics().snapshot();
+        assert_eq!(
+            snap.stages.count(WriteStage::WalAppend),
+            1,
+            "the stage that failed must still be observed",
+        );
+        assert_eq!(snap.stages.count(WriteStage::HnswInsert), 0);
+        assert_eq!(snap.stages.count(WriteStage::RedbApply), 0);
+        assert_eq!(snap.stages.count(WriteStage::RedbCommit), 0);
+    }
+
+    /// A write that fails *inside* apply must still observe the apply
+    /// stage.
+    ///
+    /// This is the case the guard exists for: the phase loop returns
+    /// early on an `ApplyError`, so a timer that recorded after the
+    /// loop would contribute nothing. A write that was slow because
+    /// apply was struggling is exactly the one an operator needs in
+    /// the histogram, and it is the one a record-at-the-end timer
+    /// silently drops.
+    #[tokio::test]
+    async fn a_failed_apply_still_observes_the_apply_stage() {
+        use crate::metrics::WriteStage;
+        use crate::write::phase::{TombstoneMode, TombstoneTarget};
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(RecordingWalSink::new()));
+
+        // Tombstoning a memory that was never written raises
+        // `ApplyError::NotFound` from inside the write transaction.
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id: MemoryId::pack(0, 999, 0),
+                mode: TombstoneMode::Hard,
+            },
+            reason: 0,
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), SpaceId::default(), phase))
+            .await
+            .expect_err("tombstoning a missing memory must fail apply");
+
+        let snap = writer.writer_metrics().snapshot();
+        assert_eq!(
+            snap.stages.count(WriteStage::RedbApply),
+            1,
+            "apply must be observed even though it failed",
+        );
+        assert_eq!(
+            snap.stages.count(WriteStage::RedbCommit),
+            0,
+            "a transaction that never committed must not record a commit",
+        );
+    }
+
+    /// An idempotent replay returns the cached ack without redoing the
+    /// work, so it must not observe the stages a second time. Counting
+    /// a replay would inflate the write rate the histograms imply and
+    /// understate every per-write latency.
+    #[tokio::test]
+    async fn a_cached_replay_does_not_re_observe_stages() {
+        use crate::metrics::WriteStage;
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(RecordingWalSink::new()));
+
+        let write_id = WriteId::new();
+        let hash = [0xAB_u8; 32];
+        writer
+            .submit(
+                Write::single(write_id, SpaceId::default(), upsert_phase(12))
+                    .with_request_hash(hash),
+            )
+            .await
+            .expect("first submit");
+
+        let before = writer.writer_metrics().snapshot();
+        assert_eq!(before.stages.count(WriteStage::RedbCommit), 1);
+
+        writer
+            .submit(
+                Write::single(write_id, SpaceId::default(), upsert_phase(12))
+                    .with_request_hash(hash),
+            )
+            .await
+            .expect("replay must be served from the cache");
+
+        let after = writer.writer_metrics().snapshot();
+        assert_eq!(
+            after.stages.count(WriteStage::RedbCommit),
+            1,
+            "a cached replay must not record a second commit",
+        );
+        assert_eq!(after.stages.count(WriteStage::RedbApply), 1);
+        assert_eq!(after.stages.count(WriteStage::WalAppend), 1);
+        assert_eq!(after.idempotency_hit, 1, "the replay must be a cache hit");
+    }
+
+    /// Apply is per-transaction; HNSW is per-vector. A multi-phase
+    /// write must observe apply once and HNSW once per memory, or the
+    /// two axes cannot be compared against each other.
+    #[tokio::test]
+    async fn a_multi_phase_write_observes_apply_once_and_hnsw_per_vector() {
+        use crate::metrics::WriteStage;
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(RecordingWalSink::new()));
+
+        writer
+            .submit(Write::from_phases(
+                WriteId::new(),
+                SpaceId::default(),
+                vec![upsert_phase(21), upsert_phase(22), upsert_phase(23)],
+            ))
+            .await
+            .expect("multi-phase submit");
+
+        let snap = writer.writer_metrics().snapshot();
+        assert_eq!(
+            snap.stages.count(WriteStage::RedbApply),
+            1,
+            "one transaction, one apply observation",
+        );
+        assert_eq!(snap.stages.count(WriteStage::RedbCommit), 1);
+        assert_eq!(
+            snap.stages.count(WriteStage::HnswInsert),
+            3,
+            "one HNSW insert per vector-bearing phase",
+        );
+    }
+
+    /// Attribute ack-path latency across its four stages.
+    ///
+    /// The per-stage histograms exist to answer which stage a write
+    /// actually spends its time in. One submit proves the stages are
+    /// wired; a distribution is what tells an operator where the cost
+    /// lives, so this drives a run of real writes and prints the shape.
+    ///
+    /// `#[ignore]` because it is a measurement, not an assertion: the
+    /// numbers depend on the host and asserting a threshold on them
+    /// would make the gate fail for being run on a slower machine.
+    /// Run it deliberately:
+    ///
+    /// ```text
+    /// cargo nextest run -p brain-ops --run-ignored only ack_path_latency -- --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "measurement harness; run deliberately with --run-ignored"]
+    #[allow(clippy::cast_precision_loss)]
+    async fn ack_path_latency_distribution() {
+        use crate::index::text_indexer::MemoryTextDispatcher;
+        use crate::metrics::WriteStage;
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        const WRITES: u64 = 500;
+
+        let (_dir, mut writer) = build_writer();
+        writer = writer.with_wal_sink(Arc::new(RecordingWalSink::new()));
+        let (dispatcher, _text_rx) = MemoryTextDispatcher::default_channel();
+        writer.set_memory_text_dispatcher(Arc::new(dispatcher));
+
+        let wall = std::time::Instant::now();
+        for i in 0..WRITES {
+            // Distinct slot and id per write, and a vector that moves
+            // with `i`: identical vectors would collapse the HNSW graph
+            // into a degenerate case and understate insert cost.
+            let slot = i;
+            let v = i as f32 / WRITES as f32;
+            let upsert = Phase::UpsertMemory {
+                id: MemoryId::pack(0, slot, 0),
+                text: format!("ack path latency sample {i}"),
+                vector: Box::new([v; VECTOR_DIM]),
+                kind: MemoryKind::Episodic,
+                salience: brain_core::Salience::default(),
+                session_id: SessionId(3),
+                created_at_unix_nanos: 1_700_000_000_000,
+                arena_slot: slot,
+                embedding_model_fp: [0xCD; 16],
+                content_hash: None,
+                occurred_at_unix_nanos: None,
+                deduplicate: false,
+            };
+            writer
+                .submit(Write::single(WriteId::new(), SpaceId::default(), upsert))
+                .await
+                .expect("submit");
+        }
+        let elapsed = wall.elapsed();
+
+        let snap = writer.writer_metrics().snapshot();
+        let stages = [
+            WriteStage::WalAppend,
+            WriteStage::RedbCommit,
+            WriteStage::HnswInsert,
+            WriteStage::TantivyIndex,
+            WriteStage::RedbApply,
+        ];
+        let stage_total_ms: f64 = stages
+            .iter()
+            .map(|s| snap.stages.latency_ms[*s as usize].sum)
+            .sum();
+
+        println!("\n=== ack-path latency over {WRITES} writes ===");
+        println!(
+            "wall {:?}  ({:.0} writes/sec)",
+            elapsed,
+            WRITES as f64 / elapsed.as_secs_f64()
+        );
+        println!(
+            "{:<15} {:>7} {:>11} {:>11} {:>9} {:>9} {:>7}",
+            "stage", "count", "total_ms", "mean_us", "p50_ms", "p99_ms", "share"
+        );
+        for stage in stages {
+            let h = &snap.stages.latency_ms[stage as usize];
+            let pct = |q: f64| -> String {
+                if h.count == 0 {
+                    return "-".into();
+                }
+                let target = (q * h.count as f64).ceil() as u64;
+                h.buckets
+                    .iter()
+                    .find(|b| b.cumulative_count >= target)
+                    .map_or_else(
+                        || "+Inf".into(),
+                        |b| b.le.map_or_else(|| "+Inf".into(), |le| format!("{le}")),
+                    )
+            };
+            let mean_us = if h.count == 0 {
+                0.0
+            } else {
+                h.sum * 1000.0 / h.count as f64
+            };
+            let share = if stage_total_ms > 0.0 {
+                h.sum / stage_total_ms * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<15} {:>7} {:>11.3} {:>11.1} {:>9} {:>9} {:>6.1}%",
+                stage.label(),
+                h.count,
+                h.sum,
+                mean_us,
+                pct(0.50),
+                pct(0.99),
+                share
+            );
+        }
+        println!(
+            "measured stage total {stage_total_ms:.1} ms of {:.1} ms wall",
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 }

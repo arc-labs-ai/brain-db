@@ -36,6 +36,10 @@ you run is exactly what we run.
 - **`seccomp=unconfined`** (or a profile permitting `io_uring_*`). Brain's
   shards use io_uring via Glommio; the default Docker seccomp profile blocks the
   syscalls.
+- **`memlock` unlimited.** io_uring pins its submission and completion rings,
+  so the memlock rlimit has to be raised: `--ulimit memlock=-1` on `docker run`,
+  or `ulimits: memlock: -1` in compose. Both this and `seccomp` are needed; one
+  without the other still fails to bring a shard up.
 - **Linux host.** Brain is Linux-only (io_uring). It runs fine in Docker on
   macOS/Windows via the Linux VM.
 
@@ -45,7 +49,7 @@ you run is exactly what we run.
 
 ```bash
 docker run -d --name brain \
-  --security-opt seccomp=unconfined \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 \
   -p 8080:8080 -p 9091:9091 \
   -e BRAIN__LLM__MODEL=gpt-4o-mini \
   -e BRAIN__ADMIN__TOKEN="$(openssl rand -hex 32)" \
@@ -87,9 +91,10 @@ The GLiNER NER model (`gliner-small-v2.1`) also ships in the image, at
 extractor pipeline — the tier that fixes entity span boundaries — and it is
 **required**: like the embedder, Brain refuses to start without it.
 
-It used to degrade instead, starting with the tier unloaded and extracting more
-weakly on every write while still reporting itself healthy. That is how v0.1.0
-shipped. A Brain that starts is now a Brain that extracts at full strength.
+A Brain that starts is a Brain that extracts at full strength: starting with the
+tier unloaded would mean extracting more weakly on every write while still
+reporting healthy, with nothing but one boot log line to distinguish the two.
+The embedder fails stop for the same reason.
 
 Together the two models account for roughly 720 MB of the image. To point the
 classifier at your own GLiNER build, override the config field:
@@ -110,7 +115,7 @@ name and refuses to load without them. See
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/arc-labs-ai/brain-db/main/docker-compose.yml
 curl -fsSLO https://raw.githubusercontent.com/arc-labs-ai/brain-db/main/.env.example
-cp .env.example .env          # then set the three required values (see below)
+cp .env.example .env          # then set the one required value (see below)
 docker compose up -d
 docker compose ps             # HEALTHCHECK status shows here
 docker compose logs -f brain
@@ -129,7 +134,7 @@ Pin a version in `.env`: `BRAIN_VERSION=0.4.0`.
 | Port | Surface | Exposed? |
 |---|---|---|
 | **8080** | Data plane — binary wire protocol (CBOR). SDKs connect here. | yes (`-p 8080`) |
-| **9091** | Public HTTP — `/healthz`, `/metrics` only. | yes (`-p 9091`) |
+| **9091** | Public HTTP — `/healthz` (liveness), `/readyz` (200 once every shard serves, 503 otherwise), `/metrics`. No auth, no data. | yes (`-p 9091`) |
 | **9092** | Admin HTTP — `/v1/*` (API-key mint/revoke, worker control, audit, snapshots, per-shard status). Stats/metrics live on the public `:9091/metrics`, not here. | **no** — loopback inside the container |
 
 The admin plane has no built-in auth beyond the operator token — it stays on
@@ -151,28 +156,55 @@ To front it externally, put it behind your own token/mTLS proxy — never map
 
 The image bakes defaults at `/etc/brain/config.toml`. Two override paths:
 
-1. **Single fields** — set `BRAIN__SECTION__FIELD` env vars. This is the only
-   env-override mechanism (no bespoke `BRAIN_X` vars). Examples:
+1. **Single fields** — set `BRAIN__SECTION__FIELD` env vars. Double underscore
+   separates nesting; each component is lowercased to match the TOML key. Any
+   field in the file is reachable this way. Examples:
 
    | Env var | Effect |
    |---|---|
    | `BRAIN__LLM__CREDENTIALS__KEK` | the key that seals stored credentials, 64 hex chars. Unset, Brain generates one into its data directory on first boot |
-   | `BRAIN__LLM__MODEL` | fallback model id when a registered credential names none (default `gpt-4o-mini`) |
-   | `BRAIN__ADMIN__TOKEN` | operator admin secret (**required**) |
+   | `BRAIN__LLM__MODEL` | fallback model id when a registered credential names none. The server has no built-in default; `docker-compose.yml` and `.env.example` set `gpt-4o-mini` |
+   | `BRAIN__ADMIN__TOKEN` | operator admin secret (**required** — the admin listener refuses to start without it) |
    | `BRAIN__STORAGE__SHARD_COUNT` | shards; one shard pins one core |
    | `BRAIN__SHARD__ARENA_CAPACITY_BYTES` | per-shard vector arena (e.g. `4GiB`) |
    | `BRAIN__RERANK__ENABLED` | load the cross-encoder reranker (default off — **fatal at boot on the stock image**, which carries no model) |
    | `BRAIN__MONITORING__TRACING__ENABLED` + `__ENDPOINT` | OTLP tracing |
+
+   Two variables sit outside the `BRAIN__` scheme, because they are read before
+   or independently of the config tree:
+
+   | Env var | Effect |
+   |---|---|
+   | `BRAIN_EMBED_MODEL_DIR` | absolute path to the embedder, first branch of the model-path cascade (shown above) |
+   | `BRAIN_LOG` | tracing filter, overriding `[monitoring.logging] level`. `RUST_LOG` is deliberately ignored so there is one way to set the level |
+
+   Everything else goes through `BRAIN__SECTION__FIELD` or the file. **Every
+   config struct is `#[serde(deny_unknown_fields)]`**, so a misspelled or
+   invented key is a startup parse error, not a warning — including one set
+   through the env scheme.
 
 2. **Whole file** — bind-mount your own:
    `-v /host/brain.toml:/etc/brain/config.toml:ro`.
 
 ### Sizing
 
-Defaults are a single-shard, single-container starting point: 1 shard, a 1 GiB
-arena (≈660K vectors at 1600 B/slot). For higher write throughput raise
-`BRAIN__STORAGE__SHARD_COUNT` toward your core count (each shard pins one core)
-and grow the arena to fit your corpus.
+The in-image defaults are 4 shards and a 1 GiB arena **per shard** (≈660K
+vectors each, at 1600 B/slot — a 1536-byte vector plus 64 bytes of metadata).
+Each shard pins one core, so 4 shards want at least 5 available: one core is
+held back for the network and admin runtimes, which do not run on a shard
+executor.
+
+Raise `BRAIN__STORAGE__SHARD_COUNT` toward your core count for write
+throughput, and grow `BRAIN__SHARD__ARENA_CAPACITY_BYTES` to fit your corpus.
+Unset `shard_count` entirely and the server sizes itself to the machine —
+`available_parallelism()` minus one, which reads the cgroup quota, so a
+container limited to two CPUs gets one shard rather than the host's core count.
+
+**Pick the count before the first boot.** A `MemoryId` encodes its shard, so
+the count the data directory was created with is recorded in `layout.json` and
+checked on every open: starting with a different count is refused with the
+recorded value in the error, rather than silently routing every existing id at
+a shard that does not hold it. There is no reshard tool.
 
 `[analytics]` (off by default) adds, per shard, `threads` OS threads and up to
 `memory_limit_mb / shard_count` of scan memory; exports add ~150 MiB per thread
@@ -210,11 +242,11 @@ verify (first one 5 minutes after start) finds and repairs any counters the
 older release left stale, and reports it in
 `brain_agg_counter_drifted_buckets_total`.
 
-**Schema v6 (salience decays when read).** This release stores each memory's
+**Schema v2 (salience decays when read).** This release stores each memory's
 salience as of an anchor time instead of a value a decay worker rewrites (the
 decay worker and `[workers] decay_interval_sec` are gone; remove that key from
 configs).
-The redb layout changed, so a v5 data directory is refused at open
+The redb layout changed, so a v1 data directory (0.4.3) is refused at open
 (`SchemaTooOld`); as with earlier pre-1.0 bumps there is no migration tool —
 start from a fresh data volume. Salience values change too: they are now
 exact at read time everywhere, where before the hourly decay batches left

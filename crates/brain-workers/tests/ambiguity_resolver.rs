@@ -190,7 +190,9 @@ fn end_to_end_promote_path() {
     )
     .with_metrics(metrics.clone());
 
-    let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+    let processed = glommio::LocalExecutor::default()
+        .run(worker.tick(&fx.worker_ctx))
+        .unwrap();
     assert_eq!(processed, 1);
 
     // Assert: proposal AutoApplied + merge committed.
@@ -227,7 +229,9 @@ fn end_to_end_reject_path() {
         fx.hnsw.clone(),
         fx.embedder.clone() as Arc<dyn Dispatcher>,
     );
-    futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+    glommio::LocalExecutor::default()
+        .run(worker.tick(&fx.worker_ctx))
+        .unwrap();
     let rtxn = fx.metadata.read_txn().unwrap();
     let p = proposal_get(&rtxn, pid).unwrap().unwrap();
     assert_eq!(p.status, proposal_status::REJECTED);
@@ -254,7 +258,9 @@ fn end_to_end_expire_path() {
     .with_knobs(AmbiguityResolverConfig::default())
     .with_metrics(metrics.clone());
 
-    futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+    glommio::LocalExecutor::default()
+        .run(worker.tick(&fx.worker_ctx))
+        .unwrap();
     let rtxn = fx.metadata.read_txn().unwrap();
     let p = proposal_get(&rtxn, pid).unwrap().unwrap();
     assert_eq!(p.status, proposal_status::EXPIRED);

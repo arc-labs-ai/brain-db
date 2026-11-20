@@ -24,7 +24,8 @@ User declarations narrow two things:
 
 | Surface | Effect of a declared type / predicate |
 |---|---|
-| `STATEMENT_CREATE`, `RELATION_CREATE`, `ENTITY_CREATE` (explicit wire ops) | Accept the call only when the referenced predicate / relation_type / entity_type exists in some active namespace. Otherwise reject with `PredicateNotInSchema` / `RelationTypeNotInSchema` / `EntityTypeNotInSchema`. |
+| `STATEMENT_CREATE`, `RELATION_CREATE` (explicit wire ops) | Resolve a qname against the schema version active for the scope the caller writes into. With a version active, a qname that scope does not declare is rejected with `PredicateNotInSchema` (0x004B) or `RelationTypeNotInSchema` (0x004C). With no version active the qname is interned and the write is accepted. |
+| `ENTITY_CREATE` (explicit wire op) | Resolves a numeric `entity_type_id` against the type registry, not a qname against a schema version, so there is no entity-type analogue of the two codes above. An id no registry row answers to is a bad argument: `InvalidArgument` (0x0040), carrying the id in the message. |
 | Extractor outputs | The pipeline runs on every ENCODE; persistence to the typed-graph tables happens only when the extracted entity / statement / relation references a declared type. Undeclared types are dropped silently (extraction is best-effort). |
 
 Read-side surfaces (`RECALL`, retrieval fan-out, lexical and semantic retrievers) run regardless of which user namespaces are present — every shard wires all three retrievers at spawn.
@@ -209,13 +210,27 @@ Brain validates a schema before accepting it:
 - Extractor model references resolve (e.g., `model: "claude-haiku-4-5"` must be a registered model).
 - LLM extractor prompts under length cap (default 4096 chars).
 
-### Compatibility (when updating existing schema)
-- Removing an entity type that has live entities: refuse, require migration.
-- Renaming an attribute: allowed; old name moves to alias internally.
-- Changing an attribute's type: refuse if incompatible (e.g., text → number).
-- Changing predicate's `kind`: refuse (would invalidate existing statements).
-- Removing a predicate: warn and require explicit `cascade_tombstone` flag.
-- Adding fields: always allowed.
+### Merge classification (when a declaration already exists)
+
+`SCHEMA_UPLOAD` is additive-merge, so the checks here are not a diff against
+the prior version — the validator never reads it. They are a per-declaration
+pre-flight against the persisted registry, run before any write transaction
+opens:
+
+- A declaration that doesn't exist yet: **insert**.
+- A declaration that exists with matching constraints: **idempotent**. An
+  upload where every item is idempotent returns the current version without
+  bumping it.
+- A declaration that exists with different constraints — a predicate's `kind`
+  or object range, for instance: **conflict**. `SCHEMA_CONFLICT` aborts the
+  whole upload and the previous active version stays live.
+
+Removal is not expressible through `SCHEMA_UPLOAD` at all: a type absent from
+a document is simply not mentioned, not dropped. The destructive path is the
+separate `SCHEMA_REPLACE` opcode ([`05_versioning.md`](05_versioning.md) §9).
+
+Adding declarations is therefore always allowed, and changing one is always
+either a no-op or a refusal.
 
 ## Schema versioning
 
@@ -223,24 +238,34 @@ Each accepted schema gets a version number. Statements and entities carry the `s
 
 On schema upload:
 - Brain parses and validates.
-- If valid, increments the version (e.g., from version 3 to version 4).
-- Writes the new schema document to `schema_versions` table.
-- Triggers a migration plan: which extractors changed, which need re-running.
-- Optionally, runs backfill: re-extract over existing memories under the new schema (configurable; typically run as a worker over weeks).
+- Classifies every declaration against the registry; one conflict aborts the upload.
+- If anything is new, increments the version (e.g., from version 3 to version 4) and writes the document to the `schema_versions` table, in one transaction with the definition rows.
+- Enqueues a flag sweep, post-commit, so the upload's ack is not coupled to a full statement scan.
 
-Existing statements remain queryable. They may become "stale" if the extractor that produced them has been improved. A `stale: bool` flag is set when their extractor version is older than the current.
+Existing rows remain queryable, always. What the sweep does is set
+`OUTSIDE_ACTIVE_SCHEMA` on each statement and relation whose predicate or type
+is missing from the new active version, and clear it on each one the new
+version adopts. Readers keep returning flagged rows; a schema-strict query is
+the only thing that uses the flag, to drop them deliberately.
 
-## Migration semantics
+## What a schema change does not do
 
-When a schema changes, three actions are possible per affected statement:
+A schema change reconciles nothing. There is no migration plan, no automatic
+backfill, and no per-type action to choose: the new version becomes active, the
+flag sweep marks what now falls outside the vocabulary, and every existing row
+stays exactly as it was written. A statement's own `schema_version` records the
+version it was extracted under, which is what makes the old row interpretable
+rather than merely tolerated.
 
-| Action | Behavior |
-|---|---|
-| **keep** | Old statement stays. New extractor doesn't touch it. Flagged stale. |
-| **re-extract** | Worker re-runs the new extractor over the source memory; produces new statement. Old supersedes-by-new. |
-| **tombstone** | Old statement marked tombstoned. Reason: SchemaInvalidation. |
+Re-aligning the memories behind those rows is a separate, opt-in act.
+`reextract_on_schema_change` is **off** by default — spending a tenant's model
+budget is not a default — so the migration worker reports how many memories
+fall outside the new vocabulary and leaves the decision with the operator, who
+runs the admin `EXTRACT_BACKFILL` op. Turning the knob on has the worker
+enqueue them itself. Flagging alone never re-aligns anything.
 
-The user picks the action per migration (in the migration declaration) or accepts the default (`re-extract`).
+The reasoning behind that, and the action vocabulary a future reconciler would
+need, are in [`05_versioning.md`](05_versioning.md) §3.
 
 ## Multiple schemas (namespaces)
 

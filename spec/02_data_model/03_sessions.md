@@ -39,6 +39,7 @@ This is a deliberate reversal of a server-allocated-handle design. A server-allo
 Two consequences follow:
 
 - There is **no session-name uniqueness rule and no normalization**, because there are no server-side names. `title` is display metadata attached to the registry row; it is never an identifier and nothing resolves through it.
+- `title` is capped at **256 bytes**, checked on `SESSION_CREATE` and refused above it with `InvalidRequest` (`crates/brain-ops/src/handlers/limits.rs:55`, enforced at `crates/brain-ops/src/handlers/session.rs:160`). The cap is the wire spec's identifier-ish field cap rather than a free-form text cap, because a title is a short label the caller reads back on every `SESSION_LIST` row — and because `SESSION_LIST` takes no limit argument, a title too large to frame would make the listing unreadable with nothing the client could pass to recover it.
 - There is **no capacity limit and no allocator**. The id space is the full `u64`, there is no monotonic counter to exhaust, and a deleted session's id may be reused by the client if it wants.
 
 ## 4. The default session
@@ -60,11 +61,9 @@ The registry is **derived, recomputable view state**. Every row summarizes memor
 
 ## 6. Memory ↔ session relationship
 
-A memory's `session_id` is set at encode time. It is **mutable** by an admin operation but not by hot-path operations:
+A memory's `session_id` is set at encode time. It is **not** mutable on the hot path, and it is not mutable by an application at all: an opcode is reserved for moving a memory between sessions (`0x0067`), but it is refused on the wire with the rest of the substrate admin set and has no route on the admin listener, so nothing reaches it today.
 
-- `ADMIN_MOVE_MEMORY(memory_id, new_session_id) → ack` (`0x0067`)
-
-Why mutable at all: occasionally a memory was encoded into the wrong session and needs to move. Why not on the hot path: most applications never need it at runtime, and exposing it there invites mass-moves from a logic bug.
+Why it is kept off the hot path: most applications never need to move a memory at runtime, and exposing it there invites a mass-move from a logic bug. The practical consequence of it being unreachable is that a memory encoded into the wrong session stays there; the fix is to re-encode under the right id and forget the original.
 
 ## 7. Querying by session
 
@@ -111,7 +110,7 @@ The v1 cascade is synchronous: it tombstones every matching memory in one pass. 
 
 There is nothing to rename. A session has no server-side name; `title` is a display field set at `SESSION_CREATE`. Changing how a session is labelled in a UI is a client concern.
 
-The admin ops `ADMIN_CREATE_SESSION` (`0x0065`) / `ADMIN_RENAME_SESSION` (`0x0066`) are a separate operator surface that does carry a `name`. They are admin-gated and not `act_as`-aware, and they are for operator tooling — not the path an application uses.
+Opcodes are reserved for an operator-side session create and rename (`0x0065` / `0x0066`) whose payloads do carry a `name`. They are refused on the wire with the rest of the substrate admin set and have no route on the admin listener, so they are not a surface an application — or an operator — reaches today. Nothing in the client-facing model resolves a session through a name.
 
 ## 12. Statistics and listing
 

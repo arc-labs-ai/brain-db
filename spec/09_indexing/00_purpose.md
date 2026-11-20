@@ -1,6 +1,6 @@
 # 09. ANN Index (HNSW)
 
-> **TL;DR.** HNSW per shard, via the `hnsw_rs` crate. Memory HNSW defaults `M=16, ef_construction=200, ef_search=64`; entity and statement HNSWs use per-corpus parameters documented in [`01_hnsw_basics.md`](01_hnsw_basics.md) § 25. Every shard owns three HNSW corpora (memory, entity, statement) and two tantivy indexes (memory text, statement text) from byte zero — none of them activate on schema upload. The HNSW indexes reference slots in the arena rather than copying vectors. Single-writer-per-shard inserts, lock-free reads through ArcSwap + crossbeam-epoch, inline filtering by model fingerprint, kind, and session. p99 search 5-10 ms; recall@10 95-98% at default ef_search.
+> **TL;DR.** HNSW per shard, via the `hnsw_rs` crate. Memory HNSW defaults `M=16, ef_construction=200, ef_search=64`; entity and statement HNSWs use per-corpus parameters documented in [`01_hnsw_basics.md`](01_hnsw_basics.md) § 25. Every shard owns three HNSW corpora (memory, entity, statement) and two tantivy indexes (memory text, statement text) from byte zero — none of them activate on schema upload. The arena stays the source of truth for a memory's vector; an index holds its own copy of what it searches. Single-writer-per-shard inserts, lock-free reads through ArcSwap plus a pending buffer searched alongside the published graph, inline filtering by model fingerprint, kind, and session. p99 search 5-10 ms; recall@10 95-98% at default ef_search.
 
 ## Status
 
@@ -32,7 +32,7 @@ This document specifies the vector index — the data structure that makes simil
 - Insertion, search, and deletion procedures.
 - The lack of dedicated persistence and the rebuild path on startup.
 - The maintenance worker that detects and repairs topology degradation.
-- The concurrency model: lock-free reads, single-writer writes, epoch-managed reclamation.
+- The concurrency model: lock-free reads, single-writer writes, atomic publication of each rebuilt graph.
 - Inline filtering by model fingerprint, kind, session.
 
 ## What this document does not cover
@@ -87,7 +87,7 @@ What the crate provides:
 What Brain adds on top:
 
 - The single-writer-per-shard discipline ([`04_concurrency.md`](04_concurrency.md)).
-- Lock-free reads via epoch-based reclamation.
+- Lock-free reads via an atomically published graph plus a pending buffer searched alongside it.
 - Inline filters for fingerprint / kind / session.
 - The maintenance worker for topology drift.
 - Integration with Brain's arena and metadata.
@@ -168,14 +168,14 @@ trait AnnIndex {
 }
 ```
 
-`insert` and `remove` are called by the writer task. `search` is called concurrently by reader tasks.
+`insert` and `remove` are called through the shard's single writer handle. `search` is called concurrently by reader tasks.
 
 ## 9. Insert + search must coexist
 
 Brain sustains writes and reads simultaneously. The HNSW must support:
 
-- A search seeing all memories committed before the search started.
-- A search not seeing memories inserted during the search (consistency).
+- A search seeing every memory inserted before the search started.
+- A search not observing an insert that lands while it runs — the search body is synchronous, so on the shard's executor none can.
 - An insert not blocking the search.
 
 This requires concurrency management, detailed in [`04_concurrency.md`](04_concurrency.md).

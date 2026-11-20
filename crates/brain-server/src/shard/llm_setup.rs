@@ -24,6 +24,7 @@ use std::sync::Arc;
 use brain_extractors::{ClassifierModel, EntityDisambiguator, MaterializeDeps};
 use brain_llm::LlmCredentialResolver;
 use brain_metadata::LlmCacheDb;
+use brain_workers::GlommioClassifierOffload;
 use parking_lot::Mutex;
 
 use super::credential_resolver::StoreCredentialResolver;
@@ -71,6 +72,13 @@ impl LlmDeps {
         MaterializeDeps {
             classifier_model,
             entity_type_qnames,
+            // A shard runs its workers on the same thread that answers its
+            // requests, and the classifier's forward pass is 3.82 s of
+            // uninterruptible CPU work per micro-batch. Left on that thread it
+            // stalls every request on the shard for its full length — two
+            // writes at 3.93 s and 3.86 s against a 1.80 ms median, one per
+            // one-second tick — so the pass goes to glommio's blocking pool.
+            classifier_offload: Some(Arc::new(GlommioClassifierOffload)),
             credential_resolver: self.resolver,
             llm_cache: self.cache,
             llm_max_tokens: self.max_tokens,
@@ -235,6 +243,11 @@ mod tests {
         assert!(materialize.llm_cache.is_some());
         assert!(materialize.classifier_model.is_none());
         assert_eq!(materialize.entity_type_qnames.as_slice(), labels.as_slice());
+        assert!(
+            materialize.classifier_offload.is_some(),
+            "a shard must never leave the forward pass on the thread that \
+             serves its requests",
+        );
     }
 
     /// Documents the constraint that drove the spawn_shard fix:

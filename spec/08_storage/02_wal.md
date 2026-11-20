@@ -89,28 +89,35 @@ Detailed format is in § Record formats below.
 
 ### 7. Synchronization
 
-A WAL append happens through the per-shard writer task. The writer:
+Appends reach the segment through one **group committer** task per shard, which owns the active `WalSegment`. Appenders enqueue records on a channel and await a per-call ack; the committer:
 
-1. Receives the record (from the request handler).
-2. Buffers it in the active segment's append buffer.
-3. Decides when to fsync (group commit window, see below).
+1. Awaits the first record of a batch.
+2. Accumulates further records into the active segment's append buffer.
+3. Decides when to flush (group commit window, see below).
 4. Submits a `pwritev2` with `RWF_DSYNC` via io_uring.
-5. Once the kernel signals completion, the record is durable.
-6. Acknowledges to the request handler.
+5. Once the kernel signals completion, every record in the batch is durable.
+6. Signals every pending ack with its LSN.
 
-The single-writer-per-shard discipline means there's no lock contention; the writer task is the only producer of WAL records for that shard.
+Several appenders can be in flight at once on a shard, because the shard dispatches a bounded number of requests concurrently. They are not a contention problem: the committer owns the segment, and all of them live on the same single-threaded executor, so there is no cross-thread synchronization on the hot path.
+
+Two producers reach the committer:
+
+- The **WAL-drain task**, which carries writer batches across the bounded channel that bridges the `Send + Sync` writer handle to the `!Sync` `Wal`. The drain is sequential, so writer LSNs are assigned in a single well-defined order.
+- The **checkpoint path**, which appends `CHECKPOINT_BEGIN` and `CHECKPOINT_END` directly.
 
 ### 8. Group commit
 
 Instead of fsync-per-record (slow), the WAL uses **group commit**: many records share a single fsync.
 
-A group commit window is small (default: 100 µs). All records that arrive within the window are fsync'd together.
+A group commit window is small (default: 100 µs). All records that arrive within the window are fsync'd together, up to a batch budget of 60 KiB, which flushes early when reached.
 
 The trade-off:
 - Smaller window → lower latency per record, less batching, more fsync overhead.
 - Larger window → higher latency per record (waiting for window to close), but better fsync amortization.
 
 100 µs is short enough that p50 latency isn't dominated by waiting; long enough to gather meaningful batches under load.
+
+The batch budget does double duty: the shard's concurrent-dispatch bound is derived from it (`max_batch_bytes / 4 KiB`, floored at two — 15 at the default). That coupling is what makes the window reachable. A second appender has to be able to arrive while the first is waiting for durability, and the bound is set so the number that can arrive matches the number of records the batch has room for. Raising `max_batch_bytes` widens both together.
 
 Detailed group-commit protocol is in § Durability below.
 
@@ -667,6 +674,8 @@ Two triggers fire a group commit:
 The 100 µs window:
 - Short enough that p50 latency for a single-record write is dominated by fsync, not waiting.
 - Long enough to gather meaningful batches under load (1000 records/sec → 1 record per 100 µs window typical; 10K rec/sec → 1-2 records per window).
+
+Those arrival rates assume records trickle in from independent requests. The ceiling on a single shard is the dispatch bound: at most 15 requests can be in flight at the default batch budget, so a window can hold at most that many writer batches regardless of offered load.
 
 For very low-rate workloads, every record fsyncs alone; group commit doesn't help, but the latency floor is fsync alone. For high-rate workloads, group commit amortizes fsync over many records.
 

@@ -602,8 +602,11 @@ impl OpsContext {
                 match ciborium::into_writer(&payload, &mut buf) {
                     Ok(()) => buf,
                     Err(e) => {
-                        tracing::warn!(error = %e, "CBOR encode of notification event failed; publishing bus-only");
-                        let _ = self.events.publish(make_envelope(0, payload));
+                        tracing::warn!(
+                            error = %e,
+                            "CBOR encode of notification event failed; publishing without a durable position; event cannot be replayed"
+                        );
+                        self.events.publish_prestamped(make_envelope(0, payload));
                         return;
                     }
                 }
@@ -634,20 +637,20 @@ impl OpsContext {
                     lsn.raw()
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "notification event WAL append failed; bus-only publish");
-                    self.events.current_lsn().saturating_add(1)
+                    tracing::warn!(
+                        error = %e,
+                        "notification event WAL append failed; publishing without a durable position; event cannot be replayed"
+                    );
+                    0
                 }
             }
         } else {
-            // No sink wired — fall through to bus's allocator.
+            // Without a WAL sink the event has no durable position and cannot
+            // be replayed, so publish it with LSN 0.
             0
         };
         let env = make_envelope(lsn, payload);
-        if lsn == 0 {
-            self.events.publish(env);
-        } else {
-            self.events.publish_prestamped(env);
-        }
+        self.events.publish_prestamped(env);
     }
 
     /// Publish a `StageCompleted` event durably: WAL-append a
@@ -673,9 +676,10 @@ impl OpsContext {
         else {
             tracing::warn!(
                 "publish_stage_event: envelope missing stage_kind/stage_outcome/stage_payload; \
-                 publishing bus-only (not durable, replay can't recover this event)"
+                 publishing without a durable position; event cannot be replayed"
             );
-            self.events.publish(env);
+            env.lsn = 0;
+            self.events.publish_prestamped(env);
             return;
         };
         let body = brain_protocol::StageCompletedEventBody {

@@ -189,11 +189,11 @@ fn collect_mismatches(
         last_scanned = Some(id);
         let meta: MemoryMetadata = value.value();
 
-        let true_out = list_memory_edges_from(&rtxn, id, None)
-            .map(|v| v.len() as u64)
+        let true_out = list_memory_edges_from(&rtxn, id, None, 1)
+            .map(|p| p.total)
             .map_err(|e| WorkerError::Ops(format!("edge from scan: {e:?}")))?;
-        let true_in = list_memory_edges_to(&rtxn, id, None)
-            .map(|v| v.len() as u64)
+        let true_in = list_memory_edges_to(&rtxn, id, None, 1)
+            .map(|p| p.total)
             .map_err(|e| WorkerError::Ops(format!("edge to scan: {e:?}")))?;
         candidates_checked.push(id);
         if meta.edges_out_count as u64 != true_out || meta.edges_in_count as u64 != true_in {
@@ -234,5 +234,4 @@ fn bump_be_u128(mut bytes: [u8; 16]) -> [u8; 16] {
 }
 
 // Silence unused-import in some build configs.
-#[allow(dead_code)]
 fn _bind_duration(_: Duration) {}

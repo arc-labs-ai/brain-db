@@ -29,6 +29,7 @@
 //!   (`removed=false`), not an error. Successful unlink decrements
 //!   both counts.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -175,40 +176,51 @@ pub struct RealWriterHandle {
     /// present — defaults to a fresh `Arc<WriterMetrics>` on construction;
     /// the server's exposition layer reads the shared snapshot.
     writer_metrics: Arc<crate::metrics::WriterMetrics>,
-    /// Per-shard "last redb-committed LSN" watermark. Advanced by
-    /// [`Self::submit`] to a write's highest WAL LSN **after** that
-    /// write's `wtxn.commit()` succeeds — never at WAL-append time. The
-    /// checkpoint path reads it (via the shared handle) as the
-    /// `CHECKPOINT_END.durable_lsn`, so a snapshot can never promise a
-    /// durable LSN that redb has not committed. Defaults to a fresh
-    /// (zero) handle; the shard shares its own handle in via
+    /// Per-shard contiguous redb-committed LSN watermark. The WAL drain
+    /// reserves each writer range when its LSNs are assigned, and
+    /// [`Self::submit`] commits or abandons that range after the redb
+    /// transaction resolves. The checkpoint path reads the published
+    /// frontier (via the shared handle) as `CHECKPOINT_END.durable_lsn`,
+    /// so a snapshot can promise only a contiguous prefix whose state is
+    /// durable in redb. Defaults to a fresh (zero) handle; the shard shares
+    /// its own handle in via
     /// [`Self::with_redb_committed_watermark`].
     redb_committed_watermark: RedbCommittedWatermark,
 }
 
-/// Per-shard "last redb-committed LSN" watermark.
+/// Per-shard highest contiguous prefix of WAL LSNs whose writer ranges have
+/// resolved successfully in redb, with unresolved ranges tracked between
+/// assignment and their commit or abandonment. Checkpoint and subscribe
+/// event records are never reserved because they do not mutate redb; a
+/// failed write abandons its reserved range so a later real commit can close
+/// the prefix across it, matching recovery's treatment of the failed write.
+/// Every WAL record at or below [`Self::load`] either reached a successful
+/// redb commit, was never reserved because it is a checkpoint or subscribe
+/// event record, or belongs to a failed write abandoned beneath a later real
+/// commit.
 ///
-/// The writer advances this to a write's highest WAL LSN **after** the
-/// redb `wtxn.commit()` for that write succeeds. It therefore tracks the
-/// LSN up to which every WAL-durable record's redb effect is *also*
-/// durable — strictly at or behind the WAL-appended tail
-/// (`Wal::next_lsn() - 1`), which advances at enqueue time, before the
-/// group-commit fsync and before the later redb commit.
-///
-/// The snapshot / checkpoint path reads this as the checkpoint's
-/// `durable_lsn`: the checkpoint contract promises the LSN is durable in
-/// the arena *and* metadata (= redb), so stamping the WAL tail there
-/// would let recovery skip a record that is WAL-durable but whose redb
-/// commit had not yet run at power loss — silently dropping it.
-///
-/// Lock-free (`Arc<AtomicU64>`): the writer (advance) and the snapshot
-/// source (read) both live on the same shard executor, so there is no
-/// cross-thread contention; the atomic keeps `RealWriterHandle`
-/// `Send + Sync` for the existing trait-object plumbing. Monotonic —
-/// [`Self::advance_to`] uses `fetch_max`, so an out-of-order commit can
-/// never regress it.
+/// The frontier is atomic because snapshot code reads it between awaits while
+/// the writer and WAL drain update the range state. The mutex protects the
+/// reservation queue and the atomic publishes the resulting frontier without
+/// making snapshot reads wait for in-flight writes.
 #[derive(Clone, Debug)]
-pub struct RedbCommittedWatermark(Arc<AtomicU64>);
+pub struct RedbCommittedWatermark(Arc<WatermarkInner>);
+
+#[derive(Debug)]
+struct WatermarkInner {
+    /// Published highest contiguous committed prefix.
+    frontier: AtomicU64,
+    pending: Mutex<PendingLsns>,
+}
+
+#[derive(Debug)]
+struct PendingLsns {
+    /// Reserved-but-unresolved inclusive LSN ranges, in ascending LSN
+    /// order (reservations always arrive in assignment order).
+    outstanding: VecDeque<(u64, u64)>,
+    /// Highest `last` over ranges that reached a successful redb commit.
+    highest_committed: u64,
+}
 
 impl Default for RedbCommittedWatermark {
     fn default() -> Self {
@@ -217,25 +229,250 @@ impl Default for RedbCommittedWatermark {
 }
 
 impl RedbCommittedWatermark {
+    /// Seed a watermark whose contiguous committed prefix ends at `lsn`.
+    #[must_use]
+    pub fn sealed_through(lsn: u64) -> Self {
+        Self(Arc::new(WatermarkInner {
+            frontier: AtomicU64::new(lsn),
+            pending: Mutex::new(PendingLsns {
+                outstanding: VecDeque::new(),
+                highest_committed: lsn,
+            }),
+        }))
+    }
+
     /// Fresh watermark at LSN 0 (nothing committed yet).
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(0)))
+        Self::sealed_through(0)
     }
 
-    /// Advance the watermark to `lsn` if it is higher (monotonic).
-    /// Called after a successful `wtxn.commit()`. `Release` so the
-    /// snapshot source's `Acquire` load observes a fully-committed
-    /// value.
-    pub fn advance_to(&self, lsn: u64) {
-        self.0.fetch_max(lsn, Ordering::Release);
+    /// Reserve an inclusive writer LSN range assigned by the WAL drain.
+    ///
+    /// The queue stays in ascending LSN order because the WAL drain is
+    /// sequential, and `publish_frontier` relies on that ordering to read the
+    /// minimum outstanding LSN from the front.
+    pub fn reserve(&self, first: u64, last: u64) {
+        debug_assert!(first <= last);
+        let mut pending = self.0.pending.lock();
+        if let Some(&(_, previous_last)) = pending.outstanding.back() {
+            debug_assert!(
+                previous_last < first,
+                "reservations must arrive in LSN-assignment order"
+            );
+        } else {
+            debug_assert!(first > self.0.frontier.load(Ordering::Acquire));
+        }
+        pending.outstanding.push_back((first, last));
     }
 
-    /// Current committed watermark. `Acquire` pairs with
-    /// [`Self::advance_to`]'s `Release`.
+    /// Resolve an inclusive writer LSN range after a successful redb commit.
+    pub fn commit(&self, first: u64, last: u64) {
+        let mut pending = self.0.pending.lock();
+        if let Some(index) = pending
+            .outstanding
+            .iter()
+            .position(|&range| range == (first, last))
+        {
+            pending.outstanding.remove(index);
+        }
+        pending.highest_committed = pending.highest_committed.max(last);
+        Self::publish_frontier(&self.0, &pending);
+    }
+
+    /// Resolve an inclusive writer LSN range whose redb transaction failed.
+    pub fn abandon(&self, first: u64, last: u64) {
+        let mut pending = self.0.pending.lock();
+        if let Some(index) = pending
+            .outstanding
+            .iter()
+            .position(|&range| range == (first, last))
+        {
+            pending.outstanding.remove(index);
+        }
+        Self::publish_frontier(&self.0, &pending);
+    }
+
+    fn publish_frontier(inner: &WatermarkInner, pending: &PendingLsns) {
+        let frontier = match pending.outstanding.front() {
+            None => pending.highest_committed,
+            Some(&(first, _)) => pending.highest_committed.min(first.saturating_sub(1)),
+        };
+        inner.frontier.store(frontier, Ordering::Release);
+    }
+
+    /// Current highest contiguous committed prefix.
     #[must_use]
     pub fn load(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.0.frontier.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedbCommittedWatermark;
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+
+    #[test]
+    fn out_of_order_commit_does_not_cross_an_outstanding_range() {
+        let watermark = RedbCommittedWatermark::new();
+        watermark.reserve(5, 6);
+        watermark.reserve(7, 7);
+
+        watermark.commit(7, 7);
+        assert_eq!(watermark.load(), 4);
+
+        watermark.commit(5, 6);
+        assert_eq!(watermark.load(), 7);
+    }
+
+    #[test]
+    fn abandoned_range_does_not_stall_a_later_commit() {
+        let watermark = RedbCommittedWatermark::new();
+        watermark.reserve(5, 6);
+        watermark.reserve(7, 7);
+
+        watermark.abandon(5, 6);
+        assert_eq!(watermark.load(), 0);
+
+        watermark.commit(7, 7);
+        assert_eq!(watermark.load(), 7);
+    }
+
+    #[test]
+    fn never_reserved_lsns_are_transparent() {
+        let watermark = RedbCommittedWatermark::new();
+        watermark.reserve(5, 5);
+        watermark.commit(5, 5);
+        assert_eq!(watermark.load(), 5);
+
+        watermark.reserve(8, 8);
+        watermark.commit(8, 8);
+        assert_eq!(watermark.load(), 8);
+    }
+
+    /// A restart resumes from the frontier recovery sealed, and that seed
+    /// must hold until the writes layered on top of it commit. Recovery
+    /// skips every WAL record at or below the published frontier, so a
+    /// seed dragged forward by a later out-of-order commit would drop the
+    /// writes still in flight beneath it.
+    #[test]
+    fn recovery_seed_is_the_frontier() {
+        let watermark = RedbCommittedWatermark::sealed_through(100);
+        assert_eq!(watermark.load(), 100);
+
+        watermark.reserve(101, 102);
+        watermark.reserve(103, 103);
+
+        watermark.commit(103, 103);
+        assert_eq!(watermark.load(), 100);
+
+        watermark.commit(101, 102);
+        assert_eq!(watermark.load(), 103);
+    }
+
+    #[test]
+    fn frontier_never_regresses_across_scrambled_resolutions() {
+        let watermark = RedbCommittedWatermark::new();
+        watermark.reserve(5, 5);
+        watermark.reserve(6, 7);
+        watermark.reserve(8, 10);
+        watermark.reserve(11, 11);
+
+        let mut previous = watermark.load();
+        for (first, last) in [(8, 10), (11, 11), (6, 7), (5, 5)] {
+            watermark.commit(first, last);
+            let current = watermark.load();
+            assert!(current >= previous);
+            previous = current;
+        }
+        assert_eq!(watermark.load(), 11);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            ..ProptestConfig::default()
+        })]
+
+        /// The frontier is a durability claim: every record at or below it
+        /// has committed. Recovery trusts that claim and skips those
+        /// records, so a frontier reaching over a write still in flight —
+        /// or over one that never committed at all — loses acknowledged
+        /// data on restart.
+        ///
+        /// Production supplies every shape this walks: redb transactions
+        /// resolve in arbitrary order, reservations are sparse because
+        /// checkpoint records and subscribe-replay events consume LSNs
+        /// that never reserve, and a failed write abandons its range
+        /// instead of committing it. The claim is checked after every
+        /// resolution, not only at the end, because the violation is
+        /// transient — the frontier can be wrong mid-sequence and right
+        /// again once the queue drains.
+        #[test]
+        fn frontier_never_claims_an_uncommitted_record(
+            seed in 0u64..64,
+            spec in pvec((0u64..4, 0u64..3, 0u64..64, any::<bool>()), 1..12),
+        ) {
+            let watermark = RedbCommittedWatermark::sealed_through(seed);
+
+            // Ascending, gapped reservations. `gap` stands for the LSNs
+            // consumed by records that never reserve at all.
+            let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(spec.len());
+            let mut next = seed + 1;
+            for &(span, gap, _, _) in &spec {
+                let first = next + gap;
+                let last = first + span;
+                watermark.reserve(first, last);
+                ranges.push((first, last));
+                next = last + 1;
+            }
+
+            // Resolution order: scrambled by the generated sort keys.
+            let mut order: Vec<usize> = (0..ranges.len()).collect();
+            order.sort_by_key(|&i| (spec[i].2, i));
+
+            let mut outstanding = ranges.clone();
+            let mut highest_committed = seed;
+            let mut previous = watermark.load();
+
+            for &i in &order {
+                let (first, last) = ranges[i];
+                if spec[i].3 {
+                    watermark.commit(first, last);
+                    highest_committed = highest_committed.max(last);
+                } else {
+                    watermark.abandon(first, last);
+                }
+                outstanding.retain(|&range| range != (first, last));
+
+                let frontier = watermark.load();
+                prop_assert!(
+                    frontier >= previous,
+                    "frontier regressed from {previous} to {frontier}: a published \
+                     durability claim can never be withdrawn"
+                );
+                previous = frontier;
+                prop_assert!(
+                    frontier <= highest_committed,
+                    "frontier {frontier} claims durability past the highest commit \
+                     {highest_committed}"
+                );
+                for &(out_first, out_last) in &outstanding {
+                    prop_assert!(
+                        frontier < out_first,
+                        "frontier {frontier} covers outstanding range \
+                         {out_first}..={out_last}, which recovery would then skip"
+                    );
+                }
+            }
+
+            // The other half: nothing may pin the frontier once every
+            // range has resolved — neither the never-reserved gaps nor
+            // the abandoned ranges.
+            prop_assert_eq!(watermark.load(), highest_committed);
+        }
     }
 }
 

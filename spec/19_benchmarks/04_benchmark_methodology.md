@@ -21,7 +21,7 @@ A standardized synthetic dataset:
 
 - 1M memories per shard.
 - Each memory: 1 KB of text.
-- Vector embeddings: derived from the text via the production embedder.
+- Vector embeddings: 384-dim, derived from the text via the production embedder (BGE-small-en-v1.5), not synthesised. A harness that planted random vectors would measure the index and skip the single most expensive stage of a text write.
 - A registered LLM provider credential on the benchmark namespace. ENCODE is refused without one, so the harness issues an `LLM_CREDENTIAL_PUT` during setup; mock-provider runs register a key pointed at the mock endpoint.
 - Edges: 5 per memory on average (Pareto distribution: most have few, some have many).
 
@@ -186,12 +186,15 @@ Clear and complete.
 
 ## 17. The CI integration
 
-Benchmarks run nightly in CI:
-- Standard environment (cloud VM).
-- Standard dataset.
-- Standard configuration.
+A nightly perf workflow runs on a daily schedule (03:00 UTC, off-peak so it hits the previous green build's cache) and on manual dispatch, on a standard cloud runner with a standard dataset and configuration. Only one run is in flight at a time.
 
-Results are stored in a benchmark database. Trends are tracked.
+It runs the two **asserting** benches: `relation_traverse`, which checks the §19.02 §2.4 traversal p50s in-process (depth 1 ≤ 5 ms, depth 2 ≤ 15 ms, depth 3 ≤ 30 ms), and `lexical_retrieve`, the per-query regression detector for the lexical path at a 10K corpus. A target miss is a panic out of the bench, which fails the step and surfaces through the normal notification path — so a regression is an alarm, not a line in a report.
+
+The pair runs on a schedule rather than per-PR because each takes minutes, and `just prod-bench` runs the same two locally.
+
+Two limits on what this catches:
+- **It is a cloud runner, not the reference hardware of §1.** It detects *relative* regression against its own history; it does not certify an absolute target.
+- **It covers two paths of the many in §19.02.** Latency and throughput figures elsewhere in that section are hand-measured, so a regression in them is not caught automatically. The two chosen are the portable ones: index and traversal work is CPU-and-redb bound, where a shared runner gives a stable enough baseline to compare against.
 
 Significant regressions block release.
 

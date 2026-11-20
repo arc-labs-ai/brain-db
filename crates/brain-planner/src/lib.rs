@@ -38,15 +38,15 @@ pub use config::PlannerConfig;
 pub use context::PlannerContext;
 pub use error::PlanError;
 pub use executor::{
-    execute_path, execute_path_stream, execute_reason, execute_reason_stream, execute_recall,
-    BackfillControl, DerivedInference, EdgeOutcome, EncodeOp, EncodeOpEdge, EncodeResult,
-    EvidenceItem, ExecError, ExecutorContext, ForgetOp, ForgetOutcome, ForgetResult, InferenceKind,
-    InferenceStep, InferenceStream, InferenceStreamTerminal, LinkOp, Path, PathFrame, PathResult,
-    PathStream, PathStreamTerminal, PendingMemorySnapshot, PlanExecutionMetadata, PlanStatus,
+    execute_path, execute_path_stream, execute_reason, execute_reason_stream, BackfillControl,
+    DerivedInference, EdgeOutcome, EncodeOp, EncodeOpEdge, EncodeResult, EvidenceItem, ExecError,
+    ExecutorContext, ForgetOp, ForgetOutcome, ForgetResult, InferenceKind, InferenceStep,
+    InferenceStream, InferenceStreamTerminal, LinkOp, Path, PathFrame, PathResult, PathStream,
+    PathStreamTerminal, PendingMemorySnapshot, PlanExecutionMetadata, PlanStatus,
     PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode, ReasonResult, ReasonStatus,
     ReasonTrace, ReasonTraceBase, ReasonTraceCandidate, ReasonTraceCentroid,
     ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown, ReasonTraceTrim, ReasonTraceWalk,
-    RecallHit, RecallResult, SharedMetadataDb, TxnSnapshot, UnlinkOp, WriterError, WriterHandle,
+    SharedMetadataDb, TxnSnapshot, UnlinkOp, WriterError, WriterHandle,
 };
 pub use explain::explain;
 pub use plan::{
@@ -59,13 +59,12 @@ pub use plan::{
     SortKey, TextFetchStep, TraversalStep, WalAppendStep,
 };
 pub use planner::encode::{
-    plan_encode, plan_encode_inner, validate_text, validate_vector_direct, DEFAULT_ENCODE_KIND,
+    plan_encode_inner, validate_text, validate_vector_direct, DEFAULT_ENCODE_KIND,
     DEFAULT_ENCODE_SALIENCE, MAX_TEXT_BYTES,
 };
-pub use planner::forget::{plan_forget, plan_forget_inner};
-pub use planner::path::{plan_path, plan_path_inner};
-pub use planner::reason::{plan_reason, plan_reason_inner};
-pub use planner::recall::{plan_recall, plan_recall_inner};
+pub use planner::forget::plan_forget_inner;
+pub use planner::path::plan_path_inner;
+pub use planner::reason::plan_reason_inner;
 pub use stats::ShardStats;
 
 /// Compile-time guard: every plan type must be `Send + Sync` so the

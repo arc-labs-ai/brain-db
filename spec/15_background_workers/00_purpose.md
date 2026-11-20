@@ -165,7 +165,7 @@ These appear in Brain's metrics endpoint.
 
 Where possible, workers coalesce work:
 
-- The decay worker processes thousands of memories in a single transaction.
+- The access-boost worker applies thousands of boosts in a single transaction.
 - The idempotency sweep processes thousands of expired entries in one batch.
 
 Per-record overhead is amortized; the worker is more efficient.
@@ -184,7 +184,7 @@ After a Brain restart:
 - They immediately begin their first cycle (or after a brief delay for stagger).
 - Any in-progress state from before the crash is lost; the worker re-discovers what to do.
 
-This is OK because workers are idempotent: running the decay worker a second time on the same memory just produces the same result.
+This is OK because workers are idempotent: running the edge scrub a second time over the same edges just produces the same result.
 
 ## 11. The "no work to do" case
 
@@ -234,7 +234,7 @@ shared I/O budget no single worker can monopolize.
 | Worker | Trigger | Backpressure |
 |---|---|---|
 | **Extractor worker** (pattern → classifier → LLM, with resolution inline) | on ENCODE | bounded queue (1024), drops on overflow with a metric |
-| **HyPE** | on ENCODE | shares the extractor worker's cycle and LLM budget |
+| **HyPE** | on ENCODE | shares the extractor worker's cycle and its namespace's LLM credential |
 | **Auto-edge** | on ENCODE | bounded queue (1024), drops with a metric |
 | **Temporal-edge** | on ENCODE | bounded queue (1024), drops with a metric |
 | **Causal-edge** | on extractor commit | bounded queue (1024), drops with a metric |
@@ -329,15 +329,15 @@ async fn run_llm_extractor(memory: &Memory, ext: &LLMExtractor) -> Vec<Extracted
         return parse_extraction(&cached, ext);
     }
     
-    // Cost budget check
-    let projected = ext.cost_estimator.estimate(&memory.text);
-    if !budget.allows(projected) {
-        metrics.skipped_over_budget.inc();
-        return vec![];
-    }
+    // Projected spend — observed, never a gate. BYOK: the tenant's own
+    // key is tracked, not rationed.
+    tracing::debug!(estimate_micro_usd = pricing.estimate_request_micro_usd(&req));
     
-    // LLM call
+    // LLM call. The response is priced from the provider's reported token
+    // usage before anything checks whether it carried usable content, so a
+    // billed-but-empty reply still records its cost.
     let response = ext.model.call(&compose_prompt(ext, memory)).await?;
+    spend.record(response.cost_micro_usd);
     
     // Schema validation
     let parsed = match validate(&response, &ext.schema) {
@@ -357,9 +357,11 @@ async fn run_llm_extractor(memory: &Memory, ext: &LLMExtractor) -> Vec<Extracted
 
 Runs in background queue. Latency: 100ms to 10s per memory. Throughput is constrained by external LLM API or local model.
 
-Cost budgeting: each call's estimated cost (from token count heuristics) is checked against the per-extractor budget and the global daily budget.
+Cost accounting: Brain is BYOK, so spend is tracked and never rationed. There is no per-extractor cap and no global daily cap — nothing can refuse a call on cost. Each call's actual cost is priced from the provider's reported token usage at per-model nano-USD-per-token rates and recorded durably: on the memory's audit row for the extraction tiers, in the `llm_spend` ledger keyed `(namespace, stage)` for HyPE generation, the HyPE refresh sweep and entity disambiguation. A projected figure is logged before each call as an observation only. See [`../11_extractors/01_extractor_tiers.md`](../11_extractors/01_extractor_tiers.md) §22.
 
-Schema validation is strict: malformed outputs are retried once, then dropped.
+Schema validation is strict: malformed outputs are retried once, then dropped. A reply the provider stopped at `max_tokens` is not retried — the prompt is unchanged, so the second call would stop at the same ceiling — and fails once naming the ceiling.
+
+Failures are retried under a bounded, widening budget rather than at the cycle rate, and a memory that exhausts it is abandoned with a durable terminal audit row. See [`./06_typed_graph_workers.md`](./06_typed_graph_workers.md) §"Bounded extraction retries".
 
 ### 15.6. Worker queue semantics
 
@@ -379,7 +381,7 @@ enum OverflowPolicy {
 }
 ```
 
-For LLM extractors specifically, the default is `Drop` with a prominent metric: if the queue is overflowing, the operator sees it and tunes (lower extraction density, raise LLM budget, scale down extraction rate).
+For LLM extractors specifically, the default is `Drop` with a prominent metric: if the queue is overflowing, the operator sees it and tunes (lower extraction density via `trigger` conditions, raise the extractor's `channel_capacity`, scale out to more shards).
 
 ### 15.7. Idempotency reminders
 
@@ -416,9 +418,11 @@ Per-worker metrics:
 - `worker_errors_total{worker}` — error count.
 
 Per-extractor metrics (in addition):
-- `extractor_extractions_total{extractor, status}` — by status (success, failure, skipped_budget).
-- `extractor_cost_usd_total{extractor}` — LLM cost tracking.
-- `extractor_cache_hit_rate{extractor}` — LLM cache hits.
+- `brain_extractor_tier_runs_total{shard, tier, status}` — per-tier outcome, `status` ∈ `{ran, skipped, failed}`.
+- `brain_extractor_llm_micro_usd_spent_total{shard}` — LLM spend in dollar micro-units. A counter, not a budget.
+- `brain_extractor_apply_dropped_total{shard, reason}` — items the apply pass could not persist, and memories the retry ladders abandoned.
+
+The full family, with label values, is in [`./06_typed_graph_workers.md`](./06_typed_graph_workers.md) §"Extractor observability".
 
 ### 15.10. Graceful shutdown
 

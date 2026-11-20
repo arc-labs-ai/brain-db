@@ -6,13 +6,15 @@
 
 use brain_core::{EvidenceRef, Statement, StatementId, TombstoneReason};
 use brain_metadata::schema::predicate::predicate_intern_or_get;
-use brain_metadata::statement::{statement_create, statement_supersede, statement_tombstone};
+use brain_metadata::statement::{
+    statement_create, statement_supersede, statement_tombstone, StatementOpError,
+};
 use brain_metadata::tables::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
 use brain_metadata::DeclScope;
 use redb::{ReadableTable, WriteTransaction};
 use smallvec::SmallVec;
 
-use super::ApplyError;
+use super::{ApplyError, RedbFault};
 use crate::write::{
     EvidenceRefPhase, Phase, PhaseAck, SupersedeReplacement, SupersedeTarget, TombstoneTarget,
     Write,
@@ -57,8 +59,8 @@ pub fn apply_upsert_statement(
 
     let s = statement_from_upsert_phase(phase, resolved_predicate)
         .ok_or(ApplyError::PhaseMisShape("expected UpsertStatement"))?;
-    statement_create(wtxn, scope, *session, &s, *extracted_at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("statement_create: {e}")))?;
+    let stored_id = statement_create(wtxn, scope, *session, &s, *extracted_at_unix_nanos)
+        .map_err(|e| statement_op_err("statement_create", e))?;
 
     // Write-path trace: the structured fact this ENCODE produced. The
     // predicate name comes from the intern hint (schemaless path) so the
@@ -82,14 +84,18 @@ pub fn apply_upsert_statement(
     // would need to adopt or evict. Folded into the same wtxn — the
     // pre-refactor code paid an extra commit for this single byte.
     //
-    // `*id` is the same id `statement_create` writes (and the same one
-    // the ack carries) — both the fresh path and the auto-supersede
-    // shortcut reuse the phase's pre-minted id.
+    // Stamp the row `statement_create` actually settled on, not the
+    // phase's minted id: the function has three exits — a fresh insert
+    // at the minted id, an auto-supersede that mints its own successor,
+    // and a content-dedup no-op that keeps a pre-existing identical row
+    // and returns ITS id. Only the returned id is guaranteed to name a
+    // row in this wtxn. Re-stamping an already-flagged dedup target is
+    // a no-op: `set_flag` reports no change and the write is skipped.
     if predicate_intern_hint.is_some() {
-        stamp_implicit_predicate_flag(wtxn, *id)?;
+        stamp_implicit_predicate_flag(wtxn, stored_id)?;
     }
 
-    Ok(PhaseAck::UpsertedStatement(*id, 1))
+    Ok(PhaseAck::UpsertedStatement(stored_id, 1))
 }
 
 /// OR the `IMPLICIT_PREDICATE` bit into the just-written statement
@@ -102,10 +108,10 @@ fn stamp_implicit_predicate_flag(
     let existing: Option<StatementMetadata> = {
         let t = wtxn
             .open_table(STATEMENTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open statements: {e}")))?;
+            .map_err(|e| ApplyError::storage("open statements", &e))?;
         let g = t
             .get(&key)
-            .map_err(|e| ApplyError::Storage(format!("statement lookup: {e}")))?;
+            .map_err(|e| ApplyError::storage("statement lookup", &e))?;
         g.map(|guard| guard.value())
     };
     let Some(mut row) = existing else {
@@ -117,9 +123,9 @@ fn stamp_implicit_predicate_flag(
     if row.set_flag(statement_flags::IMPLICIT_PREDICATE) {
         let mut t = wtxn
             .open_table(STATEMENTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open statements (write): {e}")))?;
+            .map_err(|e| ApplyError::storage("open statements (write)", &e))?;
         t.insert(&key, &row)
-            .map_err(|e| ApplyError::Storage(format!("statement update: {e}")))?;
+            .map_err(|e| ApplyError::storage("statement update", &e))?;
     }
     Ok(())
 }
@@ -139,10 +145,10 @@ fn statement_scope_guard(
     let row: Option<StatementMetadata> = {
         let t = wtxn
             .open_table(STATEMENTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open statements: {e}")))?;
+            .map_err(|e| ApplyError::storage("open statements", &e))?;
         let got = t
             .get(&id.to_bytes())
-            .map_err(|e| ApplyError::Storage(format!("statement lookup: {e}")))?;
+            .map_err(|e| ApplyError::storage("statement lookup", &e))?;
         got.map(|g| g.value())
     };
     let caller = brain_metadata::RowScope::new(write.namespace, write.space_id);
@@ -192,7 +198,7 @@ pub fn apply_supersede_statement(
         new_statement.as_ref(),
         *at_unix_nanos,
     )
-    .map_err(|e| ApplyError::Metadata(format!("statement_supersede: {e}")))?;
+    .map_err(|e| statement_op_err("statement_supersede", e))?;
     Ok(PhaseAck::Superseded(*target, replacement.id()))
 }
 
@@ -218,11 +224,57 @@ pub fn apply_tombstone_statement(
     statement_scope_guard(wtxn, *id, write)?;
     let reason = TombstoneReason::from_u8(*reason).unwrap_or(TombstoneReason::UserRequest);
     statement_tombstone(wtxn, *id, reason, *at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("statement_tombstone: {e}")))?;
+        .map_err(|e| statement_op_err("statement_tombstone", e))?;
     Ok(PhaseAck::Tombstoned {
         target: *target,
         tombstoned_at_unix_nanos: *at_unix_nanos,
     })
+}
+
+/// Classify a [`StatementOpError`] for the wire. A missing predicate /
+/// subject / statement is the caller pointing at something that is not
+/// there, and a tombstoned, superseded or already-existing target is the
+/// caller racing committed state — neither can succeed on a retry of the
+/// same request. Redb failures retain their retry classification. Everything
+/// else is the engine's own fault. A declared subject or object type the write
+/// violated, a malformed argument, and a supersede whose kind, subject or
+/// predicate does not match its target are the caller's input to fix.
+fn statement_op_err(ctx: &'static str, e: StatementOpError) -> ApplyError {
+    use brain_metadata::statement::StatementOpError as E;
+    let detail = format!("{ctx}: {e}");
+    match e {
+        E::NotFound(_) => ApplyError::NotFound {
+            what: "statement",
+            detail,
+        },
+        E::UnknownPredicate(_) => ApplyError::NotFound {
+            what: "predicate",
+            detail,
+        },
+        E::UnknownSubject(_) => ApplyError::NotFound {
+            what: "subject entity",
+            detail,
+        },
+        E::UnknownObjectEntity(_) => ApplyError::NotFound {
+            what: "entity",
+            detail,
+        },
+        E::AlreadyExists(_)
+        | E::AlreadySuperseded(..)
+        | E::AlreadyTombstoned(_)
+        | E::EventCannotSupersede => ApplyError::Conflict(detail),
+        E::Storage(ref se) => ApplyError::Storage {
+            fault: se.storage_fault(),
+            detail,
+        },
+        E::ObjectEntityTypeMismatch { .. }
+        | E::SubjectEntityTypeMismatch { .. }
+        | E::InvalidArgument(_)
+        | E::KindMismatch { .. }
+        | E::SubjectMismatch
+        | E::PredicateMismatch => ApplyError::InvalidRequest(detail),
+        _ => ApplyError::Metadata(detail),
+    }
 }
 
 /// Build the [`Statement`] a [`Phase::UpsertStatement`] describes, given
@@ -282,6 +334,96 @@ fn build_evidence_ref(phase_ref: &EvidenceRefPhase) -> EvidenceRef {
             EvidenceRef::inline(sv)
         }
         EvidenceRefPhase::Overflow(id) => EvidenceRef::Overflow(*id),
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::{statement_op_err, ApplyError};
+    use crate::apply::StorageFault;
+    use brain_core::{EntityId, EntityTypeId, StatementId, StatementKind};
+    use brain_metadata::statement::StatementOpError;
+
+    #[test]
+    fn statement_faults_the_caller_caused_are_classified_for_the_wire() {
+        assert!(matches!(
+            statement_op_err("create", StatementOpError::UnknownPredicate(7)),
+            ApplyError::NotFound {
+                what: "predicate",
+                ..
+            }
+        ));
+        assert!(matches!(
+            statement_op_err("create", StatementOpError::UnknownSubject(EntityId::new())),
+            ApplyError::NotFound {
+                what: "subject entity",
+                ..
+            }
+        ));
+        assert!(matches!(
+            statement_op_err(
+                "tombstone",
+                StatementOpError::AlreadyTombstoned(StatementId::new())
+            ),
+            ApplyError::Conflict(_)
+        ));
+        assert!(matches!(
+            statement_op_err(
+                "supersede",
+                StatementOpError::AlreadySuperseded(StatementId::new(), StatementId::new())
+            ),
+            ApplyError::Conflict(_)
+        ));
+        assert!(matches!(
+            statement_op_err("supersede", StatementOpError::EventCannotSupersede),
+            ApplyError::Conflict(_)
+        ));
+        assert!(matches!(
+            statement_op_err(
+                "create",
+                StatementOpError::Storage(redb::StorageError::DatabaseClosed)
+            ),
+            ApplyError::Storage {
+                fault: StorageFault::Transient,
+                ..
+            }
+        ));
+    }
+
+    /// Every statement refusal the caller can fix must leave the apply layer
+    /// as an invalid request. Flattened into `Metadata` it becomes an engine
+    /// fault on the wire, in a category clients retry — against a write that
+    /// is refused identically every time.
+    #[test]
+    fn caller_fixable_statement_faults_are_invalid_requests() {
+        let entity = EntityId::from_bytes([0; 16]);
+        let cases = [
+            StatementOpError::ObjectEntityTypeMismatch {
+                entity,
+                expected: EntityTypeId::from(1),
+                actual: EntityTypeId::from(2),
+            },
+            StatementOpError::SubjectEntityTypeMismatch {
+                entity,
+                expected: EntityTypeId::from(1),
+                actual: EntityTypeId::from(2),
+            },
+            StatementOpError::InvalidArgument("confidence out of range"),
+            StatementOpError::KindMismatch {
+                old: StatementKind::Fact,
+                new: StatementKind::Event,
+            },
+            StatementOpError::SubjectMismatch,
+            StatementOpError::PredicateMismatch,
+        ];
+        for case in cases {
+            let rendered = case.to_string();
+            let mapped = statement_op_err("statement_supersede", case);
+            assert!(
+                matches!(mapped, ApplyError::InvalidRequest(_)),
+                "{rendered} must classify as an invalid request, got {mapped:?}"
+            );
+        }
     }
 }
 
@@ -513,5 +655,140 @@ mod tenant_wall_tests {
         let rtxn = db.read_txn().unwrap();
         let got = statement_get(&rtxn, id).unwrap().unwrap();
         assert!(got.tombstoned, "same-tenant tombstone must apply");
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod content_dedup_tests {
+    //! Re-asserting a byte-identical triple against a cumulative,
+    //! non-stateful predicate is idempotent: `statement_create` keeps
+    //! the row it already has and writes nothing. The ack has to carry
+    //! that pre-existing row's id — acking the phase's own minted id
+    //! names a row no transaction ever wrote, and the handler's
+    //! post-commit read-back then fails the request.
+    use super::*;
+    use brain_core::{
+        Entity, EntityId, EntityType, ExtractorId, PredicateId, SessionId, StatementId,
+        StatementKind, StatementObject, StatementValue, SubjectRef,
+    };
+    use brain_metadata::entity::ops::{entity_put, normalize_name};
+    use brain_metadata::schema::predicate::predicate_intern;
+    use brain_metadata::statement::statement_get;
+    use brain_metadata::{MetadataDb, RowScope};
+    use tempfile::TempDir;
+
+    use crate::write::{EvidenceRefPhase, Phase, PhaseAck, Write, WriteId};
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    fn scope() -> RowScope {
+        RowScope::from_bytes(1, [0xC3; 16])
+    }
+
+    /// A fresh phase for the same `(subject, knows, "lovelace")` triple.
+    /// Each call mints its own phase id, exactly as a repeated client
+    /// request does.
+    fn upsert_phase(subject: EntityId, predicate: PredicateId) -> Phase {
+        Phase::UpsertStatement {
+            id: StatementId::new(),
+            kind: StatementKind::Fact,
+            session: SessionId::DEFAULT,
+            subject: SubjectRef::Entity(subject),
+            predicate,
+            object: StatementObject::Value(StatementValue::Text("lovelace".into())),
+            confidence: 0.9,
+            evidence: EvidenceRefPhase::Inline(Vec::new()),
+            valid_from_unix_nanos: None,
+            extractor: ExtractorId::from(0),
+            extracted_at_unix_nanos: NOW,
+            schema_version: 1,
+            predicate_intern_hint: None,
+        }
+    }
+
+    fn minted_id(phase: &Phase) -> StatementId {
+        match phase {
+            Phase::UpsertStatement { id, .. } => *id,
+            _ => unreachable!("built as UpsertStatement"),
+        }
+    }
+
+    #[test]
+    fn repeating_an_identical_fact_acks_the_row_that_already_exists() {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        let scope = scope();
+
+        let subject = EntityId::new();
+        {
+            let wtxn = db.write_txn().unwrap();
+            let e = Entity::new_active(
+                subject,
+                EntityType::PERSON_ID,
+                "ada".into(),
+                normalize_name("ada"),
+                NOW,
+            );
+            entity_put(&wtxn, scope, SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // `is_stateful: false` Fact — a cumulative kind, so nothing
+        // auto-supersedes the repeat and content dedup is the only
+        // thing that collapses it.
+        let predicate = {
+            let wtxn = db.write_txn().unwrap();
+            let id = predicate_intern(
+                &wtxn,
+                DeclScope::base("test"),
+                "knows",
+                Some(StatementKind::Fact),
+                2,
+                1,
+                "",
+                false,
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+
+        let apply = |phase: &Phase| -> StatementId {
+            let write = Write::single(WriteId::new(), scope.space(), phase.clone())
+                .with_namespace(scope.namespace());
+            let wtxn = db.write_txn().unwrap();
+            let ack = apply_upsert_statement(&wtxn, phase, &write).expect("apply must succeed");
+            wtxn.commit().unwrap();
+            match ack {
+                PhaseAck::UpsertedStatement(id, _) => id,
+                other => panic!("expected an UpsertedStatement ack, got {other:?}"),
+            }
+        };
+
+        let first_phase = upsert_phase(subject, predicate);
+        let second_phase = upsert_phase(subject, predicate);
+        assert_ne!(
+            minted_id(&first_phase),
+            minted_id(&second_phase),
+            "the two attempts must mint distinct phase ids"
+        );
+
+        let first = apply(&first_phase);
+        let second = apply(&second_phase);
+
+        assert_eq!(
+            first, second,
+            "the repeat must ack the existing row's id, not its own minted id"
+        );
+        assert_ne!(
+            second,
+            minted_id(&second_phase),
+            "the dedup no-op wrote no row at the second phase's minted id"
+        );
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            statement_get(&rtxn, second).unwrap().is_some(),
+            "the acked id must resolve to a stored statement"
+        );
     }
 }

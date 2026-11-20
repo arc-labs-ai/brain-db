@@ -23,7 +23,9 @@ pub mod hype;
 pub mod lifeline;
 pub mod llm_cache;
 pub mod llm_credential;
+pub mod llm_spend;
 pub mod namespace;
+pub mod page_cache;
 pub mod recovery;
 pub mod registry;
 pub mod relation;
@@ -71,8 +73,9 @@ pub use entity::types::{
     render_declared_entity_types_block, EntityTypeOpError, EntityTypeQnames, ScopedEntityType,
 };
 pub use extraction::queue::{
-    extraction_queue_drain, extraction_queue_enqueue, extraction_queue_len,
-    extraction_queue_remove, ExtractionQueueError,
+    extraction_queue_backlog, extraction_queue_drain, extraction_queue_enqueue,
+    extraction_queue_len, extraction_queue_remove, ExtractionBacklog, ExtractionQueueError,
+    EXTRACTION_BACKLOG_SCAN_CAP,
 };
 pub use extractor::ops::{
     extractor_get, extractor_intern, extractor_list, extractor_lookup_by_qname, ExtractorOpError,
@@ -86,6 +89,9 @@ pub use lifeline::{Lifeline, LifelineGuard, LifelineOwner};
 pub use llm_cache::{
     sweep_expired as llm_cache_sweep_expired, LlmCacheDb, LlmCacheError, LlmResponse,
 };
+pub use llm_spend::ops::{
+    llm_spend_add, llm_spend_get, llm_spend_iter, namespace_total_micro_usd, LlmSpendError,
+};
 pub use registry::{
     session_create, session_delete_registry, session_get, session_list, space_create,
     space_delete_registry, space_get, space_list, touch_on_write, RegistryError, SessionListEntry,
@@ -96,6 +102,7 @@ pub use relation::ops::{
     relation_list_to, relation_list_to_page, relation_supersede, relation_tombstone,
     relations_with_evidence, RelationListFilter, RelationOpError, RelationPage,
 };
+pub use relation::qnames::RelationTypeQnames;
 pub use relation::traversal::{
     traverse, TraversalConfig, TraversalDirection, TraversalPath, TraversalStep,
     DEFAULT_MAX_BRANCHING, DEFAULT_MAX_DEPTH, MAX_BRANCHING, MAX_DEPTH, MAX_TOTAL_VISITED,
@@ -103,8 +110,11 @@ pub use relation::traversal::{
 pub use relation::types::{
     relation_type_embedding_get, relation_type_embedding_put, relation_type_get,
     relation_type_intern, relation_type_list, relation_type_lookup_by_qname, RelationTypeOpError,
+    RelationTypeRedeclaration,
 };
-pub use schema::apply::{apply_schema_definitions, SchemaApplyError};
+pub use schema::apply::{
+    apply_schema_definitions, resolve_redeclarations, Redeclarations, SchemaApplyError,
+};
 pub use schema::declared::{
     declared_entity_type_names, declared_entity_type_names_wtxn, declared_vocabulary,
     declared_vocabulary_wtxn, entity_type_labels_for_namespaces, render_entity_type_labels_block,
@@ -118,7 +128,9 @@ pub use schema::predicate::{
     predicate_intern_with_subject, predicate_list, predicate_lookup_by_qname,
     predicate_retention_seconds, predicate_review_list, predicate_review_record,
     predicate_set_retention, render_declared_predicates_block, PredicateOpError,
+    PredicateRedeclaration,
 };
+pub use schema::qnames::PredicateQnames;
 pub use schema::store::{
     schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,
     SchemaStoreError,
@@ -134,9 +146,8 @@ pub use statement::{
 };
 pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
 pub use tables::extractor_audit::{
-    audit_count as pipeline_audit_count, extraction_attempts as pipeline_extraction_attempts,
-    extraction_retry_due as pipeline_extraction_retry_due, failure_class,
-    has_extracted as pipeline_has_extracted, pipeline_audit_entry, pipeline_status,
+    audit_count as pipeline_audit_count, extraction_retry_due as pipeline_extraction_retry_due,
+    failure_class, has_extracted as pipeline_has_extracted, pipeline_audit_entry, pipeline_status,
     record_extracted as pipeline_record_extracted, retry_backoff_nanos, tier_status,
     ExtractorItemCounts, ExtractorPipelineAuditEntry, ExtractorPipelineAuditError,
     EXTRACTOR_PIPELINE_AUDIT_TABLE,

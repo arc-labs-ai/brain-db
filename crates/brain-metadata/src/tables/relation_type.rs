@@ -16,6 +16,19 @@ use redb::TableDefinition;
 pub const RELATION_TYPES_TABLE: TableDefinition<'static, u32, RelationTypeDefinition> =
     TableDefinition::new("relation_types");
 
+/// `relation_type_id_high_water` — singleton `() -> u32` holding the highest
+/// `RelationTypeId` ever issued in this store. The counterpart to
+/// [`crate::tables::predicate::PREDICATE_ID_HIGH_WATER_TABLE`], and it exists
+/// for the same reason: dropping a relation type removes its row, while an
+/// edge or sidecar can still carry the number and silently change meaning if
+/// that number is reissued to the next name interned.
+/// A store written before the mark existed has no row. The allocator seeds
+/// the mark from the highest id still witnessed anywhere in the store,
+/// including typed edges and relation metadata that may carry a retired
+/// relation-type id after its registry row is gone.
+pub const RELATION_TYPE_ID_HIGH_WATER_TABLE: TableDefinition<'static, (), u32> =
+    TableDefinition::new("relation_type_id_high_water");
+
 /// `relation_types_by_scope` — secondary index for `(qname, space) →
 /// RelationTypeId`. Key is the canonical `"namespace:name"` paired with the
 /// space the declaration belongs to; value is the type id.

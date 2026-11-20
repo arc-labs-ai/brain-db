@@ -31,17 +31,19 @@ The agent commits a piece of content to memory.
 
 1. Tokenizes the text and runs the embedding model to produce a 384-dim `f32` vector.
 2. L2-normalizes the vector (so cosine similarity is the same as dot product).
-3. Allocates a slot in the vector arena.
-4. Writes a WAL record (the durability barrier).
+3. Reserves a fresh `memory_id` from the shard's monotonic slot counter. Reserving writes nothing; an id whose write never commits is simply skipped.
+4. Writes a WAL record and group-commits it — the recoverability barrier.
 5. Inserts the vector into the HNSW index.
-6. Stores metadata (session, timestamp, initial salience, edges).
+6. Stores the memory row, its text, its vector and the idempotency stamp in one redb transaction, and commits — the acknowledgement barrier.
 7. Returns the `memory_id`.
+
+The vector's durable home on this path is redb, not the vector arena; see [`04_layers.md`](04_layers.md) §L5 for why the arena is a boot-time image rather than a live mirror.
 
 ### 1.2 Idempotency
 
 The `request_id` is a client-supplied 16-byte identifier (UUIDv7 recommended) used for idempotency. Retrying an `ENCODE` with the same `request_id` is a no-op: the server returns the existing `memory_id` without re-encoding.
 
-The idempotency horizon is configurable (default: 5 minutes). Retries delayed beyond the horizon may be treated as new operations. See [08. Storage: Arena & WAL](../08_storage/00_purpose.md) §4.4.2 for the deduplication mechanism.
+The idempotency horizon is configurable, and the default is **24 hours** — one window for every operation, substrate and typed-graph alike. Retries delayed beyond the horizon may be treated as new operations. The record is durable: the idempotency row commits in the same transaction as the write it describes, so a restart between the two is unreachable and a replay after it still returns the original response. A small in-memory cache fronts the table to keep same-shard replays cheap; a miss there falls through to the durable row. Bulk eviction of expired rows is a background worker's job. See [08. Storage: Arena & WAL](../08_storage/00_purpose.md) §4.4.2 for the deduplication mechanism.
 
 ### 1.3 Salience hint
 
@@ -53,9 +55,9 @@ The optional `salience_hint` lets the agent signal importance. It's a number in 
 
 - Embedding inference: 5–10 ms (CPU), <1 ms (GPU, batched).
 - WAL append (group-committed): 0.05–0.5 ms.
-- Arena slot write: <0.001 ms.
+- Slot-id reservation: <0.001 ms (one atomic bump; no I/O).
 - HNSW insert: 0.1–1 ms (scales with `log(N)`).
-- Metadata write: 0.005–0.02 ms.
+- Metadata write: 0.005–0.02 ms — the memory row, its text and its vector, in one transaction.
 
 Total p50: ~12 ms (CPU), ~3 ms (GPU). p99: ~25 ms (CPU), ~8 ms (GPU). Embedding dominates; everything else is in the noise.
 
@@ -236,22 +238,23 @@ The agent explicitly removes a memory.
 
 The `mode` parameter selects between two semantics:
 
-**Soft forget** — the slot is tombstoned: hidden from queries, eligible for reuse but recoverable until consolidation. The slot's `version` increments when reused, so old `memory_id` references won't accidentally point to the new occupant. Soft forget is the default.
+**Soft forget** — the memory is tombstoned: hidden from queries, but its content is kept and the forget stays reversible for a grace window (seven days by default). Reversing it is an admin-plane operation; it is refused only if the forget was hard or the window has closed. When the window closes, a reclamation worker deletes the memory for good. Soft forget is the default.
 
-**Hard forget** — the slot is overwritten with zeros, removed from the index, and the original content is unrecoverable. Used for compliance scenarios (GDPR right-to-erasure, removal of secrets accidentally encoded). Hard forget is destructive and cannot be undone.
+**Hard forget** — the text, the stored embedding and the derived graph are deleted at once, the memory's at-rest vector copy is zeroed, and an irreversibility flag goes on the row so no restore can resurrect it. Used for compliance scenarios (GDPR right-to-erasure, removal of secrets accidentally encoded). Hard forget is destructive and cannot be undone.
 
 ### 5.2 What Brain does
 
 For both modes:
 
-1. Validates that the `memory_id` exists and is owned by the requesting agent.
+1. Validates that the `memory_id` exists and is owned by the requesting agent. Ownership is checked inside the write transaction against the row's own space id, so a memory belonging to another tenant is indistinguishable from a missing one.
 2. Writes a `FORGET` record to the WAL.
-3. Removes the memory from the HNSW index.
-4. Marks (soft) or clears (hard) the slot in the arena.
-5. Updates metadata in redb.
-6. Acknowledges to the client.
+3. Tombstones the memory's node in the HNSW index, and drops its lexical-index and hypothetical-question rows.
+4. Stamps the tombstone on the memory row in redb, clears its active flag, removes its timeline-index entry, and evicts its deduplication fingerprint — all in one transaction.
+5. Acknowledges to the client.
 
-For hard forget, additional zeroing passes are performed on the arena slot to ensure the data is truly gone (not just removed from the active index).
+The slot itself is not reclaimed at this point: reclamation is a later, separate step that runs once the grace period passes.
+
+Hard forget adds the irreversibility and the purge. It sets a hard-forgotten flag on the row — which is what lets a restore refuse to resurrect the memory — and, in the same transaction, drops the memory's stored text, its derived-graph artifacts and its stored embedding. Once the write commits, the arena slot holding that memory's at-rest vector copy is zeroed, under a slot-version check so a slot already reclaimed by a newer memory is left untouched; WAL replay re-zeroes it, so the guarantee survives a crash before writeback.
 
 ### 5.3 Idempotency
 
@@ -259,7 +262,7 @@ Like `ENCODE`, `FORGET` carries a `request_id` for idempotent retry. Retrying `F
 
 ### 5.4 Edges and forgetting
 
-When a memory is forgotten, its outgoing edges are gone (they're owned by the source memory). Incoming edges (from other memories pointing to this one) are eagerly invalidated when the slot is reclaimed; until reclamation, edges to a tombstoned memory are filtered during traversal.
+When a memory is forgotten, its outgoing edges are gone (they're owned by the source memory). Edges to a tombstoned memory are filtered during traversal. Reclamation then deletes the edge-index rows adjacent to the memory — its outgoing entries and the incoming entries that name it as a target. Dangling entries in the other direction are left to the edge-scrub worker, so edge cleanup finishes asynchronously rather than at the instant of reclamation.
 
 ### 5.5 Decay vs FORGET
 
@@ -348,15 +351,17 @@ Transactions are local to a single shard. Cross-shard transactions are not suppo
 
 ## 9. Admin Operations
 
-A small set of operations for administrative use, typically invoked via a CLI tool rather than from the agent's hot path.
+A small set of operations for administrative use, never on the agent's hot path.
 
-- **`ADMIN_SNAPSHOT`** — take a consistent backup of one or more shards.
-- **`ADMIN_RESTORE`** — restore a shard from a snapshot.
-- **`ADMIN_STATS`** — current statistics: memory counts, salience distribution, throughput, etc.
-- **`ADMIN_INTEGRITY_CHECK`** — full or partial integrity verification.
-- **`ADMIN_MIGRATE_EMBEDDINGS`** — re-embed all memories with a new model.
+**Administration is a separate plane.** The wire protocol reserves opcodes for the substrate admin operations — statistics, snapshot and restore, integrity check, embedding re-encode, operator session create and rename, move-memory, reclassify, tombstone listing, backfill — and then **refuses all of them**: a client that sends one is answered with an error saying administration is served over the HTTP admin listener. The refusal is uniform across that set, so holding the admin permission bit on a wire connection reaches none of them.
 
-These require elevated permissions (see [17. Observability](../17_observability/00_purpose.md) for the permission model). They are invoked over the same protocol as operations, just with different opcodes.
+The one admin operation that is served on the wire is the pending-contradiction listing (`0x0178` / `0x01F8`), which is admin-gated like the rest but answered inline. It is a read over a graph audit table rather than an act on the deployment, which is why it sits with the typed-graph opcodes and not behind the admin listener.
+
+The reason to split them off rather than gate them is that the two surfaces want different shapes. An agent's connection is long-lived, authenticated once, and carries cognitive operations; an operator's request is a one-shot, externally routable call that belongs behind whatever already fronts the deployment's operational endpoints. Keeping them on one socket would mean one authorization surface protecting two very different blast radii.
+
+The administrative surface covers snapshot and restore, index rebuilds, extraction backfill, worker control, configuration read and reload, audit query and export, API-key and space management, per-memory restore, shard listing and creation, and runtime diagnostics. The routes, their permission model, and the authorization boundary are specified in [17. Observability](../17_observability/00_purpose.md).
+
+Re-embedding every memory under a new model is **not** currently part of that surface. An opcode is reserved for it, but it is refused on the wire like the rest and has no route on the admin listener, so there is no path to invoke it; the model-fingerprint machinery that such an operation would drive is described in [07. Embedding Layer](../07_embedding/00_purpose.md).
 
 ---
 
@@ -371,7 +376,7 @@ These require elevated permissions (see [17. Observability](../17_observability/
 | `FORGET` | Write | No | Yes | ~3 ms |
 | `SUBSCRIBE` | Read | Yes | No | ~1 ms (setup) |
 | `TXN_*` | Both | No | Yes (on commit) | ~5 ms |
-| `ADMIN_*` | Both | Varies | Varies | Varies |
+| `ADMIN_*` | — | — | — | Refused on the wire; the operator plane is HTTP (`05.06`). `ADMIN_LIST_PENDING_CONTRADICTIONS` is the exception |
 
 ---
 

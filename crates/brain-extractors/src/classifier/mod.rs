@@ -30,6 +30,7 @@ pub mod config;
 pub mod extractor;
 pub mod gliner;
 pub mod model;
+pub mod offload;
 
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,7 @@ pub use config::{default_xdg_model_dir, ClassifierConfig};
 pub use extractor::ClassifierExtractor;
 pub use gliner::{GlinerConfig, GlinerError, GlinerModel, Span as GlinerSpan};
 pub use model::{ClassifiedSpan, ClassifierModel, GlinerClassifier};
+pub use offload::{ClassifiedBatch, ClassifiedBatchFuture, ClassifierOffload};
 
 // Shared constants used by config, extractor, and tests.
 

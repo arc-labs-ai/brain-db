@@ -4,9 +4,9 @@
 //! and when its content happened. The mechanical decisions — memory
 //! `kind`, `salience`, whether the write deduplicates, and which edges
 //! get wired — are decided here, server-side, not by the client. The
-//! wire `EncodeRequest` no longer carries them.
+//! wire `EncodeRequest` does not carry them.
 //!
-//! Without `txn_id`: validate + embed + reserve id + dedup check +
+//! Without `txn_id`: validate + dedup check + embed + reserve id +
 //! build a single-phase Write (UpsertMemory) and submit.
 //! With `txn_id`: validate + embed + reserve a `MemoryId`, push to
 //! the buffer, return a preview response. Writes happen at TXN_COMMIT.
@@ -51,8 +51,8 @@ fn stage_kind_name(kind: StageKind) -> &'static str {
 /// work; until then every text encode files as Episodic.
 const DEFAULT_KIND: MemoryKind = MemoryKind::Episodic;
 
-/// Router-owned salience floor for an ENCODE. The client no longer
-/// supplies a hint; the write router decides it.
+/// Router-owned salience floor for an ENCODE. The client supplies no
+/// hint; the write router decides it.
 const DEFAULT_SALIENCE: f32 = 0.5;
 
 #[tracing::instrument(name = "brain.encode", skip_all)]
@@ -144,8 +144,8 @@ pub async fn handle_encode(
     let mut stage_rx = trace_enabled.then(|| ctx.events.receiver());
 
     // 1. Input validation via the existing planner check. The plan now
-    // reports the router's policy kind/salience (the client no longer
-    // supplies them); we read them straight off the constants for
+    // reports the router's policy kind/salience (the client supplies
+    // neither); we read them straight off the constants for
     // clarity and use the plan only as the validation gate.
     let t_validate = trace_enabled.then(Instant::now);
     let _plan = plan_encode_inner(&req, &ctx.planner_ctx)?;
@@ -189,41 +189,14 @@ pub async fn handle_encode(
         crate::writer::submit::CacheLookup::Miss => {}
     }
 
-    // 2. Embed text → vector.
-    let t_embed = trace_enabled.then(Instant::now);
-    let vector = ctx
-        .executor
-        .embedder
-        .embed(&req.text)
-        .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
-    // Captured before `vector`/`req.text` are moved into the write phase, so
-    // the persist stage's record artifact can report the stored dimensions.
-    let vector_dim = vector.len();
-    let text_len = req.text.len();
-    if let Some(start) = t_embed {
-        // embed → the actual embedding this stage produced. Trace-only clone
-        // (the vector is moved into the write phase below); skipped entirely
-        // when `trace = false`.
-        trace_stages.push(EncodeTraceStage {
-            name: "embed".into(),
-            status: EncodeTraceStageStatus::Ok,
-            latency_us: elapsed_us(start),
-            detail: format!("dim={}", vector.len()),
-            artifact: Some(EncodeStageArtifact {
-                vector: vector.to_vec(),
-                ..Default::default()
-            }),
-        });
-    }
-    let content_hash = *blake3::hash(req.text.as_bytes()).as_bytes();
-
-    // Content dedup is on by default; the client can opt out per request
+    // 2. Content dedup is on by default; the client can opt out per request
     // (`allow_duplicates`) to force a distinct memory for byte-identical text.
+    let content_hash = *blake3::hash(req.text.as_bytes()).as_bytes();
     let deduplicate = !req.allow_duplicates;
 
     // 3. Dedup check — default policy is content dedup. Look up
     // (space, context, content_hash). On hit, return the existing
-    // memory id without submitting a Write.
+    // memory id without embedding or submitting a Write.
     if deduplicate {
         if let Some(existing) = lookup_fingerprint(ctx, content_hash, session_id)? {
             return Ok(EncodeResponse {
@@ -247,7 +220,36 @@ pub async fn handle_encode(
         }
     }
 
-    // 4. Reserve a fresh MemoryId via the writer's slot allocator.
+    // 4. Embed text → vector. This runs only for writes that survived the
+    // content-dedup check, because the duplicate path has no vector to store.
+    // The shard's batch window carries this text through the model alongside
+    // whatever other writes are waiting on the same shard, so a loaded shard
+    // spends one forward pass on many rows instead of one pass each.
+    let t_embed = trace_enabled.then(Instant::now);
+    let vector = crate::embedding::embed_batched_off_reactor(&ctx.executor.embedder, &req.text)
+        .await
+        .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
+    // Captured before `vector`/`req.text` are moved into the write phase, so
+    // the persist stage's record artifact can report the stored dimensions.
+    let vector_dim = vector.len();
+    let text_len = req.text.len();
+    if let Some(start) = t_embed {
+        // embed → the actual embedding this stage produced. Trace-only clone
+        // (the vector is moved into the write phase below); skipped entirely
+        // when `trace = false`.
+        trace_stages.push(EncodeTraceStage {
+            name: "embed".into(),
+            status: EncodeTraceStageStatus::Ok,
+            latency_us: elapsed_us(start),
+            detail: format!("dim={}", vector.len()),
+            artifact: Some(EncodeStageArtifact {
+                vector: vector.to_vec(),
+                ..Default::default()
+            }),
+        });
+    }
+
+    // 5. Reserve a fresh MemoryId via the writer's slot allocator.
     let t_reserve = trace_enabled.then(Instant::now);
     let memory_id = ctx
         .executor
@@ -279,7 +281,7 @@ pub async fn handle_encode(
         "write stage: text embedded",
     );
 
-    // 5. Build the single-phase Write: UpsertMemory. ENCODE carries no
+    // 6. Build the single-phase Write: UpsertMemory. ENCODE carries no
     // client edges — auto/temporal-edge derivation is the workers' job,
     // enqueued post-commit by submit(). `req.text` is no longer read
     // after this point (the embedding ran off `&req.text` above and
@@ -306,7 +308,7 @@ pub async fn handle_encode(
         deduplicate,
     }];
 
-    // 6. Submit.
+    // 7. Submit.
     let t_persist = trace_enabled.then(Instant::now);
     let write = Write::from_phases(write_id, ctx.executor.caller_space, phases)
         .with_namespace(ctx.executor.caller_namespace)
@@ -1039,11 +1041,9 @@ async fn handle_encode_in_txn(
             buf.check_capacity_for_push()
         })?;
 
-    // 5. Embed.
-    let vector = ctx
-        .executor
-        .embedder
-        .embed(&req.text)
+    // 5. Embed, sharing a forward pass with the shard's other waiting writes.
+    let vector = crate::embedding::embed_batched_off_reactor(&ctx.executor.embedder, &req.text)
+        .await
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
 
     // 6. Reserve a MemoryId from the writer.

@@ -57,7 +57,7 @@ use crate::subscribe::{
 // `network::connection` in the binary or root-mounted as `connection` by each
 // integration-test binary's `#[path]` mount.
 #[path = "gate.rs"]
-mod gate;
+pub mod gate;
 use gate::ConnectionGate;
 
 // ---------------------------------------------------------------------------
@@ -243,7 +243,6 @@ impl CloseReason {
     /// going through the metric registry; the exposition path uses
     /// [`CLOSE_REASONS`] indexed by [`Self::idx`] instead.
     #[must_use]
-    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             CloseReason::Bye => "bye",
@@ -643,7 +642,7 @@ async fn abort_orphaned_transactions(shards: &[ShardHandle], connection_id: [u8;
 // One outgoing frame: bytes pre-encoded, with an optional "close after
 // this frame" hint that lets the writer loop tear down on the right
 // frame (BYE, fatal ERROR).
-pub(crate) struct OutgoingFrame {
+pub struct OutgoingFrame {
     pub(crate) bytes: Vec<u8>,
     pub(crate) close_after: bool,
 }
@@ -914,10 +913,6 @@ where
                                 metrics.record_close(reason);
                                 exit!(Ok(()));
                             }
-                            Action::Close => {
-                                metrics.record_close(CloseReason::Bye);
-                                exit!(Ok(()));
-                            }
                             Action::Nothing => {}
                         }
                     }
@@ -983,9 +978,27 @@ fn build_close_error_frame_with_category(
     message: &str,
 ) -> Frame {
     let body = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::from(code),
-        category: ErrorCategoryWire::from(category),
+        code: ErrorCodeWire::from(code) as u16,
+        category: ErrorCategoryWire::from(category) as u8,
         message: message.to_owned(),
+        details: None,
+        retry_after_ms: None,
+    });
+    Frame::try_new(Opcode::Error.as_u16(), 0, 0, body.encode())
+        .unwrap_or_else(|_| close_error_fallback_frame(code, category))
+}
+
+/// The close frame sent when a detail message does not fit a frame.
+///
+/// Fixed-shape and a few dozen bytes, so it fits by construction and the
+/// fallback cannot re-enter itself. The connection is closing either way;
+/// the code and category are what the peer needs, and the detail text is the
+/// only part that can be lost.
+fn close_error_fallback_frame(code: ErrorCode, category: ErrorCategory) -> Frame {
+    let body = ResponseBody::Error(ErrorResponse {
+        code: ErrorCodeWire::from(code) as u16,
+        category: ErrorCategoryWire::from(category) as u8,
+        message: "error detail exceeds the frame limit".to_owned(),
         details: None,
         retry_after_ms: None,
     });

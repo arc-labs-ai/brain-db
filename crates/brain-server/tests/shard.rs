@@ -17,9 +17,7 @@ use tempfile::TempDir;
 // the test binary so that `crate::` resolves the same as in main.rs.
 // The `dispatch_op` surface is used only by `tests/dispatch.rs`;
 // silence the dead-code lint from this binary's perspective.
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
+use brain_server::shard;
 
 use shard::{spawn_shard, ShardError, ShardHandle, ShardSpawnConfig};
 
@@ -76,20 +74,6 @@ async fn drop_last_handle_lets_joiner_complete() {
         .await
         .expect("spawn_blocking join")
         .expect("shard joins cleanly");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pin_to_invalid_cpu_errors() {
-    let dir = TempDir::new().unwrap();
-    let cfg = ShardSpawnConfig {
-        pin_cpu: Some(usize::MAX),
-        ..ShardSpawnConfig::new(dir.path().to_owned(), stub())
-    };
-    match spawn_shard(4, cfg) {
-        Ok(_) => panic!("spawn should fail for invalid CPU id usize::MAX"),
-        Err(ShardError::Spawn(_)) => {}
-        Err(other) => panic!("expected Spawn error, got: {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,8 +206,8 @@ async fn arena_uuid_persists_across_restarts() {
     }
 }
 
-/// Smoke: `take_snapshot()` no longer errors out with
-/// `SnapshotNotYetImplemented`. Drives the worker through the new save path
+/// Smoke: `take_snapshot()` completes rather than erroring out with
+/// `SnapshotNotYetImplemented`. Drives the worker through the save path
 /// against an empty HNSW (the basic test harness can't populate the live
 /// HNSW — `append_wal_record` only logs and arena populates at recovery
 /// time). The empty-HNSW guard in `save_snapshot` skips the hnsw_rs
@@ -244,9 +228,9 @@ async fn take_snapshot_succeeds_on_empty_hnsw_after_pq_pivot() {
         let (handle, joiner) =
             spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1");
         handle.append_wal_record(encode_record(0, 1)).await.unwrap();
-        // Previously this errored with `SnapshotNotYetImplemented`; the PQ
-        // save_snapshot now succeeds (no-op on the empty HNSW, full write
-        // when the index is populated — see brain-index round-trip test).
+        // The PQ save_snapshot succeeds here rather than returning
+        // `SnapshotNotYetImplemented`: a no-op on the empty HNSW, a full write
+        // when the index is populated (see brain-index round-trip test).
         let _snap_id = handle.take_snapshot().await.expect("take_snapshot");
         drop(handle);
         tokio::task::spawn_blocking(move || joiner.join())

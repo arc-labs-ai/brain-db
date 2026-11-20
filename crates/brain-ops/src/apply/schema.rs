@@ -4,8 +4,9 @@
 //! It reconstructs the schema document from `Phase::UpsertSchema.blob`
 //! (DSL source for UPLOAD / REPLACE, re-parsed here; serde_json for a
 //! targeted DROP, whose narrowed form has no DSL source), applies the
-//! destructive delta first (REPLACE's `replace_all` drops all declared
-//! vocabulary; DROP's `drops` removes specific targets), then delegates to
+//! destructive delta first (REPLACE's `replace_all` drops the declared
+//! vocabulary the new document does not re-state unchanged; DROP's `drops`
+//! removes specific targets), then delegates to
 //! [`brain_metadata::schema::store::schema_upload`] which atomically writes
 //! the schema-version row, updates the active-version pointer, fans out
 //! predicate/relation-type/entity-type/extractor interns, and re-flags
@@ -15,11 +16,12 @@
 
 use brain_metadata::extractor::ops::extractor_drop_declared;
 use brain_metadata::relation::types::{relation_type_drop_one, relation_type_drop_schema_declared};
+use brain_metadata::schema::apply::resolve_redeclarations;
 use brain_metadata::schema::predicate::{predicate_drop_one, predicate_drop_schema_declared};
 use brain_metadata::schema::store::{declared_context_wtxn, schema_upload_with_mode, SourceMode};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_metadata::DeclScope;
-use brain_protocol::schema::{parse_schema, validate_with};
+use brain_protocol::schema::{parse_schema, validate_with, ValidatedSchema};
 use brain_protocol::schema_drop_target;
 use redb::WriteTransaction;
 
@@ -121,6 +123,8 @@ pub fn apply_upsert_schema(
         DeclScope::space(&namespace, *space),
         *replace_all,
         drops,
+        &validated,
+        *created_at_unix_nanos,
     )?;
 
     // The scope comes off the phase, not off the `Write` and not off any
@@ -146,22 +150,32 @@ pub fn apply_upsert_schema(
 
 /// Apply the destructive schema delta carried on an `UpsertSchema` phase.
 ///
-/// `replace_all` (SCHEMA_REPLACE) drops every declared predicate / relation
-/// type / extractor in the namespace; `drops` (SCHEMA_DROP) removes specific
+/// `replace_all` (SCHEMA_REPLACE) drops the declared predicate / relation type
+/// vocabulary the new document does not re-state unchanged, plus every
+/// extractor; `drops` (SCHEMA_DROP) removes specific
 /// declared targets. Both run before the additive `schema_upload`, so a plain
 /// UPLOAD (empty delta) is a no-op here. Shared by the live apply path and WAL
-/// recovery so the two never diverge.
+/// recovery so the two never diverge. The decision to refuse a destructive
+/// delta is not made here: this function is shared by live apply and WAL
+/// recovery, and a replay that refused would wedge recovery on a write that
+/// was already acknowledged. The in-use gate therefore lives in the
+/// `SCHEMA_REPLACE` / `SCHEMA_DROP` handlers, where a caller can still be told
+/// no.
 fn apply_schema_delta(
     wtxn: &WriteTransaction,
     scope: DeclScope<'_>,
     replace_all: bool,
     drops: &[(u8, String)],
+    validated: &ValidatedSchema,
+    now_unix_nanos: u64,
 ) -> Result<usize, ApplyError> {
     let mut dropped = 0usize;
     if replace_all {
-        dropped += predicate_drop_schema_declared(wtxn, scope)
+        let redeclared = resolve_redeclarations(wtxn, validated, scope.space_id(), now_unix_nanos)
+            .map_err(|e| ApplyError::Metadata(format!("resolve redeclarations: {e}")))?;
+        dropped += predicate_drop_schema_declared(wtxn, scope, &redeclared.predicates)
             .map_err(|e| ApplyError::Metadata(format!("predicate drop-all: {e}")))?;
-        dropped += relation_type_drop_schema_declared(wtxn, scope)
+        dropped += relation_type_drop_schema_declared(wtxn, scope, &redeclared.relation_types)
             .map_err(|e| ApplyError::Metadata(format!("relation_type drop-all: {e}")))?;
         dropped += extractor_drop_declared(wtxn, scope)
             .map_err(|e| ApplyError::Metadata(format!("extractor drop-all: {e}")))?;
@@ -226,17 +240,17 @@ define entity_type Widget {
         brain_core::SpaceId::derive_from_string("acme", "tenant:user-b").into()
     }
 
-    fn upload_phase(space: [u8; 16]) -> Phase {
+    fn upload_phase(space: [u8; 16], source: &str, replace_all: bool) -> Phase {
         Phase::UpsertSchema {
             namespace: "acme".into(),
             version: 1,
             space,
-            blob: SOURCE.as_bytes().to_vec(),
+            blob: source.as_bytes().to_vec(),
             declared_predicates: Vec::new(),
             declared_relation_types: Vec::new(),
             declared_entity_types: Vec::new(),
             created_at_unix_nanos: 1_700_000_000_000,
-            replace_all: false,
+            replace_all,
             drops: Vec::new(),
         }
     }
@@ -258,12 +272,173 @@ define entity_type Widget {
         .is_some()
     }
 
+    fn apply_phase(db: &MetadataDb, phase: &Phase) {
+        let write = Write::single(
+            WriteId::new(),
+            brain_core::SpaceId::default(),
+            phase.clone(),
+        );
+        let wtxn = db.write_txn().unwrap();
+        apply_upsert_schema(&wtxn, phase, &write).unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    /// The id `acme:<name>` resolves to for a reader at the namespace base,
+    /// or `None` when nothing declares the name any more.
+    fn predicate_id(db: &MetadataDb, name: &str) -> Option<brain_core::PredicateId> {
+        let rtxn = db.read_txn().unwrap();
+        brain_metadata::schema::predicate::predicate_lookup_by_qname(
+            &rtxn,
+            brain_metadata::DeclScope::base("acme"),
+            name,
+        )
+        .unwrap()
+        .map(|p| p.id)
+    }
+
+    /// Does a registry row still exist for `id`? A statement carrying a
+    /// number no row answers to is a statement that asserts an empty qname,
+    /// which is the degradation a removed declaration must produce.
+    fn predicate_row_exists(db: &MetadataDb, id: brain_core::PredicateId) -> bool {
+        let rtxn = db.read_txn().unwrap();
+        brain_metadata::schema::predicate::predicate_get(&rtxn, id)
+            .unwrap()
+            .is_some()
+    }
+
+    fn relation_type_id(db: &MetadataDb, name: &str) -> Option<brain_core::RelationTypeId> {
+        let rtxn = db.read_txn().unwrap();
+        brain_metadata::relation::types::relation_type_lookup_by_qname(
+            &rtxn,
+            brain_metadata::DeclScope::base("acme"),
+            name,
+        )
+        .unwrap()
+        .map(|r| r.id)
+    }
+
+    /// One predicate, declared on its own, for the replace assertions.
+    const ALPHA: &str = "namespace acme\n\
+                         define predicate alpha { kind: Fact object: Value<text> }\n";
+
+    /// A replace that re-states a declaration unchanged must leave its id
+    /// alone: every statement already written carries that number, and a
+    /// re-minted id would leave all of them asserting an empty qname.
+    #[test]
+    fn a_replace_that_restates_its_vocabulary_keeps_the_predicate_identifier() {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, ALPHA, false));
+        let old = predicate_id(&db, "alpha").expect("the upload declares alpha");
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, ALPHA, true));
+
+        assert_eq!(
+            predicate_id(&db, "alpha"),
+            Some(old),
+            "an unchanged declaration keeps the id its statements name"
+        );
+        assert!(predicate_row_exists(&db, old));
+    }
+
+    /// The other half of the contract: a declaration the new document drops
+    /// really is gone, so its statements degrade to an empty qname rather
+    /// than silently reading as some other predicate. Apply is unconditional
+    /// by design; the handler tests assert the refusal that stops a caller
+    /// reaching this state.
+    #[test]
+    fn a_replace_that_omits_a_predicate_leaves_its_identifier_naming_nothing() {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        let both = "namespace acme\n\
+                    define predicate alpha { kind: Fact object: Value<text> }\n\
+                    define predicate beta { kind: Fact object: Value<text> }\n";
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, both, false));
+        let alpha = predicate_id(&db, "alpha").expect("the upload declares alpha");
+        let beta = predicate_id(&db, "beta").expect("the upload declares beta");
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, ALPHA, true));
+
+        assert_eq!(
+            predicate_id(&db, "alpha"),
+            Some(alpha),
+            "re-stating one declaration must not disturb its id"
+        );
+        assert_eq!(
+            predicate_id(&db, "beta"),
+            None,
+            "the omitted name resolves to nothing"
+        );
+        assert!(
+            !predicate_row_exists(&db, beta),
+            "and no registry row answers to the number its statements carry"
+        );
+    }
+
+    /// Re-declaring a name under a DIFFERENT object constraint is not a
+    /// re-statement: the rows already on disk were written under the old
+    /// constraint, so the name has to start over on a fresh id rather than
+    /// re-reading those rows as the new declaration.
+    #[test]
+    fn a_replace_that_changes_an_object_constraint_mints_a_new_identifier() {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        let changed = "namespace acme\ndefine predicate alpha { kind: Fact object: Memory }\n";
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, ALPHA, false));
+        let old = predicate_id(&db, "alpha").expect("the upload declares alpha");
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, changed, true));
+
+        let new_id = predicate_id(&db, "alpha").expect("the replace re-declares alpha");
+        assert_ne!(
+            new_id, old,
+            "a changed constraint must not adopt the old id"
+        );
+        assert!(
+            !predicate_row_exists(&db, old),
+            "and the old number must answer to nothing"
+        );
+    }
+
+    /// Relation types carry the same hazard through typed edges and relation
+    /// metadata, which both stamp the relation-type id.
+    ///
+    /// The entity types are deliberately NOT the system schema's built-ins,
+    /// for the reason given on [`SOURCE`].
+    #[test]
+    fn a_replace_that_restates_a_relation_type_keeps_its_identifier() {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        let source = "namespace acme\n\
+                      define entity_type Widget {\n}\n\
+                      define entity_type Gadget {\n}\n\
+                      define relation_type owns {\n\
+                          from: Widget\n\
+                          to: Gadget\n\
+                          cardinality: many-to-many\n\
+                      }\n";
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, source, false));
+        let old = relation_type_id(&db, "owns").expect("the upload declares owns");
+
+        apply_phase(&db, &upload_phase(SPACE_BASE, source, true));
+
+        assert_eq!(
+            relation_type_id(&db, "owns"),
+            Some(old),
+            "an unchanged relation type keeps the id its edges name"
+        );
+    }
+
     #[test]
     fn upsert_schema_round_trips_and_increments_version() {
         let dir = TempDir::new().unwrap();
         let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
 
-        let phase = upload_phase(SPACE_BASE);
+        let phase = upload_phase(SPACE_BASE, SOURCE, false);
         let write = Write::single(
             WriteId::new(),
             brain_core::SpaceId::default(),
@@ -309,7 +484,7 @@ define entity_type Widget {
 
         let dir = TempDir::new().unwrap();
         let space = space_a();
-        let phase = upload_phase(space);
+        let phase = upload_phase(space, SOURCE, false);
         let write = Write::single(
             WriteId::new(),
             brain_core::SpaceId::default(),
@@ -365,7 +540,7 @@ define entity_type Widget {
         use brain_storage::recovery::MetadataSink;
 
         let dir = TempDir::new().unwrap();
-        let phase = upload_phase(SPACE_BASE);
+        let phase = upload_phase(SPACE_BASE, SOURCE, false);
         let write = Write::single(
             WriteId::new(),
             brain_core::SpaceId::default(),

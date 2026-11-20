@@ -30,8 +30,10 @@ impl Frame {
     ///
     /// # Panics
     ///
-    /// Panics if `payload.len()` exceeds [`MAX_PAYLOAD_BYTES`]. Callers must
-    /// split into multi-payload frames before that point.
+    /// Panics if `payload.len()` exceeds [`MAX_PAYLOAD_BYTES`]. Use `new` for
+    /// payloads whose bounds are enforced by the caller, such as fixed-shape
+    /// control frames and tests. Use [`Frame::try_new`] for payloads whose
+    /// size can be influenced by a client.
     #[must_use]
     pub fn new(opcode: u16, flags: u8, stream_id: u32, payload: Vec<u8>) -> Self {
         assert!(
@@ -44,6 +46,30 @@ impl Frame {
         header.payload_crc32c = payload_crc(&payload).to_be_bytes();
         header.seal();
         Self { header, payload }
+    }
+
+    /// Build a `Frame`, reporting rather than panicking when the payload is
+    /// larger than the 24-bit length field can describe.
+    ///
+    /// This is the constructor for any frame whose payload size is a function
+    /// of data the client influenced — a response body carrying rows, memory
+    /// text, or graph nodes, where the per-item bounds multiply out past the
+    /// frame cap. `new` asserts in that case and the release profile aborts on
+    /// panic, so an oversize response would take the process down instead of
+    /// failing one request.
+    pub fn try_new(
+        opcode: u16,
+        flags: u8,
+        stream_id: u32,
+        payload: Vec<u8>,
+    ) -> Result<Self, ProtocolError> {
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(ProtocolError::OversizePayload {
+                len: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+                max: u32::try_from(MAX_PAYLOAD_BYTES).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(Self::new(opcode, flags, stream_id, payload))
     }
 
     /// Serialize the frame to a wire-ready byte vector.
@@ -137,6 +163,28 @@ mod tests {
 
     fn sample_frame() -> Frame {
         Frame::new(0x0021, 0, 7, b"hello brain".to_vec())
+    }
+
+    #[test]
+    fn try_new_accepts_a_payload_at_the_cap() {
+        // This intentionally allocates about 16 MiB to exercise the wire cap.
+        let frame = Frame::try_new(0x0021, 0, 7, vec![0u8; MAX_PAYLOAD_BYTES])
+            .expect("payload at the cap is valid");
+        assert_eq!(frame.payload.len(), MAX_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn try_new_rejects_a_payload_over_the_cap_so_the_abort_door_is_shut() {
+        // This intentionally allocates about 16 MiB to exercise the wire cap.
+        // Release builds abort on panic, so the oversize result must be returned.
+        let result = Frame::try_new(0x0021, 0, 7, vec![0u8; MAX_PAYLOAD_BYTES + 1]);
+        assert!(matches!(
+            result,
+            Err(ProtocolError::OversizePayload {
+                max,
+                ..
+            }) if max == MAX_PAYLOAD_BYTES as u32
+        ));
     }
 
     #[test]

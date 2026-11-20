@@ -145,6 +145,7 @@ fn build_fixture(
         scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
+        semantic_query: Some(brain_index::SemanticQuery::Text("bench query".into())),
     };
 
     Fixture { _dir: dir, ctx }

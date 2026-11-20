@@ -1,6 +1,8 @@
 # 07.04 Batching and GPU
 
-The optional GPU inference path. This file specifies how Brain batches multiple inference requests onto a GPU when one is available.
+The GPU inference path. This file specifies how Brain batches multiple inference requests onto a GPU.
+
+> **The GPU path is not available.** `EmbedderConfig::device` is a forward-compatibility slot, and the model loader refuses anything other than `Device::Cpu` with `EmbedError::UnsupportedDevice` before it does any I/O. There is no CUDA feature to compile in. Everything below is the shape the path takes when it lands, not behaviour a deployment can select today. The CPU path is unbatched and is what every deployment runs; its measured throughput and the reason it scales on the shard axis are in [`02_inference_pipeline.md`](02_inference_pipeline.md) §19.
 
 ## 1. When GPU helps
 
@@ -24,6 +26,8 @@ Per-item:
 | GPU, batched (128) | ~30 ms wall, 0.25 ms amortized | ~10,000/s |
 
 GPU shines with batching. Single-item GPU inference is comparable to CPU but worse — kernel launch overhead matters for small workloads.
+
+The CPU row is a per-item estimate. Measured whole-process throughput on the CPU path is in [`02_inference_pipeline.md`](02_inference_pipeline.md) §19, which also explains why CPU throughput scales on the shard axis rather than by widening one forward pass.
 
 Brain batches automatically when GPU is enabled. The batching happens at the embedding layer; clients are unaware.
 

@@ -96,7 +96,7 @@ The merge is rejected (returning a structured error) if any pre-condition fails:
 | neither is tombstoned | merge of tombstoned | `ENTITY_MERGE_CONFLICT` |
 | `confidence` ∈ `[0.7, 1.0]` | low-confidence | `INVALID_ARGUMENT` |
 
-Cross-type merges are forbidden — see [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) Q3.
+Cross-type merges are forbidden.
 
 ### Confidence-banded behavior
 
@@ -112,8 +112,8 @@ When `actor = Actor::Agent(_)` — the merge came from `ENTITY_MERGE` over the w
 
 When `actor = Actor::System` — the merge came from an internal worker (the LLM-tier resolver):
 
-- `confidence >= 0.95`: **autonomous merge.** Audit row written; `MERGED` event emitted. Operators see the merge after the fact via `ADMIN_LIST_PENDING_RESOLUTIONS` audit history.
-- `0.7 <= confidence < 0.95`: **review required.** The merge is **not** applied. Instead, the proposal is written to the `merge_review_queue` table, an audit row is stamped with `outcome = Pending`, and the proposal surfaces via `ADMIN_LIST_PENDING_RESOLUTIONS`. An operator confirms via `ADMIN_RESOLVE_AMBIGUITY` (audit kind discriminates merge-pending vs resolution-pending).
+- `confidence >= 0.95`: **autonomous merge.** Audit row written; `MERGED` event emitted. Operators see the merge after the fact through the audit query on the admin listener.
+- `0.7 <= confidence < 0.95`: **review required.** The merge is **not** applied. The proposal is written to the `merge_review_queue` table and an audit row is stamped with `outcome = Pending`. The queue is written but not yet read back: there is no wire op and no admin route that lists the proposals or confirms one, so a pending merge stays pending and is visible only in the audit trail.
 - `confidence < 0.7`: not a merge candidate; the resolver shouldn't even surface it.
 
 #### The `merge_review_queue` table
@@ -275,24 +275,23 @@ Per-shard single-writer discipline ([`../08_storage/`](../08_storage/00_purpose.
 2. Run §"Mechanics" steps on each shard (statements / relations live on the subject's shard).
 3. Coordinate the merge audit row (lives on the survivor's shard).
 
-The coordination strategy is tracked in [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
 
 ### Audit retention
 
-The `entity_merge_log` row is kept indefinitely (no automatic deletion). Operators may export and prune via `ADMIN_GET_AUDIT` + offline tooling, but Brain doesn't garbage-collect merge audits as part of normal operations.
+The `entity_merge_log` row is kept indefinitely (no automatic deletion). Operators may query and export the audit trail from the admin listener and prune with offline tooling, but Brain doesn't garbage-collect merge audits as part of normal operations.
 
-### Tests
+### What merge must hold
 
-Test coverage for merge mechanics (lands _(later)_):
+The requirements an implementation of the mechanics above is bound to:
 
-- All pre-conditions, both inside and outside the redb txn.
-- Each confidence band (auto / review / reject).
-- Attribute conflict resolution for every policy.
-- Re-routing: statements with `subject = merged`, with `object = Entity(merged)`, with both; relations with `from = merged`, with `to = merged`.
-- Multi-hop merge: A→B then B→C, verify chain collapse.
-- Concurrent merges on different shards.
-- Crash mid-transaction: verify either the full merge applied or none.
-- Grace-period boundary: unmerge succeeds at `expires_at - 1ns`, fails at `expires_at + 1ns`.
+- Every pre-condition holds both as checked by the caller and as re-checked inside the redb transaction. A pre-condition enforced only outside the transaction is not enforced.
+- Each confidence band behaves as its band specifies — autonomous, review, or reject — with no band leaking into another at its boundary.
+- Attribute conflict resolves per the declared policy, for every policy.
+- Re-routing covers all four shapes: a statement whose `subject` is the merged entity, one whose `object` is, one where both are, and a relation whose `from` or `to` is.
+- A multi-hop merge (A→B, then B→C) collapses the chain rather than leaving a two-step indirection.
+- Concurrent merges on different shards do not interfere.
+- A crash mid-transaction leaves either the whole merge applied or none of it.
+- The grace boundary is exact: an unmerge succeeds up to `expires_at` and fails after it.
 
 Exercised in `crates/brain-server/tests/knowledge_entity_merge.rs` (lands _(later)_).
 
@@ -402,26 +401,22 @@ If `merged → survivor → other`:
 - Unmerging `merged` is safe **only if** `survivor` is still active (not itself merged into `other`).
 - If `survivor` has been merged into `other` since, the unmerge of `merged` is rejected with `ENTITY_MERGE_CONFLICT`.
 
-Operators in this case must unmerge `other → survivor` first (if still in grace), then `survivor → merged`. Brain enforces the order; tracked in [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) Q-multi-hop-unmerge.
+Operators in this case must unmerge `other → survivor` first (if still in grace), then `survivor → merged`. Brain enforces that order.
 
 ### Re-merging after unmerge
 
 The same `(survivor, merged)` pair can be re-merged after an unmerge. Each merge writes a new audit; the previous one's `unmerged_at` field remains set as historical record.
 
-### Tests
+### What unmerge must hold
 
-Test coverage for unmerge (lands _(later)_):
-
-- All pre-conditions.
-- Round-trip: merge → unmerge → verify state matches pre-merge.
-- Statements / relations authored during the merge window stay with the survivor.
-- Multi-hop refusal: `merged → survivor → other` unmerge fails until upstream unmerge.
-- Grace-period boundary.
-- Re-merge after unmerge.
-- Crash mid-transaction.
-- Audit-row overflow path (>1 MiB statement re-route list).
-
-Exercised in `crates/brain-server/tests/knowledge_entity_unmerge.rs` (lands _(later)_).
+- Every pre-condition is enforced.
+- The round trip is exact: merge then unmerge restores the pre-merge state.
+- Statements and relations authored during the merge window stay with the survivor rather than following the restored entity.
+- A multi-hop unmerge is refused while an upstream merge is still in force, and the refusal names the order the operator must follow.
+- The grace boundary is exact, as for merge.
+- A re-merge after an unmerge is permitted, and writes a fresh audit row.
+- A crash mid-transaction leaves either the whole unmerge applied or none of it.
+- An audit row whose statement re-route list exceeds the inline bound takes the overflow path rather than failing the unmerge.
 
 ## What follows in this section
 

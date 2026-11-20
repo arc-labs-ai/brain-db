@@ -237,12 +237,20 @@ impl Extractor for PipelineFailureStub {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Drive `worker.run_cycle` to completion under a Tokio runtime.
-/// The worker doesn't depend on Glommio's executor here because all
-/// three tests drain ≤ 1 memory, so the periodic `yield_if_needed`
-/// branch (every 4 drains) never fires.
+/// Drive `worker.run_cycle` to completion.
+///
+/// The cycle reaches `brain_ops::embedding`, which offloads onto
+/// `glommio::executor().spawn_blocking(..)`. `glommio::executor()` resolves
+/// through a scoped thread-local and panics on a thread that has no executor,
+/// so the engine future has to be polled inside one. `LocalExecutor::run`
+/// drives it on *this* thread and imposes no `Send`/`'static` bound, which is
+/// what lets the `!Send` fixture be borrowed straight across. Nothing Tokio is
+/// awaited inside the cycle, so blocking the current-thread test runtime for
+/// its duration is safe.
 async fn run_cycle(fixture: &Fixture) -> usize {
-    fixture.worker.run_cycle(&fixture.ctx).await.unwrap()
+    glommio::LocalExecutor::default()
+        .run(fixture.worker.run_cycle(&fixture.ctx))
+        .unwrap()
 }
 
 /// Collect every event currently sitting on the bus receiver. Returns
@@ -488,6 +496,7 @@ async fn shard_registry_with_real_gliner_persists_entities() {
     let deps = MaterializeDeps {
         llm_max_tokens: None,
         classifier_model: Some(Arc::new(model)),
+        classifier_offload: None,
         entity_type_qnames: Arc::new(entity_type_qnames),
         credential_resolver: None,
         llm_cache: None,
@@ -940,13 +949,13 @@ async fn hype_pass_with_empty_reply_publishes_one_empty_event() {
 
 /// A HyPE stage that could not run publishes `Failed` **with the reason**.
 ///
-/// This is the gap the payload used to have. `Failed` plus `questions_written:
-/// 0` is the same record for a namespace with no provider key, a completion
-/// budget too small for a reasoning model, and a dead embedder — three faults
-/// with three different fixes. The cause was known at the failure site and
-/// logged, but the stage record carried no field to put it in, so everything
-/// downstream (the write trace, the analytics row an operator actually reads)
-/// could say only that something broke.
+/// Without it, `Failed` plus `questions_written: 0` is the same record for a
+/// namespace with no provider key, a completion budget too small for a
+/// reasoning model, and a dead embedder — three faults with three different
+/// fixes. The cause is known at the failure site and logged, but with no field
+/// on the stage record to put it in, everything downstream (the write trace,
+/// the analytics row an operator actually reads) can say only that something
+/// broke.
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_hype_pass_publishes_the_reason_it_failed() {
     let registry = ExtractorRegistry::new();

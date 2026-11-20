@@ -14,41 +14,53 @@
 [server]
 # Data plane: the binary wire protocol (CBOR payloads) is served here.
 # Bound to 0.0.0.0 inside the container; expose with -p 8080:8080.
-listen_addr  = "0.0.0.0:8080"
+listen_addr = "0.0.0.0:8080"
 
-# HTTP server: /healthz, /metrics, /v1/* (REST surface).
+# Public HTTP: /healthz, /readyz and /metrics. Nothing else is served here.
 # Bound to 0.0.0.0 inside the container; expose with -p 9091:9091.
 metrics_addr = "0.0.0.0:9091"
 
 # Admin surface — /v1/* HTTP routes. Kept on loopback inside the
 # container (no `-p` mapping in docker run / compose). The host can't
 # reach it; sidecar containers / `docker exec` calls to the HTTP
-# surface can. v1 has no built-in auth on /v1/* — keep this on loopback
-# or front it with a token / mTLS proxy.
-admin_addr   = "127.0.0.1:9092"
+# surface can. Every route is gated on the [admin] token below (overridable
+# as BRAIN__ADMIN__TOKEN), presented as Authorization: Bearer <token>, and
+# refused fail-closed; loopback is a second layer rather than the only one.
+admin_addr = "127.0.0.1:9092"
+
+# TLS on the data-plane listener. Off: the image carries no certificate, and
+# `enabled = true` without both PEM paths is refused at boot rather than serving
+# plaintext. Mount a pair and point these at it, or terminate TLS in the proxy in
+# front of the container.
+# [server.tls]
+# enabled = false
+# cert = "/etc/brain/tls/server.pem"
+# key = "/etc/brain/tls/server.key"
 
 [storage]
-data_dir    = "/var/lib/brain/data"
-# Single shard is the safe default for a single-container deployment.
-# Grow this for higher write throughput (one shard pins one core).
-shard_count = 1
+data_dir = "/var/lib/brain/data"
+# Four shards pin one core each, sized for a container with at least four
+# cores; lower this on a smaller host and raise it for write throughput. The
+# count is recorded in the data directory on first boot, and a later value
+# that disagrees with the record is refused rather than served because ids
+# route by shard.
+shard_count = 4
 
 [shard]
 # 1 GiB arena per shard ≈ 660K vectors at 1600 B/slot.
 # Override via BRAIN__SHARD__ARENA_CAPACITY_BYTES=4GiB at runtime.
-arena_capacity_bytes    = "1GiB"
-wal_segment_size_bytes  = "64MiB"
-wal_retention_segments  = 16        # 1 GiB WAL retention per shard
+arena_capacity_bytes = "1GiB"
+wal_segment_size_bytes = "64MiB"
+wal_retention_segments = 16      # 1 GiB WAL retention per shard
 
 [hnsw]
 # Defaults trade recall against latency and memory; change deliberately.
-m              = 16
+m = 16
 ef_construction = 200
-ef_search      = 64
+ef_search = 64
 # ef_factor: derive the search beam from the requested `k` when a query
 # gives no explicit `ef` — the beam becomes max(ef_search, k * ef_factor).
-# Range 1..=16. Default 1 = `ef_search` alone decides the beam, which is
-# what every release before this field did.
+# Range 1..=16. Default 1 = `ef_search` alone decides the beam.
 #
 # Why it exists: at these defaults ef_search and DEFAULT_TOP_K are both 64,
 # so ef == k — the search barely explores past the results it is about to
@@ -64,10 +76,10 @@ ef_search      = 64
 # BRAIN_EMBED_MODEL_DIR already points at. There is no download path and
 # no egress at boot; to run a different BERT-shaped model, mount it and
 # override that variable.
-model            = "bge-small-en-v1.5"
-cache_size       = 10000
-batch_size       = 32
-batch_window_ms  = 5
+model = "bge-small-en-v1.5"
+cache_size = 10000
+batch_size = 32
+batch_window_ms = 5
 
 # There is no [llm] provider key, here or anywhere: each namespace registers
 # its own at run time through LLM_CREDENTIAL_PUT and Brain seals it in the
@@ -83,6 +95,14 @@ batch_window_ms  = 5
 # one: HyPE and extraction both need it, so storing the memory would leave it
 # ungrounded. See config/dev.toml's [llm] block for the full explanation.
 
+# The one [llm] field an operator may set is the model id extraction falls
+# back to when a registered credential does not name one. Unset by default,
+# in which case the credential's own model decides.
+# [llm]
+# model = "gpt-4o-mini"
+#
+#   -e BRAIN__LLM__MODEL=gpt-4o-mini
+
 [admin]
 # Operator admin secret gating the /v1/* admin HTTP plane (key mint /
 # revoke / stats). The admin listener refuses to start without it. Override
@@ -90,76 +110,202 @@ batch_window_ms  = 5
 token = "docker-admin-token"
 
 [monitoring.logging]
-level  = "info"
+level = "info"
 output = "stdout"
 format = "json"   # Loki / Elastic / CloudWatch ingest cleanly.
 
 [monitoring.tracing]
-# Disabled in the in-image default. Compose stack flips this on
-# via BRAIN__MONITORING__TRACING__ENABLED=true and points at the in-stack
-# OTel collector. For a standalone container, set:
+# Off in the image default: span export belongs to the deployment, not to
+# the artifact. To turn it on, point it at your collector:
 #   -e BRAIN__MONITORING__TRACING__ENABLED=true
 #   -e BRAIN__MONITORING__TRACING__ENDPOINT=http://your-collector:4318/v1/traces
-enabled       = false
-sampler       = "ratio"
-sample_ratio  = 0.01
-endpoint      = ""
-service_name  = "brain-server"
+# An empty endpoint with tracing on falls back to the OTLP convention
+# default, http://localhost:4318/v1/traces.
+enabled = false
+sampler = "ratio"
+sample_ratio = 0.01
+endpoint = ""
+service_name = "brain-server"
 
 [workers]
-# Background worker cadence defaults. Each value is seconds; 0 disables the worker.
-# Most operators never touch these.
-consolidation_interval_sec         = 600
-hnsw_maintenance_interval_sec      = 1800
-idempotency_cleanup_interval_sec   = 3600
-slot_reclamation_interval_sec      = 3600
-wal_retention_interval_sec         = 600
-edge_scrub_interval_sec            = 86400
-counter_reconciliation_interval_sec = 86400
-statistics_update_interval_sec     = 60
-embedder_cache_eviction_interval_sec = 300
-snapshot_interval_sec              = 21600
+# Maintenance-worker cadences, in seconds: the sleep between one worker's
+# cycles. A worker takes its cadence when it is registered and keeps it for the
+# life of the process, so changing one of these needs a restart. Omitting a key
+# leaves the built-in cadence in place. Each value must be >= 1; a zero is
+# refused at boot. Most operators never touch these.
+#
+# `access_boost` is an eleventh maintenance worker with no key here — its tick is
+# a property of the build.
+#
+# `hnsw_maintenance_interval_sec` is how often a shard's tombstone ratio is
+# CHECKED, not how often the index is reclaimed. Above 0.30 the check rebuilds
+# the index there and then; between 0.15 and 0.30 it only records that a
+# rebuild is due, so a workload sitting in that band reclaims nothing however
+# often it is checked.
+consolidation_interval_sec = 300
+hnsw_maintenance_interval_sec = 300
+idempotency_cleanup_interval_sec = 3600
+slot_reclamation_interval_sec = 600
+wal_retention_interval_sec = 60
+edge_scrub_interval_sec = 1800
+counter_reconciliation_interval_sec = 3600
+statistics_update_interval_sec = 300
+embedder_cache_eviction_interval_sec = 60
+snapshot_interval_sec = 3600
 
-# Phase B: per-shard AutoEdgeWorker. Derives SimilarTo edges from
+# per-shard AutoEdgeWorker. Derives SimilarTo edges from
 # HNSW knn after each ENCODE. Every field defaults if the section
 # is omitted; commented overrides shown for visibility.
 [workers.auto_edge]
-enabled              = true
-interval_ms          = 100
-batch_size           = 256
+enabled = true
+interval_ms = 100
+batch_size = 256
 similarity_threshold = 0.85
-top_k                = 5
-ef_search            = 64
-channel_capacity     = 1024
+top_k = 5
+ef_search = 64
+channel_capacity = 1024
 
-# Phase E: per-shard ExtractorWorker. See dev.toml for full field
+# per-shard ExtractorWorker. See dev.toml for full field
 # documentation.
 [workers.extractor]
-interval_ms                      = 1000
-drain_per_cycle                  = 32
-llm_budget_per_cycle_micro_usd   = 50000
-channel_capacity                 = 1024
-skip_already_extracted           = true
+interval_ms = 1000
+drain_per_cycle = 32
+# Memories bundled into one classifier forward pass. The GLiNER backbone GEMM
+# dominates per-encode latency; 8 amortises it to roughly a fifth of the
+# per-memory cost on a CPU host. Bounded above by drain_per_cycle — a micro-batch
+# is min(batch_size, the cycle's remaining budget). Per shard, so the four shards
+# above each get their own batch rather than sharing this one.
+batch_size = 8
+channel_capacity = 1024
+skip_already_extracted = true
+# Re-extract a namespace's already-committed memories on a new schema upload.
+# Policy: off, because one SCHEMA_UPLOAD against a large corpus becomes one paid
+# LLM call per affected memory with no operator in the loop. POST
+# /v1/extract/backfill runs the same work deliberately.
+reextract_on_schema_change = false
+# Apply/gate infra-failure attempts one memory gets before extraction is
+# abandoned with a durable FAILURE audit row. Policy; the same per-item cap the
+# backfill worker gives up at, so both paths abandon together.
+max_apply_attempts_per_memory = 3
+# How recently an LLM call must have succeeded on this shard for a later
+# transient failure to be charged to the memory rather than to the provider.
+# Policy; what keeps a provider outage from spending every queued memory's
+# per-item budget.
+provider_reachable_window_ms = 900000
+# Transient failures charged to the memory itself before extraction is
+# abandoned. Policy; small because the same text fails the same way next time.
+max_item_attributable_failures = 5
+# Absolute ceiling on attempts for one memory, provider-charged failures
+# included. Derived: outage coverage ÷ the capped retry interval — 48h ÷ 1h.
+max_transient_attempts = 48
 
 [workers.temporal_edge]
-enabled                          = true
-interval_ms                      = 100
-batch_size                       = 256
-window_seconds                   = 300
-weight_min                       = 0.1
-channel_capacity                 = 1024
-cross_session                    = false
+enabled = true
+interval_ms = 100
+batch_size = 256
+# Temporal window: how far back a predecessor may be and still earn a
+# `FollowedBy` edge, and the span the decay weight is measured against.
+# 30 minutes covers the natural pauses inside one conversational session,
+# so consecutive turns stay chained instead of fragmenting.
+window_seconds = 1800
+weight_min = 0.1
+channel_capacity = 1024
+cross_session = false
+# Cosine floor for the topical gate: below it a candidate predecessor is dropped,
+# so adjacency alone cannot chain unrelated memories. Policy, deliberately
+# permissive — it cuts unrelated pairs rather than re-ranking related ones.
+topical_threshold = 0.4
 
 [workers.causal_edge]
-enabled                                  = true
-interval_ms                              = 200
-batch_size                               = 64
-min_confidence                           = 0.6
-whitelist_qnames                         = ["brain:caused_by", "brain:triggered", "brain:led_to", "brain:resulted_in", "brain:because_of"]
-max_effect_memories_per_statement        = 3
-max_cause_memories_per_statement         = 3
-max_related_statements_per_entity        = 5
-channel_capacity                         = 1024
+enabled = true
+interval_ms = 200
+batch_size = 64
+min_confidence = 0.6
+whitelist_qnames = [
+  "brain:caused_by",
+  "brain:triggered",
+  "brain:led_to",
+  "brain:resulted_in",
+  "brain:because_of",
+]
+max_effect_memories_per_statement = 3
+max_cause_memories_per_statement = 3
+max_related_statements_per_entity = 5
+channel_capacity = 1024
+
+# Per-shard retracted-statement GC. Hard-deletes retracted statement rows,
+# and their secondary-index and evidence-overflow entries, once the grace
+# window has elapsed. Off — a retracted row is invisible to retrieval
+# regardless, so this only reclaims disk.
+# [workers.statement_reclaim]
+# enabled = false
+# grace_seconds = 2592000   # 30 days
+# period_seconds = 86400    # 1 day sweep cadence
+
+# Per-shard coined-predicate GC. Reclaims ImplicitFromWrite predicates that no
+# live statement references; schema-declared predicates are never touched. Off —
+# those unreferenced names are the shortlist worth promoting into a schema.
+# [workers.predicate_gc]
+# enabled = false
+# grace_seconds = 604800    # 7 days: coining a name and the statement that uses
+#                           # it landing are not the same moment
+# period_seconds = 86400    # 1 day sweep cadence
+# dry_run = false           # true logs the candidates and deletes nothing
+
+# Per-shard superseded-statement GC. Off — a superseded row is filtered from
+# every read regardless, so this only reclaims disk.
+# [workers.supersession_sweeper]
+# enabled = false
+# retention_seconds = 0     # 0 = eligible the moment it is superseded; set a
+#                           # window before arming this
+# period_seconds = 86400    # 1 day sweep cadence
+# dry_run = false           # true logs the candidates and deletes nothing
+
+# Low-cost metadata maintenance sweeps, on unless an operator opts out. Each
+# re-reads rows the write path already wrote: merge proposals re-scored as the
+# entity HNSW grows, Statement confidence recomputed so aged evidence stops
+# over-ranking, and expired LLM-cache rows deleted so that file stays bounded.
+# [workers.ambiguity_resolver]
+# enabled = true
+# interval_secs = 3600      # 1 hour
+# [workers.confidence_sweep]
+# enabled = true
+# interval_secs = 3600      # 1 hour
+# [workers.llm_cache_sweep]
+# enabled = true
+# interval_secs = 3600      # 1 hour
+
+# Lexical (tantivy) index group commit — whichever threshold trips first
+# bounds how long a written memory stays unsearchable in the lexical lane.
+# Per shard, so each of the four shards above commits on its own counter.
+# [index]
+# tantivy_commit_n = 256    # commit after N queued writes
+# tantivy_commit_ms = 1000  # commit after T milliseconds
+
+# Deploy-time read-path tuning. Every field defaults to the value shown and
+# the section may be omitted; see dev.toml for full field documentation.
+[retrieval]
+# Rank-fusion strategy: "rrf" (score-scale-invariant), "relative", "zscore".
+fusion_method = "rrf"
+# HyPE joins the semantic lane as its own RRF rank list rather than a
+# non-displacing append.
+hype_rrf = false
+# Scale the memory probe's ef_search by index occupancy.
+ef_occupancy_scaling = false
+# Relative-drop autocut of the ranked result tail.
+autocut = false
+
+# Calibrated precision on the read path: how much cross-lane agreement a RECALL
+# answer must carry before it commits rather than abstains. Both floors sit at 0,
+# which never abstains and never trims. Policy: whether a wrong answer reads worse
+# than no answer is measured per corpus, so the image's value declines to decide
+# it.
+[precision]
+# Minimum cross-lane support (0..=5) the uncommitted lead must carry to commit.
+commit_min_support = 0
+# Minimum support a member needs to join a Many answer's committed set rather
+# than stay as retained context.
+many_min_support = 0
 
 [analytics]
 # Columnar snapshot + DataFusion scans for MEMORY_AGGREGATE requests the live
@@ -201,11 +347,40 @@ backend = "disabled"
 # there is no per-tier on/off gate.
 [extractors.classifier]
 # The GLiNER NER model ships inside the image. Set explicitly rather than
-# left to XDG auto-discovery: with HOME=/var/lib/brain and XDG_DATA_HOME
-# unset, discovery resolves to /var/lib/brain/.local/share/brain/models/,
-# a path nothing mounts and no operator would guess. Leaving it implicit is
-# what left the classifier tier silently unloaded in v0.1.0.
+# left to XDG auto-discovery, which resolves against the runtime user's
+# home and lands on a path nothing mounts — the classifier tier then loads
+# nothing and extraction quietly drops a whole tier.
 #
 # Point this at your own directory to use a different GLiNER build; it must
 # contain pytorch_model.bin, gliner_config.json, tokenizer.json, config.json.
 model_path = "/opt/brain/models/gliner-small-v2.1"
+
+# GLiNER post-sigmoid acceptance floor for a candidate span. Lower admits
+# more spans and more noise; the LLM tier and the resolver gauntlet are what
+# a loose floor then has to be filtered by.
+# threshold = 0.5
+
+# Entity-resolution gauntlet. Tier-3 cosine floor for matching a mention
+# against an existing entity's aliases: below it the mention opens a new
+# entity rather than merging into a near neighbour.
+# [extractors.resolver]
+# embed_threshold = 0.78
+
+# The LLM tier is always-on; this only sizes its calls.
+[extractors.llm]
+# Output-token ceiling for one extraction call. The tier asks for a memory's
+# whole typed graph as a single JSON document, so the ceiling scales with how
+# much the memory says, not how long it is — and hitting it truncates the JSON
+# mid-token, landing the memory with entities but no statements and no
+# relations. 4096 fits a dense paragraph (eight entities with their statements
+# and relations) with headroom. Raise it when `response truncated at max_tokens`
+# appears in the extractor log, and raise it further on a reasoning model, whose
+# thinking tokens come out of this same budget.
+max_tokens = 4096
+
+# Write-time hypothetical-question generation. Mandatory and always-on —
+# there is no enable/disable flag, and the credential resolves per namespace
+# from the credential store like the LLM tier. num_questions sizes each
+# call's output and the per-memory question vectors it adds to the index.
+# [extractors.hype]
+# num_questions = 6

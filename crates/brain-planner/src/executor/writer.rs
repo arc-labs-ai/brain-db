@@ -127,21 +127,41 @@ pub enum EdgeOutcome {
 
 #[derive(Debug, Error)]
 pub enum WriterError {
-    /// queue over its max length → reject + retry.
-    #[error("writer queue overloaded")]
-    Overloaded,
+    /// The write referenced a row that does not exist. `what` names the
+    /// kind of row — `"memory"`, `"entity"`, `"subject entity"`,
+    /// `"statement"`, `"predicate"` — and the wire layer routes on it to
+    /// pick the precise not-found error code.
+    #[error("{what} not found: {detail}")]
+    NotFound { what: &'static str, detail: String },
     /// The request conflicts with committed state and cannot succeed on a
     /// retry. Two causes reach here: a duplicate `request_id` carrying a
     /// different `request_hash` (client bug or RequestId reuse), and a write
     /// refused by a uniqueness invariant such as a duplicate canonical name.
     ///
-    /// The display is deliberately neutral — it used to hard-code
-    /// "idempotency conflict", which labelled every canonical-name collision
-    /// as an idempotency problem. Each call site names its own cause.
+    /// The display is deliberately neutral: hard-coding "idempotency
+    /// conflict" here would label every canonical-name collision as an
+    /// idempotency problem. Each call site names its own cause.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The write asks for something the engine refuses on its own terms: a
+    /// relation type the active schema does not declare, an endpoint whose
+    /// entity type the relation type forbids, or a supersede whose type or
+    /// endpoints do not match the row it replaces. The caller fixes it by
+    /// changing the request; the identical bytes are refused every time, so
+    /// the wire layer must mark it non-retryable rather than as a fault of
+    /// ours.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("writer internal error: {0}")]
     Internal(String),
+    /// The shard's write-ahead log is in its terminal broken state: a
+    /// durability failure has latched for the life of the process, so this
+    /// write and every later one fails until an operator restarts the shard.
+    /// Separate from `Internal` because the wire marks this one non-retryable.
+    /// `detail` carries the underlying failure for the server log and is
+    /// deliberately kept out of the `Display` the client sees.
+    #[error("shard storage is terminally faulted: this shard's write-ahead log can no longer be written, so every write will fail until an operator restarts the shard process; retrying will not help")]
+    StorageFaulted { detail: String },
 }
 
 /// Forget operation payload.

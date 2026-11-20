@@ -22,7 +22,7 @@ in production, `block_on` in tests); every plan type is `Send + Sync`.
 | Module | Role |
 |---|---|
 | `plan` | Plan tree: `ExecutionPlan` + per-op plan structs (`EncodePlan`, `RecallPlan`, `PathPlan`, `ReasonPlan`, `ForgetPlan`) and step types. |
-| `planner` | Per-op planners (`plan_encode`, `plan_recall`, `plan_path`, `plan_reason`, `plan_forget`). |
+| `planner` | Per-op planners (`plan_encode`, `plan_path`, `plan_reason`, `plan_forget`). |
 | `cost` | Cost model consulting `ShardStats`; enforces the cost budget. |
 | `executor` | Runs plans: `execute_recall`/`execute_reason`/`execute_path` (+ streaming variants), writer handoff, result types. |
 | `retrieval` | Fused read pipeline — fusion, filters, router, rerank stage. |

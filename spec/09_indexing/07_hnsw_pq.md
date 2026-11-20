@@ -277,7 +277,7 @@ The arena snapshot is **not** re-trained; the codebook from the current epoch is
 
 Read side: identical to the lock-free model in §09.04. The current `MainEpoch` (Arc-swapped) carries either pure HNSW or PQ HNSW; readers don't branch on which.
 
-Write side: the single-writer invariant (§09.04 §2) holds. PQ encoding happens inside the writer task before the pending push; no additional synchronisation.
+Write side: the single-writer invariant (§09.04 §1) holds. PQ encoding happens inside the write submission, before the pending push, in the same await-free region as the push itself; no additional synchronisation.
 
 Codebook updates (epoch rebuild) follow the existing snapshot-then-swap pattern. Readers mid-flight on the old epoch see the old codebook + old graph + old SDC; readers that observe the new epoch see all three new. The two states never interleave because both are reached via the same `ArcSwap::store`.
 

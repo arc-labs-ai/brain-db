@@ -6,10 +6,12 @@
 //!   can run `perf record` against the server PID.
 //! - `GET /v1/diagnostics/debug-snapshot?shard=N` → 200 + JSON.
 //!   Populates `workers` (from `scheduler_snapshot`), `pending_requests`
-//!   (the shard's dispatch-queue depth), and `in_memory_state_summary`
-//!   (HNSW + arena/WAL/metadata counters). The two fields still in
-//!   `deferred[]` — `active_tasks` and `recent_errors` — need runtime
-//!   primitives that do not exist yet (see the module for the design).
+//!   (the shard's dispatch-queue depth), `derivation_queue` (the durable
+//!   extraction backlog — a different queue from `pending_requests`),
+//!   and `in_memory_state_summary` (HNSW + arena/WAL/metadata counters).
+//!   The two fields still in `deferred[]` — `active_tasks` and
+//!   `recent_errors` — need runtime primitives that do not exist yet
+//!   (see the module for the design).
 
 mod debug_snapshot;
 mod profile;

@@ -134,7 +134,7 @@ To list an space's memories: a range scan of `memories` by MemoryId range corres
 
 Note — looking at the MemoryId layout ([02.02 Memory](../02_data_model/02_memory.md)) — MemoryIds are not strictly space-clustered. The shard_id_runtime is in the high bits, then slot_id, then slot_version. So MemoryIds within a shard are slot-id-ordered (which is roughly creation-time-ordered).
 
-To list an space's memories, an auxiliary index would be required. Brain does not currently have one in the table layout above; an `(SpaceId, MemoryId) → ()` index table would need to be added. This is a [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) item.
+To list an space's memories, an auxiliary index would be required. Brain does not currently have one in the table layout above; an `(SpaceId, MemoryId) → ()` index table would need to be added. This is an open question.
 
 In v1, listing an space's memories means scanning all memories in the shard and filtering by space_id. For shards with thousands of spaces, this is wasteful. For shards with one or few spaces per shard, it's fine.
 
@@ -217,11 +217,9 @@ For comparison, the vector arena at 10M memories is 15 GB. The metadata table is
 
 ### 9. Cross-version compatibility
 
-The row's binary layout is rkyv-encoded. Adding fields requires:
-- Bumping the table's schema version.
-- A migration that rewrites existing rows in the new format.
+The row's binary layout is rkyv-encoded, so a row written against a different field set does not decode. Adding a field therefore bumps the one storage format version the file carries (see [`02_table_layout.md`](02_table_layout.md) §6).
 
-Migrations are run lazily (per-row on access) or eagerly (full-table scan on startup), depending on the migration type. See [03.05 Schema Versioning](../03_schema/05_versioning.md).
+There is no migration — not lazily per row, not eagerly on startup. A file stamped with any version other than the current one is refused at open, and a bump means a fresh data directory.
 
 ### 10. The "fresh memory" lifecycle
 
@@ -382,21 +380,20 @@ Sizing scales linearly with edge count. Heavily-connected memories (lots of REFE
 
 ### 11. Edge limits
 
-To prevent pathological cases (a memory with millions of edges), Brain enforces:
+There is **no** per-memory cap on edge count, in either direction or per kind. `edges_out_count` and `edges_in_count` on the memory row are maintained as counters, not as budgets — nothing reads them to refuse a write.
 
-- Per-memory soft limit on outgoing edges per kind: 10K (configurable).
-- Per-memory hard limit on outgoing edges per kind: 100K (configurable).
-- Per-encode limit: 64 edges per ENCODE operation.
+The one edge-count bound is per request: `ENCODE_VECTOR_DIRECT` carries an inline edge list and accepts at most `max_edges_per_encode` (64) entries. Client `ENCODE` carries no edges at all, so there is nothing to cap there; explicit edges arrive one at a time through `LINK`, and derived edges are the write pipeline's business.
 
-Beyond the soft limit, LINK operations log a warning. Beyond the hard limit, they fail with `TooManyEdges`.
+What bounds a *read* of a large edge set is the reading verb, not the store. `MEMORY_INSPECT` returns at most 256 per direction and reports `edge_total_count` / `edges_truncated` so a caller can tell a partial view from a complete one; `GRAPH_FETCH` paginates the whole set. See [`../04_wire_protocol/05_frame_layouts.md`](../04_wire_protocol/05_frame_layouts.md) §63.
 
 ### 12. Multi-edges
 
-Are duplicate (source, kind, target) edges allowed? No. The composite key is a unique key.
+Whether two rows can share a `(from, kind, to)` triple depends on the kind, because the fourth key component — the 16-byte disambiguator — is what distinguishes them.
 
-A second LINK with the same key updates the existing edge's data (weight, etc.) rather than creating a duplicate. This is the natural behavior of B-tree insertion.
+- **Builtin** memory↔memory kinds and **Mentions** pass a zero disambiguator. The triple is therefore the whole key, and it is unique: a second `LINK` with the same triple overwrites the existing row's `EdgeData` (weight, origin, timestamp, annotation) rather than creating a duplicate. This is the natural behavior of B-tree insertion.
+- **Typed** relations pass the `RelationId`'s bytes as the disambiguator. Two relations of the same type between the same pair of entities are two distinct rows, each addressable by its own relation id — which is what lets a relation carry its own properties, evidence and supersession history.
 
-For applications that want multi-edges (e.g., multiple instances of REFERENCES with different annotations), Brain doesn't support that directly. Workaround: encode the differentiator into the kind (e.g., `REFERENCES_v1`, `REFERENCES_v2`).
+So multi-edges exist exactly where a record identity exists to hang them on. A memory↔memory edge is a fact about a pair with no identity of its own; a typed relation is a record.
 
 ### 13. Edges and memory deletion
 
@@ -531,7 +528,7 @@ There is no per-space session cap. `session_id` is the client's `u64`, not a ser
 
 Nothing in these tables is renameable. A space's string is the input its id was derived from — changing it would derive a different space, which is a different space. A session's `title` is display metadata set at create time.
 
-The admin ops `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` are a separate operator surface that carries a `name`; they are admin-gated and not part of the tenant-facing registry.
+`SESSION_CREATE` carries the optional `title` itself and is `act_as`-aware, so naming a session is tenant-facing, not an operator privilege. The `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` opcodes that once held that job are refused on the wire, and nothing renames a session on either plane.
 
 ### 9. Deletion
 
@@ -780,7 +777,7 @@ Currently, Brain enforces idempotency-required for:
 
 For these operations, RequestId is mandatory. The wire protocol's validation checks for it.
 
-For RECALL, PLAN, REASON, ADMIN_*, RequestId is optional. If supplied, it's recorded for observability; if not, the operation proceeds without a RequestId.
+For RECALL, PLAN, REASON and the one served admin op, RequestId is optional. If supplied, it's recorded for observability; if not, the operation proceeds without a RequestId.
 
 ## Text Storage
 

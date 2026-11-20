@@ -197,7 +197,7 @@ In clustered deployment, shards may live in different processes on different mac
 
 A shard's lifecycle:
 
-- **Created** when Brain is initialized (or via `ADMIN_SHARD_CREATE`).
+- **Created** when Brain is initialized (or via `POST /v1/shards`). The count a data directory was created with is recorded in its `layout.json` and checked on every later boot, because memory ids route by shard.
 - **Active** during normal operation.
 - **Maybe migrated** between nodes (in clustered mode).
 - **Maybe split** if it grows too large.

@@ -115,15 +115,17 @@ Some features can degrade gracefully:
 
 These don't break operations; they just stop progress on background work.
 
-## 10. The "shed load" partial response
+## 10. Overload is queueing, not shedding
 
-Under heavy load, Brain may return Overloaded for some operations:
+Under heavy load Brain queues; it does not reject requests to protect itself.
 
-- Writes shed first (less critical for reads).
-- Cross-shard operations shed before single-shard.
-- Background work pauses.
+- A shard admits a bounded number of concurrent dispatches. Once the permits are out, the shard parks on its receive channel and requests wait there, served in arrival order.
+- Parking the receive parks every request kind on that shard, cheap ones included. In-order service of a saturated shard is preferred to a second scheduling lane with unreasoned starvation behavior.
+- Background work yields rather than pausing outright: workers run on a separate task queue with a minority share (250 against the request lane's 1000), so under contention they get roughly a fifth of the core and the request path gets the rest.
 
-Clients see Overloaded for shed operations. This is partial-success: Brain is still operational, but capacity is limited.
+Clients see latency, not errors. There is no write or read load-shedder and no general `Overloaded` response: the error code exists, but it is raised only on the SUBSCRIBE path — stream-id exhaustion, the per-server subscriber limit, and consumers too slow to keep up with their change feed.
+
+That is a deliberate trade. Shedding converts a capacity problem into a correctness problem for the caller, who must now decide what a dropped write means. Queueing keeps the answer simple: the write happens, late.
 
 ## 11. Embedder failure isolation
 

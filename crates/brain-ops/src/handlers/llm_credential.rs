@@ -42,6 +42,7 @@ use crate::error::OpError;
 /// would seal successfully and then fail every extraction, so it is rejected
 /// at registration instead.
 const SUPPORTED_PROVIDERS: [&str; 2] = ["openai", "anthropic"];
+const MIN_API_KEY_LEN: usize = 8;
 
 /// Reach the credential store, or explain that this deployment has none.
 fn credentials(
@@ -62,8 +63,8 @@ fn storage_error(e: LlmCredentialError) -> OpError {
 ///
 /// # Errors
 /// `Unauthorized` over a non-confidential connection; `InvalidRequest` for an
-/// unsupported provider, an empty model, or an empty key; `NotYetImplemented`
-/// `Internal` on a storage or sealing failure.
+/// unsupported provider, an empty model, or a key that is too short;
+/// `NotYetImplemented` `Internal` on a storage or sealing failure.
 pub fn handle_llm_credential_put(
     req: LlmCredentialPutRequest,
     caller: &RequestCaller,
@@ -89,10 +90,13 @@ pub fn handle_llm_credential_put(
     if model.is_empty() {
         return Err(OpError::InvalidRequest("`model` must not be empty".into()));
     }
-    if req.api_key.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "`api_key` must not be empty".into(),
-        ));
+    // Eight characters keeps the existing four-character fingerprint from
+    // revealing most of an accepted key, while real provider keys and this
+    // repository's placeholder fixtures are substantially longer.
+    if req.api_key.len() < MIN_API_KEY_LEN {
+        return Err(OpError::InvalidRequest(format!(
+            "`api_key` must be at least {MIN_API_KEY_LEN} characters long"
+        )));
     }
     // Surrounding whitespace on a key is almost always a copy-paste artifact.
     // It would seal verbatim and then fail upstream with an opaque 401 that

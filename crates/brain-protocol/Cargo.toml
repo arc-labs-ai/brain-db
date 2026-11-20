@@ -14,9 +14,9 @@ crc32c.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
 uuid.workspace = true
-# 17.6: SmallVec used by Statement / EvidenceRef projections.
+# SmallVec used by Statement / EvidenceRef projections.
 smallvec.workspace = true
-# 19.2: serde + serde_json used by the value-typed schema AST (§21/02).
+# serde + serde_json used by the value-typed schema AST.
 serde = { workspace = true }
 # Encodes fixed `[u8; N]` UUID-shaped wire fields as CBOR byte strings.
 serde_bytes.workspace = true
@@ -24,7 +24,7 @@ serde_bytes.workspace = true
 ciborium.workspace = true
 serde_repr.workspace = true
 serde_json = { workspace = true }
-# 19.3: pest-based parser for the schema DSL (§21/01).
+# pest-based parser for the schema DSL.
 pest = { workspace = true }
 pest_derive = { workspace = true }
 

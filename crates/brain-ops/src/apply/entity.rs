@@ -9,9 +9,10 @@
 //! - apply_merge_entities        — entity_merge_ops::merge_entity
 
 use brain_core::{Entity, EntityAttributes, EntityId};
+use brain_metadata::entity::merge::EntityMergeOpError;
 use brain_metadata::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
-    normalize_name,
+    normalize_name, EntityOpError,
 };
 use brain_metadata::entity::review::{proposal_get_inside_wtxn, update_proposal_status};
 use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
@@ -20,6 +21,36 @@ use redb::{ReadableTable, WriteTransaction};
 
 use super::ApplyError;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write};
+
+/// Classify an [`EntityOpError`] for the wire. A missing row and a
+/// canonical-name collision are both the caller's request against
+/// committed state; the rest are the engine's own faults.
+fn entity_op_err(ctx: &'static str, e: EntityOpError) -> ApplyError {
+    use brain_metadata::entity::ops::EntityOpError as E;
+    let detail = format!("{ctx}: {e}");
+    match e {
+        E::NotFound(_) => ApplyError::NotFound {
+            what: "entity",
+            detail,
+        },
+        E::DuplicateCanonicalName { .. } => ApplyError::Conflict(detail),
+        _ => ApplyError::Metadata(detail),
+    }
+}
+
+/// Classify an [`EntityMergeOpError`] for the wire, delegating the
+/// forwarded entity-op case so both paths agree on one classification.
+fn entity_merge_op_err(ctx: &'static str, e: EntityMergeOpError) -> ApplyError {
+    let detail = format!("{ctx}: {e}");
+    match e {
+        EntityMergeOpError::EntityNotFound(_) => ApplyError::NotFound {
+            what: "entity",
+            detail,
+        },
+        EntityMergeOpError::EntityOp(inner) => entity_op_err(ctx, inner),
+        _ => ApplyError::Metadata(detail),
+    }
+}
 
 /// Tenant wall for an entity mutation. Loads the primary row inside the
 /// wtxn and confirms it belongs to the caller's `(namespace, space)`
@@ -36,10 +67,10 @@ fn entity_scope_guard(
     let row: Option<EntityMetadata> = {
         let t = wtxn
             .open_table(ENTITIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open entities: {e}")))?;
+            .map_err(|e| ApplyError::storage("open entities", &e))?;
         let got = t
             .get(&id.to_bytes())
-            .map_err(|e| ApplyError::Storage(format!("entity lookup: {e}")))?;
+            .map_err(|e| ApplyError::storage("entity lookup", &e))?;
         got.map(|g| g.value())
     };
     let caller = brain_metadata::RowScope::new(write.namespace, write.space_id);
@@ -97,21 +128,7 @@ pub fn apply_upsert_entity(
     let e = entity_from_upsert_phase(phase)
         .ok_or(ApplyError::PhaseMisShape("expected UpsertEntity"))?;
     let id = e.id;
-    entity_put(wtxn, scope, *session, &e).map_err(|err| {
-        // A canonical name already held by a different id is the caller's
-        // request conflicting with committed state, not an engine fault.
-        // Flattened into `Metadata` it reached the client as a 500/502, and
-        // a client that trusts the status retries a write that is refused
-        // every time.
-        if matches!(
-            err,
-            brain_metadata::entity::ops::EntityOpError::DuplicateCanonicalName { .. }
-        ) {
-            ApplyError::Conflict(format!("entity_put: {err}"))
-        } else {
-            ApplyError::Metadata(format!("entity_put: {err}"))
-        }
-    })?;
+    entity_put(wtxn, scope, *session, &e).map_err(|e| entity_op_err("entity_put", e))?;
     // Write-path trace: which entity (canonical name) was minted/updated.
     // Subject resolution at read time keys on this canonical name, so a read
     // miss often traces back to a name that was never written this way.
@@ -143,7 +160,7 @@ pub fn apply_tombstone_entity(
     };
     entity_scope_guard(wtxn, *id, write)?;
     entity_tombstone(wtxn, *id, *at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("entity_tombstone: {e}")))?;
+        .map_err(|e| entity_op_err("entity_tombstone", e))?;
     Ok(PhaseAck::Tombstoned {
         target: *target,
         tombstoned_at_unix_nanos: *at_unix_nanos,
@@ -183,7 +200,7 @@ pub fn apply_merge_entities(
         *grace_seconds,
         *at_unix_nanos,
     )
-    .map_err(|e| ApplyError::Metadata(format!("merge_entity: {e}")))?;
+    .map_err(|e| entity_merge_op_err("merge_entity", e))?;
     Ok(PhaseAck::EntityMerged {
         source: *source,
         target: *target,
@@ -221,8 +238,7 @@ pub fn apply_update_entity(
     next.aliases = aliases.clone();
     next.attributes = EntityAttributes::from(attributes_blob.clone());
 
-    entity_update(wtxn, &next, *at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("entity_update: {e}")))?;
+    entity_update(wtxn, &next, *at_unix_nanos).map_err(|e| entity_op_err("entity_update", e))?;
 
     let persisted = entity_get_inside_wtxn(wtxn, *id)
         .map_err(|e| ApplyError::Metadata(format!("entity_get post-update: {e}")))?
@@ -257,7 +273,7 @@ pub fn apply_rename_entity(
     let old_canonical_name = current.canonical_name.clone();
 
     entity_rename(wtxn, *id, new_canonical_name.clone(), *at_unix_nanos)
-        .map_err(|e| ApplyError::Metadata(format!("entity_rename: {e}")))?;
+        .map_err(|e| entity_op_err("entity_rename", e))?;
 
     let persisted = entity_get_inside_wtxn(wtxn, *id)
         .map_err(|e| ApplyError::Metadata(format!("entity_get post-rename: {e}")))?
@@ -353,7 +369,7 @@ pub fn apply_approve_merge_with_status(
         grace_seconds,
         at_unix_nanos,
     )
-    .map_err(|e| ApplyError::Metadata(format!("merge_entity: {e}")))?
+    .map_err(|e| entity_merge_op_err("merge_entity", e))?
     .merge_id;
     update_proposal_status(
         wtxn,
@@ -427,7 +443,7 @@ pub fn apply_unmerge_entities(
     entity_scope_guard(wtxn, *merged, write)?;
     let survivor =
         brain_metadata::entity::merge::unmerge_entity(wtxn, *merged, *actor, *at_unix_nanos)
-            .map_err(|e| ApplyError::Metadata(format!("unmerge_entity: {e}")))?;
+            .map_err(|e| entity_merge_op_err("unmerge_entity", e))?;
 
     Ok(PhaseAck::EntitiesUnmerged {
         restored: *merged,
@@ -687,5 +703,36 @@ mod tenant_wall_tests {
             got.flags & brain_metadata::tables::entity::flags::TOMBSTONED,
             0
         );
+    }
+
+    #[test]
+    fn entity_faults_are_classified_for_the_wire() {
+        assert!(matches!(
+            entity_op_err(
+                "entity_update",
+                brain_metadata::entity::ops::EntityOpError::NotFound(EntityId::new())
+            ),
+            ApplyError::NotFound { what: "entity", .. }
+        ));
+        assert!(matches!(
+            entity_op_err(
+                "entity_put",
+                brain_metadata::entity::ops::EntityOpError::DuplicateCanonicalName {
+                    type_id: brain_core::EntityTypeId::from(1),
+                    name: "Alice".into(),
+                    existing: EntityId::new(),
+                }
+            ),
+            ApplyError::Conflict(_)
+        ));
+        assert!(matches!(
+            entity_op_err(
+                "entity_update",
+                brain_metadata::entity::ops::EntityOpError::Storage(
+                    redb::StorageError::DatabaseClosed
+                )
+            ),
+            ApplyError::Metadata(_)
+        ));
     }
 }

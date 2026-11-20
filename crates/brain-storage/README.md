@@ -16,6 +16,11 @@ It also provides the **crash-recovery** replay engine that re-applies the WAL
 into downstream sinks. This is the only crate in the workspace allowed to use
 `unsafe`, and only for memory-mapping.
 
+The arena is a boot-time image rather than a live mirror of the index: WAL
+replay is what writes a memory's vector into its slot, so the arena a running
+process reads is the one recovery built at open. That is what makes the WAL,
+not the arena, the thing a write has to reach to be durable.
+
 ## Key modules
 
 | Module | Purpose |
@@ -24,6 +29,7 @@ into downstream sinks. This is the only crate in the workspace allowed to use
 | `wal` | Per-shard write-ahead log: segments, group commit, CRC32C/LSN records. |
 | `recovery` | WAL replay engine and the `MetadataSink` trait that downstream sinks implement. |
 | `layout` | On-disk path layout (`ShardPaths`, `ensure_dirs`). |
+| `reflink` | Copy-on-write file cloning via the Linux `FICLONE` ioctl, with a byte-for-byte fallback. Snapshots clone the arena, the metadata database, and each WAL segment; on btrfs or xfs with `reflink=1` a multi-gigabyte arena is captured in milliseconds, and on ext4 the clone degrades to a full copy. |
 
 ## Where it fits
 

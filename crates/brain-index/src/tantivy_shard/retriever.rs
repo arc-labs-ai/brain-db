@@ -101,8 +101,6 @@ pub enum RankedItemId {
 
 #[derive(Debug, Error)]
 pub enum LexicalError {
-    #[error("index unavailable (rebuild in progress or corrupt)")]
-    IndexUnavailable,
     #[error("query parse failed: {0}")]
     QueryParseFailed(String),
     #[error("query timed out after {0} ms")]

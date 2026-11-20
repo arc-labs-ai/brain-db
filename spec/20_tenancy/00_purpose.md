@@ -1,11 +1,10 @@
 # §20 — Tenancy & Isolation
 
 *Normative home for Brain's multi-tenant memory model — the contract the other sections
-reference. Design rationale: `.claude/plans/tenancy_industry_scale.md`.*
+reference.*
 
-> **Decision status.** Settled. The vocabulary is `namespace → space → session`, and the
-> connection-lifetime concept is named **connection** so that `session` is free for the memory
-> tier. Nothing below is provisional.
+> **Vocabulary.** The scope tiers are `namespace → space → session`. The connection-lifetime
+> concept is named **connection**, leaving `session` to mean a grouping inside the memory tier.
 
 ## 1. Purpose — the two isolation axes
 
@@ -15,7 +14,7 @@ the dominant failure mode of memory systems:
 | Axis | Cardinality | Lifetime | Mechanism |
 |---|---|---|---|
 | *Who is calling* (org / app) | small (10²–10³) | long-lived | a **credential** (API key) |
-| *Whose memory this is* (end-user) | **large (up to 10⁶ per org)** | dynamic, churny | a **data-partition key passed per request** |
+| *Whose memory this is* (end-user) | **large (up to 10⁶ per org)** | dynamic, churny | a **data-partition key resolved server-side** — from the credential, or from the `act_as` slot on a delegating principal |
 
 **MUST:** Per-end-user isolation MUST be enforced in the index as a storage-key prefix, **not**
 by minting a credential per end-user.
@@ -27,7 +26,7 @@ Three nested tiers, plus the records:
 | Tier | Meaning | Set by | Isolation |
 |---|---|---|---|
 | `namespace` | organization / product / environment | resolved from the API key at AUTH | **hard wall** |
-| `space` | the isolation unit — one end-user, or one purpose | a per-request selector (the `act_as` slot) | **hard wall** |
+| `space` | the isolation unit — one end-user, or one purpose | **resolved from the API key at AUTH**; a delegating principal may instead select it per request through the `act_as` slot (§3) | **hard wall** |
 | `session` | a conversation / run within a space | optional per-request grouping | **soft grouping, not a wall** |
 
 - **MUST:** Every stored row (memory, entity, statement, relation) carries an owner scope
@@ -41,10 +40,17 @@ Three nested tiers, plus the records:
 
 - **MUST:** The wire/SDK carries `space_id` as a **structured opaque string** (e.g.
   `support-bot:user123`). The server MUST NOT parse sub-scopes in v1 — it is opaque.
-- **MUST:** The server derives the 16-byte storage key `SpaceId = UUIDv5(namespace, space_string)`
-  at request ingress, deterministically. The `uuid5` seed derivation MUST fold the namespace (so
-  equal strings under different namespaces diverge at the id level too) and MUST be pinned by a
-  golden test — changing it re-keys every space.
+- **MUST:** The server derives the 16-byte storage key at request ingress, deterministically, by
+  folding the namespace into the seed:
+
+  ```text
+  SpaceId = UUIDv5( UUIDv5(BRAIN_ROOT_NAMESPACE_UUID, namespace), space_string )
+  ```
+
+  (`crates/brain-core/src/ids.rs:66-78`.) Equal strings under different namespaces therefore
+  diverge at the id level and not only at the row-scope prefix. The derivation is one-way and
+  **frozen**, pinned by a golden test: changing `BRAIN_ROOT_NAMESPACE_UUID` or the folding order
+  re-keys every space in every deployment.
 - **Rationale:** a fixed-width 16-byte storage key keeps every secondary-index prefix
   `(u32, [u8;16], …)` compact and range-scannable, and lets sharding and scope-prefix range-delete
   operate on it directly.
@@ -147,17 +153,35 @@ connection to Brain, they cannot spend anything upstream, and the database store
 - **Rationale:** the per-user world inverts the old assumption (millions of spaces, few memories
   each). A shared index with a post-hoc scope filter misses a sparse space's own results at high
   selectivity.
-- **MUST:** When a query is scoped to a single space, retrieval routes to a per-space path — exact
-  brute-force scan of that space's vectors for small spaces (below a configured threshold), or a
-  **per-space** HNSW for large spaces — never a shared-index-with-filter path that can miss
-  sparse-space results.
+- **MUST:** When a query is scoped to a single space and that space is small enough to scan
+  exactly, retrieval routes to a per-space path: an exact cosine scan of only that space's
+  vectors, reached by range-scanning the space's `MEMORIES_BY_SPACE_TIMELINE_TABLE` prefix and
+  resolving each candidate's vector. Recall on that lane is 1.0 by construction, and the lane
+  applies the same HyPE union the shared path applies, so single-space paraphrase recall is not
+  traded away for exactness (`crates/brain-ops/src/index/semantic_retriever.rs:248-320`).
+- **MUST:** The routing threshold is the space's live `memory_count` from the `spaces` registry
+  against `SPACE_BRUTEFORCE_MAX = 20_000`
+  (`crates/brain-ops/src/index/semantic_retriever.rs:45`). A space above that count, or one with
+  no registry row, falls through to the shared per-shard HNSW with a post-hoc scope filter — the
+  path this section exists to avoid. **Per-space isolation of the retrieval route is therefore
+  bounded at 20 000 memories per space**; a space larger than that is still hard-walled for
+  correctness (every index prefix and every primary read re-check in §3 still applies) but is
+  served by the shared index, where a high-selectivity query can miss its own sparse results. A
+  per-space HNSW for large spaces does not ship.
 - **MUST:** When no space is named (namespace-wide admin/analytics), the shared/low-selectivity
   path MAY be used.
-- **MUST:** A space's memory vectors have physical locality (per-space slot-list v1; contiguous
-  per-space arena segment v2) so recall touches only that space's vectors.
-- **SHOULD:** At extreme scale, spaces carry an activity state (active/inactive/offloaded) with
-  lazy load and cold offload to object storage (v2).
-- **Gate:** the high-selectivity recall probe (§19) is the go/no-go for shipping partitioning.
+- **SHOULD:** A space's memory vectors have physical locality so recall touches only that space's
+  vectors. The shipped lane achieves this through the per-space timeline prefix rather than a
+  contiguous arena segment.
+- **Gate:** the high-selectivity recall probe is the go/no-go for the per-space route, and it is
+  an executable harness rather than a paper target
+  (`crates/brain-ops/tests/recall_probe.rs:1-62`). It runs both arms over the same planted
+  queries — the shared index with a scope filter at the shipped `ef_search = 64` /
+  `ef_search_max = 500`, and the exact per-space scan — against an adversarial corpus where each
+  sparse space's one true answer is outranked globally by competitors in other spaces. The
+  shared arm's failure is predicted at `occupancy × competitor_density ≳ 500`, i.e. where the
+  true hit's global rank exceeds the widest beam the shared search will ever explore. A light
+  smoke arm runs in the normal test sweep; the 100K–1M-node sweeps are opt-in.
 
 ## 7. Auth & `may_act`
 
@@ -171,26 +195,45 @@ connection to Brain, they cannot spend anything upstream, and the database store
 - **MUST:** The managed platform mints customer keys **namespace-scoped** (`may_act` over their
   own namespace), **never** wildcard-`may_act`. Wildcard `["*"]` is reserved for the internal
   service principal. A wildcard customer key is a cross-tenant hole.
-- **MUST:** The impersonated space runs with the fixed `STANDARD_AGENT` permission mask — never
-  inheriting `ADMIN`/`ACT_AS` (a space is data, not a principal).
+- **MUST:** The impersonated space runs with the fixed `STANDARD_SPACE` mask —
+  `ENCODE | RECALL | FORGET | LINK` (`crates/brain-metadata/src/tables/api_keys.rs:53`). A space
+  is data, not a principal: it inherits nothing from the delegator by default. This is the
+  no-escalation invariant **R4** (§04 handshake), and Brain satisfies it with a fixed mask
+  because it has no per-space permission store to resolve against.
+- **MUST:** The one widening is explicit and bounded. `act_as.grant` lets a delegating principal
+  add rights to a single delegated op, and the effective mask is
+  `STANDARD_SPACE | (grant & delegator & DELEGABLE)` where `DELEGABLE = SCHEMA_UPLOAD | ADMIN`
+  (`crates/brain-metadata/src/tables/api_keys.rs:61-67`). So `ADMIN` reaches a delegated op only
+  when the delegator both holds it and names it; `ACT_AS` is excluded from `DELEGABLE`, so a
+  delegated op can never itself delegate — the non-inheritability **R4** requires — and
+  `LLM_CREDENTIAL` is excluded, so a delegated op can never replace the key that pays for
+  extraction.
+- **MUST:** A grant naming a non-delegable bit, or one the delegator does not itself hold, is
+  hard-rejected with `ActAsDenied` rather than silently masked
+  (`crates/brain-server/src/network/dispatch.rs:1199-1209`). The same handler enforces **R1**
+  (the principal holds the `ACT_AS` grant) and **R2** (the target namespace lies within
+  `may_act`, wildcard-aware) ahead of it, and all three denials share the one error code —
+  `ActAsDenied` is defined in those terms in the protocol itself
+  (`crates/brain-protocol/src/error.rs:106-115`).
 
-## 8. Deployment modes — OSS-direct and managed-through-edge, one SDK
+## 8. Deployment modes — OSS-direct and managed-through-edge, one client surface
 
 - **MUST:** The entire tenancy model (space/session, registries, `SPACE_*`/`SESSION_*`, RowScope,
   the namespace wall, per-space partitioning) ships in Brain core and is fully usable with **no
   edge** — open-source self-hosters get a first-class multi-tenant DB.
 - **MUST:** Isolation lives entirely in Brain core; brain-edge MUST NOT be an isolation mechanism.
-- **MUST:** The SDK speaks the wire protocol in both modes; "through the edge" means pointing the
-  same client at the edge's address with the **same Brain key**. brain-edge MUST be a transparent
-  passthrough that **forwards** `space_id`/`session` verbatim and MUST NOT resolve identities or
-  stamp `act_as`.
+- **MUST:** A client speaks the same wire protocol in both modes; "through the edge" means
+  pointing the same client at the edge's address with the **same Brain key**. brain-edge MUST be
+  a transparent passthrough that **forwards** `space_id`/`session` verbatim and MUST NOT resolve
+  identities or stamp `act_as`.
 - **MUST:** The end-user → `space_id` mapping lives in the customer's own application; Brain
   validates the space against the key's namespace.
-- **MUST:** SDK call signatures are identical in both modes — the only difference is configuration
-  (endpoint + token).
+- **MUST:** Call signatures are identical in both modes — the only difference is configuration
+  (endpoint + token). See [`../06_sdk/00_purpose.md`](../06_sdk/00_purpose.md): the protocol, not
+  a shipped library, is what makes the two modes one surface.
 
 ## Cross-references (contracts centralized elsewhere — link, don't duplicate)
 
 - `act_as` R1–R6 contract: §04 handshake. · `may_act` mint + wildcard rules: §17 admin ops.
 - Namespace wall + owner-vs-type namespace: §03 namespaces. · RowScope + registry tables: §10.
-- Per-space index mechanism: §09 filtering + §08 arena. · Recall-probe acceptance: §19.
+- Per-space index mechanism: §09 filtering + §08 arena. · Recall-probe arms and corpus: §6 above.

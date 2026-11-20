@@ -23,13 +23,13 @@
 //!   This covers length / type / reserved garbage at the true tail, so a
 //!   torn final write never bricks boot.
 //! - one found → acknowledged data survives past the corruption →
-//!   `MidSegmentCorruption` (fail-stop; never silently drop it — invariant
-//!   #7, "no silent corruption / no silent loss").
+//!   `MidSegmentCorruption`, which reports the corruption position and
+//!   survivor scan; recovery decides whether discarding the suffix is safe.
 //!
 //! **Earlier segment — strict.** Any corruption is a hard error:
-//! `Truncated` / `CrcMismatch` → `MidSegmentCorruption`;
-//! `PayloadTooLarge` / `UnknownRecordType` / `NonZeroReserved` →
-//! `RecordError`.
+//! `MidSegmentCorruption` with the corruption position, survivor scan, and
+//! decode cause. Position determines the recovery policy; the cause preserves
+//! the forensic detail for operators.
 //!
 //! Plus boundary checks:
 //!
@@ -71,8 +71,6 @@ pub struct SegmentInfo {
 /// [`FusedIterator`]: core::iter::FusedIterator
 pub struct WalReader {
     segments: Vec<SegmentInfo>,
-    #[allow(dead_code)]
-    shard_uuid: [u8; 16],
     current_idx: usize,
     current: Option<LoadedSegment>,
     expected_next_lsn: u64,
@@ -156,16 +154,43 @@ pub enum WalReadError {
         found_lsn: u64,
     },
 
-    #[error("mid-segment corruption in segment {segment_seq}")]
-    MidSegmentCorruption { segment_seq: u64 },
-
-    #[error("record error in segment {in_segment} at expected LSN {expected_lsn}: {source}")]
-    RecordError {
-        in_segment: u64,
-        expected_lsn: u64,
-        #[source]
-        source: WalRecordError,
+    #[error(
+        "mid-segment corruption in segment {segment_seq} at byte {offset}: \
+         {} well-formed record(s) decode past the damage (first LSN {:?}), \
+         active segment: {in_active_segment}, cause: {cause}",
+        survivors.count,
+        survivors.first_lsn
+    )]
+    MidSegmentCorruption {
+        segment_seq: u64,
+        /// Byte offset in the segment file where decoding stopped.
+        offset: u64,
+        /// True when this is the highest-seq (append-target) segment.
+        in_active_segment: bool,
+        survivors: SurvivorScan,
+        cause: DecodeFailure,
     },
+}
+
+/// How decoding failed at a byte position. `Truncated` is not a
+/// `WalRecordError`, so the two classes share one type for reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DecodeFailure {
+    #[error("record bytes end mid-record")]
+    Truncated,
+    #[error("{0}")]
+    Record(#[from] WalRecordError),
+}
+
+/// What a forward scan over the bytes past an undecodable position found.
+/// A record only counts when it decodes with a valid CRC and carries an LSN
+/// at or past the one the reader expected, so a false positive would have to
+/// forge a CRC32C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SurvivorScan {
+    pub count: u64,
+    pub first_lsn: Option<u64>,
+    pub last_lsn: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,7 +235,6 @@ impl WalReader {
 
         Ok(Self {
             segments: infos,
-            shard_uuid,
             current_idx: 0,
             current: None,
             expected_next_lsn,
@@ -289,7 +313,7 @@ impl WalReader {
     /// Byte offset within its segment file at which the most recently
     /// yielded record ends. `None` if the reader hasn't yielded any record
     /// yet. Recovery pairs this with [`Self::last_record_segment_seq`] to
-    /// derive the physical tail to truncate the active segment to on reopen.
+    /// derive the physical tail segment and offset to truncate on reopen.
     #[must_use]
     pub fn last_record_end_offset(&self) -> Option<usize> {
         self.last_record_end_offset
@@ -307,6 +331,12 @@ impl WalReader {
     #[must_use]
     pub fn active_segment_seq(&self) -> Option<u64> {
         self.segments.last().map(|s| s.segment_seq)
+    }
+
+    /// `segment_seq` of the oldest segment. `None` if the WAL has no segments.
+    #[must_use]
+    pub fn oldest_segment_seq(&self) -> Option<u64> {
+        self.segments.first().map(|s| s.segment_seq)
     }
 }
 
@@ -387,6 +417,13 @@ impl Iterator for WalReader {
                 // fields can surface as any of these depending on the value;
                 // we treat them uniformly by position.
                 outcome => {
+                    let cause = match outcome {
+                        Ok(DecodeOutcome::Truncated) => DecodeFailure::Truncated,
+                        Err(source) => DecodeFailure::Record(source),
+                        Ok(DecodeOutcome::Record { .. }) => {
+                            unreachable!("Record outcome handled in the arm above")
+                        }
+                    };
                     let is_last = self.current_idx + 1 >= self.segments.len();
                     let segment_seq = self.segments[self.current_idx].segment_seq;
                     let expected_lsn = self.expected_next_lsn;
@@ -396,13 +433,18 @@ impl Iterator for WalReader {
                         // for acknowledged data past the corruption. Compute
                         // it while `seg` is still borrowed, before flipping
                         // `self.finished`.
-                        let survives =
-                            valid_record_survives_after(&seg.bytes[seg.cursor..], expected_lsn);
+                        let survivors = scan_survivors(&seg.bytes[seg.cursor..], expected_lsn);
                         self.finished = true;
-                        if survives {
+                        if survivors.count > 0 {
                             // Acknowledged data survives past a corrupt
                             // record — never drop it (invariant #7).
-                            return Some(Err(WalReadError::MidSegmentCorruption { segment_seq }));
+                            return Some(Err(WalReadError::MidSegmentCorruption {
+                                segment_seq,
+                                offset: seg.cursor as u64,
+                                in_active_segment: true,
+                                survivors,
+                                cause,
+                            }));
                         }
                         // Genuine torn / garbage final write: the expected
                         // post-crash case. Log once and end cleanly.
@@ -414,21 +456,19 @@ impl Iterator for WalReader {
                         return None;
                     }
 
-                    // Earlier (fully-rolled-over) segment: strict. Preserve
-                    // the historical classification of each corruption class.
+                    // Every corruption class in a rolled-over segment reaches
+                    // one positional decision with its decode cause attached,
+                    // because the caller decides what is safe to discard from
+                    // the damage's position.
+                    let survivors = scan_survivors(&seg.bytes[seg.cursor..], expected_lsn);
+                    let offset = seg.cursor as u64;
                     self.finished = true;
-                    return Some(Err(match outcome {
-                        Ok(DecodeOutcome::Truncated) | Err(WalRecordError::CrcMismatch { .. }) => {
-                            WalReadError::MidSegmentCorruption { segment_seq }
-                        }
-                        Err(source) => WalReadError::RecordError {
-                            in_segment: segment_seq,
-                            expected_lsn,
-                            source,
-                        },
-                        Ok(DecodeOutcome::Record { .. }) => {
-                            unreachable!("Record outcome handled in the arm above")
-                        }
+                    return Some(Err(WalReadError::MidSegmentCorruption {
+                        segment_seq,
+                        offset,
+                        in_active_segment: false,
+                        survivors,
+                        cause,
                     }));
                 }
             }
@@ -476,42 +516,30 @@ impl core::fmt::Debug for WalReader {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Forward-scan `bytes` — the remaining bytes of the *last* segment, from a
-/// corruption cursor to the end of the segment — for a well-formed record
-/// that carries acknowledged data (`lsn >= expected_lsn`).
-///
-/// Returns `true` iff such a record exists anywhere after the corruption,
-/// meaning recovery must fail-stop rather than treat the corruption as a
-/// clean tail. This upholds invariant #7: acknowledged data past a corrupt
-/// record is never silently dropped.
-///
-/// The scan steps byte-by-byte because the corrupt record's own length field
-/// may itself be corrupt, so record-boundary stepping is unreliable. Each
-/// [`WalRecord::decode_one`] short-circuits cheaply unless a full-length,
-/// structurally well-formed record is present, and only yields `Ok(Record)`
-/// after the CRC, valid-kind, and zero-reserved gates pass. Combined with the
-/// `lsn >= expected_lsn` check, a false positive (garbage read as a valid
-/// record) is astronomically unlikely — and even then it only forces an
-/// unnecessary fail-stop, the safe direction (no data loss). A false negative
-/// (missing a record that is really there) cannot happen: every offset is
-/// tried, so a present valid record is always found.
-///
-/// The bound `lsn >= expected_lsn` (rather than strict equality) is
-/// deliberate: a bit-flip in an already-acknowledged record leaves the
-/// records written *after* it intact, and those carry `lsn > expected_lsn`
-/// (the corrupt record consumed the `expected_lsn` slot). Requiring strict
-/// equality would miss them and silently drop acknowledged data — exactly the
-/// failure this policy exists to prevent. `>=` only ever adds fail-stops
-/// relative to `==`, all in the safe direction.
-fn valid_record_survives_after(bytes: &[u8], expected_lsn: u64) -> bool {
-    for start in 0..bytes.len() {
-        if let Ok(DecodeOutcome::Record { record, .. }) = WalRecord::decode_one(&bytes[start..]) {
-            if record.lsn.raw() >= expected_lsn {
-                return true;
+/// Forward-scan bytes after a corruption cursor for valid records at or past
+/// the expected LSN. Byte stepping finds records when the damaged length
+/// field cannot identify a boundary; consuming a found record keeps the scan
+/// single-pass over its bytes.
+/// Count only records whose CRC validates and whose LSN is at or past
+/// `expected_lsn`.
+pub(crate) fn scan_survivors(bytes: &[u8], expected_lsn: u64) -> SurvivorScan {
+    let mut scan = SurvivorScan::default();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match WalRecord::decode_one(&bytes[cursor..]) {
+            Ok(DecodeOutcome::Record { record, consumed }) if record.lsn.raw() >= expected_lsn => {
+                let lsn = record.lsn.raw();
+                scan.count += 1;
+                if scan.first_lsn.is_none() {
+                    scan.first_lsn = Some(lsn);
+                }
+                scan.last_lsn = Some(lsn);
+                cursor += consumed;
             }
+            _ => cursor += 1,
         }
     }
-    false
+    scan
 }
 
 /// Parse the segment_seq from a `wal/0000000000.wal`-style path. Returns an
@@ -921,7 +949,10 @@ mod tests {
         // the last segment, this is mid-segment corruption.
         let err = reader.next().unwrap().unwrap_err();
         assert!(
-            matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            matches!(
+                err,
+                WalReadError::MidSegmentCorruption { segment_seq: 0, .. }
+            ),
             "got {err:?}"
         );
         // Fused: further calls return None.
@@ -959,7 +990,10 @@ mod tests {
         // Record 2 hits the corruption; segment 0 isn't last → MidSegmentCorruption.
         let err = reader.next().unwrap().unwrap_err();
         assert!(
-            matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            matches!(
+                err,
+                WalReadError::MidSegmentCorruption { segment_seq: 0, .. }
+            ),
             "got {err:?}"
         );
     }
@@ -979,8 +1013,8 @@ mod tests {
     #[test]
     fn last_segment_unknown_type_at_true_tail_is_clean_end() {
         // Corrupting the *last* record's type byte, with nothing valid after
-        // it, used to fail-stop (RecordError). It must now be treated as a
-        // torn-tail clean end so a garbage final write never bricks boot.
+        // it, must be treated as a torn-tail clean end rather than a
+        // fail-stop, so a garbage final write never bricks boot.
         let dir = tempfile::tempdir().unwrap();
         let records: Vec<WalRecord> = (1..=3)
             .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
@@ -1057,7 +1091,7 @@ mod tests {
     fn last_segment_crc_corruption_with_valid_after_fails_stop() {
         // A CRC hit in the *middle* of the last segment, with intact records
         // after it, must fail-stop — never silently drop the survivors
-        // (invariant #7). Previously this returned a clean end (silent loss).
+        // (invariant #7). Reporting a clean end here is silent data loss.
         let dir = tempfile::tempdir().unwrap();
         let records: Vec<WalRecord> = (1..=5)
             .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
@@ -1078,7 +1112,10 @@ mod tests {
         // Record 3 is corrupt but records 4 & 5 survive → fail-stop, not None.
         let err = reader.next().unwrap().unwrap_err();
         assert!(
-            matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            matches!(
+                err,
+                WalReadError::MidSegmentCorruption { segment_seq: 0, .. }
+            ),
             "surviving acknowledged data must fail-stop, not be dropped; got {err:?}"
         );
         // Fused after the error.
@@ -1109,15 +1146,18 @@ mod tests {
         assert_eq!(reader.next().unwrap().unwrap().lsn.raw(), 2);
         let err = reader.next().unwrap().unwrap_err();
         assert!(
-            matches!(err, WalReadError::MidSegmentCorruption { segment_seq: 0 }),
+            matches!(
+                err,
+                WalReadError::MidSegmentCorruption { segment_seq: 0, .. }
+            ),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn non_last_segment_unknown_type_is_record_error() {
-        // Header-field garbage in an earlier segment keeps the strict
-        // RecordError classification (unchanged by the tail policy).
+    fn non_last_segment_unknown_type_is_mid_segment_corruption() {
+        // Damage in a rolled-over segment is classified by position, with
+        // the decode cause retained for the operator.
         let dir = tempfile::tempdir().unwrap();
         let seg0: Vec<WalRecord> = (1..=3)
             .map(|i| make_record(i, WalRecordKind::Encode, vec![i as u8; 8]))
@@ -1141,9 +1181,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                WalReadError::RecordError {
-                    in_segment: 0,
-                    source: WalRecordError::UnknownRecordType(0x7F),
+                WalReadError::MidSegmentCorruption {
+                    segment_seq: 0,
+                    in_active_segment: false,
+                    cause: DecodeFailure::Record(WalRecordError::UnknownRecordType(0x7F)),
                     ..
                 }
             ),

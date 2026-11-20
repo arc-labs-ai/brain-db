@@ -12,10 +12,22 @@ description = "The Brain cognitive substrate server."
 name = "brain-server"
 path = "src/main.rs"
 
+[[bench]]
+name = "embed_contention"
+harness = false
+
+[[bench]]
+name = "embed_batch_window"
+harness = false
+
+[[bench]]
+name = "write_path_concurrency"
+harness = false
+
 [features]
 default = []
-# Sub-task 9.15 — feature-gated LLM summarizers. Both pull `reqwest`
-# (with rustls-tls, reusing 9.9's vendored stack). Default off: the
+# Feature-gated LLM summarizers. Both pull `reqwest` (with rustls-tls,
+# reusing the connection layer's vendored stack). Default off: the
 # substrate works without consolidation.
 # The LLM-backed summarizer reuses brain-llm's provider clients, so it
 # needs no HTTP stack of its own.
@@ -23,10 +35,7 @@ summarizer-llm = []
 summarizer-ollama = ["reqwest"]
 
 [dependencies]
-# Brain crate dependencies are added in later Phase 9 sub-tasks as each one
-# is wired in (e.g. 9.4 shards → brain-storage; 9.5 metadata → brain-metadata,
-# ...). Keeping the import set minimal so this crate compiles on non-Linux
-# hosts during the pure-rust sub-tasks.
+# The import set is kept minimal so this crate compiles on non-Linux hosts.
 brain-crypto = { path = "../brain-crypto" }
 brain-core = { path = "../brain-core" }
 
@@ -60,7 +69,7 @@ brain-protocol = { path = "../brain-protocol" }
 brain-storage = { path = "../brain-storage" }
 brain-metadata = { path = "../brain-metadata" }
 brain-extractors = { path = "../brain-extractors" }
-# 21.5: shard startup builds the LLM model router + per-shard cache.
+# Shard startup builds the LLM model router + per-shard cache.
 brain-llm = { path = "../brain-llm" }
 brain-index = { path = "../brain-index" }
 brain-embed = { path = "../brain-embed" }
@@ -73,7 +82,7 @@ brain-workers = { path = "../brain-workers" }
 # inside the shard executor (avoiding the cost of a full dispatch
 # round-trip for what is a maintenance op).
 redb = { workspace = true }
-# Phase 11 M3: admin server is built on brain-http (hyper-based).
+# The admin server is built on brain-http (hyper-based).
 brain-http = { path = "../brain-http", features = ["server"] }
 # Hyper types referenced directly from admin handlers + the metrics
 # exposition path.
@@ -82,7 +91,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 
-# Connection layer (sub-task 9.9): Tokio TCP + optional rustls TLS.
+# Connection layer: Tokio TCP + optional rustls TLS.
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true

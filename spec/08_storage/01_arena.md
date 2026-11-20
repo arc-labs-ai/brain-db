@@ -34,7 +34,7 @@ Each slot is 1600 bytes:
 
 The fixed slot size means:
 - Slot ID → byte offset is `slot_id * 1600`. No indirection table.
-- Allocation is "find the next free slot" — a per-shard free list.
+- Slot indexes are issued from a monotonic per-shard counter; the free list serves the replay path (§10).
 - Reuse is direct — overwrite the slot.
 
 Brain does not pack arbitrary lengths into a flat file. Variable-length data (text, edges) lives in the metadata store; the arena is for fixed-size vectors only.
@@ -126,6 +126,8 @@ Brain accepts regular 4 KB pages. For arena sizes up to ~64 GB, the TLB overhead
 
 ### 8. Writes via memcpy
 
+Vectors are written into slots by WAL replay, not by the live write path ([`03_write_path.md`](03_write_path.md) §5). The mechanism is a memcpy into the mapped region either way.
+
 Writing a vector to a slot:
 
 ```rust
@@ -160,15 +162,19 @@ For SIMD-friendly access, the slot pointer is cache-line-aligned (slots start at
 
 ### 10. The free list
 
-Free slots are tracked via a per-shard in-memory free list. The list is rebuilt at startup by scanning the arena's metadata bytes (looking for slots with `bit 0 == 0` in `flags`).
+Free slots are tracked via a per-shard in-memory free list, rebuilt from the post-replay arena at startup by scanning the slot metadata bytes (looking for slots with `bit 0 == 0` in `flags`).
 
 For a 10M-slot arena, the rebuild scans 10M × 64 bytes = 640 MB of metadata bytes. At sequential read speeds (~3 GB/s on NVMe), this takes ~200 ms. Acceptable for startup; not a hot path.
+
+The free list belongs to the arena allocator, which serves the replay path. The live write path reserves slot indexes from a monotonic counter instead and does not consult the free list, so a reclaimed index is not reissued while the process is up ([`03_write_path.md`](03_write_path.md) §2).
 
 The free list is not persisted as a separate structure. The arena's slot flags are the source of truth.
 
 ### 11. The arena is not the source of truth
 
 As stated in [`00_purpose.md`](00_purpose.md) §4: the WAL is the source of truth, not the arena.
+
+The arena is, more precisely, the **boot-time image** of every durable memory: replay fills it, and nothing on the live path adds to it. It is therefore authoritative for the boot-recovery index rebuild and only for that. A rebuild at runtime must read the durable write-time vectors from redb, because a runtime rebuild from the arena would silently drop every memory encoded since the process started.
 
 If the arena is corrupted (bit flips on disk, partial write before fsync), Brain detects it via:
 - Slot version mismatches with metadata.
@@ -311,7 +317,7 @@ f16 (half precision) is a future possibility:
 - Sufficient precision for cosine similarity at 384 dim.
 - But: poorer SIMD support on x86 (gather/scatter required), and the model itself outputs f32.
 
-f32 is the current choice. f16 is a possible future optimization (tracked in [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md)).
+f32 is the choice: the poorer x86 SIMD support and the f32 model output outweigh the storage saving.
 
 ### 7. Slot ID to offset
 
@@ -358,7 +364,7 @@ A freshly-initialized arena (no memories yet) has:
 - `slot_count_capacity = 1024` (default initial capacity).
 - File on disk: 4096 + 1024 × 1600 = 1,642,496 bytes ≈ 1.6 MB, sparse if the filesystem supports it.
 
-A newly-allocated slot (the first encode) goes to slot ID 0 (the lowest free slot). Subsequent encodes use slots 1, 2, 3, ... in order, populating the arena densely.
+Slot indexes on the live path come from a monotonic counter that starts at 1, so the first encode is slot 1 and subsequent encodes take 2, 3, 4, … in order. Slot index 0 is never issued; the counter is seeded at boot with `fetch_max` from the persisted high-water mark and never moves backwards, so reclaimed indexes are not reissued by the live path and the arena fills densely in index order. ([`03_write_path.md`](03_write_path.md) §2.)
 
 ### 10. Reading slots that haven't been written
 
@@ -374,7 +380,7 @@ At startup, after the file is mmap'd, Brain optionally:
 2. Verifies the magic bytes (`"BARN"`).
 3. Verifies the header CRC32C.
 4. Verifies the shard UUID matches the configured shard.
-5. Verifies the format version is supported.
+5. Verifies the `format_version` is exactly 1. Any other value is refused — there is no supported range and no migration path.
 6. Verifies dim and slot_size match expectations.
 
 Any mismatch is a startup failure; Brain refuses to operate with a malformed arena.
@@ -482,7 +488,7 @@ For NVMe SSDs, this is a non-issue. For older storage with significant block-all
 
 ### 8. Shrinking?
 
-The arena does not shrink. Slots that become free (after FORGET + reclaim) are reused, not returned to the OS.
+The arena does not shrink. Slots that become free (after FORGET + reclaim) stay allocated in the file rather than being returned to the OS.
 
 Why no shrinking:
 - The mmap region's address range can't be partially unmapped without disrupting the file's logical layout.

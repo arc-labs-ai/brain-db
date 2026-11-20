@@ -15,32 +15,13 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::admin;
+use brain_server::config;
+use brain_server::metrics;
+use brain_server::network::auth;
+use brain_server::network::connection;
+use brain_server::network::routing;
+use brain_server::shard;
 
 use admin::{AdminServer, AdminState};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};

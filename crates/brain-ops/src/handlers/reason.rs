@@ -411,7 +411,7 @@ fn fetch_trace_texts(
             Ok(Some(guard)) => std::str::from_utf8(guard.value())
                 .map(str::to_owned)
                 .map_err(|e| {
-                    OpError::Internal(format!(
+                    OpError::PermanentFault(format!(
                         "reason trace TEXTS_TABLE non-UTF-8 for {id:?}: {e}"
                     ))
                 })?,

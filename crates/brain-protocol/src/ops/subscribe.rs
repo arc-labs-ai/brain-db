@@ -23,12 +23,11 @@ pub struct SubscriptionFilter {
     pub session_filter: Option<Vec<WireSessionId>>,
     pub kinds: Option<Vec<MemoryKindWire>>,
     pub similar_to: Option<SimilarityFilter>,
-    /// Subset of space ids whose events the subscriber wants. `None`
-    /// or empty = all spaces (server-wide / shard-wide). The single
-    /// most useful filter on a multi-tenant shard — without it, a
-    /// subscriber sees every other space's events that happen to
-    /// route to the same shard. Server-side matching is a
-    /// `HashSet::contains` per event.
+    /// The space whose events the subscriber wants, named by its resolved
+    /// id. The server accepts only the caller's effective space (the
+    /// `act_as` target when the subscription carries one) and refuses
+    /// `None`, an empty list, or any other id: a shard is multi-tenant, so
+    /// an unfiltered feed would carry other tenants' events.
     #[serde(with = "crate::codec::cbor::opt_vec_byte_array16")]
     pub spaces: Option<Vec<WireUuid>>,
     /// Subset of memory ids whose events the subscriber wants. `None`

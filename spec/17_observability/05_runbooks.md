@@ -55,43 +55,64 @@ Issue not resolved by above steps. Capture full logs and pre/post state for engi
 
 1. Identify which operations are slow:
    ```
-   histogram_quantile(0.99, brain_request_duration_ms_bucket{shard="<id>"}) by (op)
+   histogram_quantile(0.99, sum by (le, op) (rate(brain_request_duration_ms_bucket[5m])))
    ```
+   The `by` clause belongs to the inner aggregation, not after
+   `histogram_quantile`, and the buckets need `rate()` — a quantile taken over
+   raw cumulative buckets answers "since process start", not "right now".
+   `op` is the only label on this family besides `le`; there is no `shard`
+   label on the request metrics, so a shard cannot be selected here. Pin the
+   shard by scraping that instance, or use the per-shard families below.
 
 2. Check for resource exhaustion:
-   - CPU: `top` or `brain_executor_latency_ms`.
-   - Memory: `process_resident_memory_bytes`.
+   - CPU: `top`. (`brain_executor_latency_ms` is deferred, not emitted.)
+   - Memory: `process_memory_resident_bytes`.
    - Disk I/O: `iostat -x 1`.
 
 3. Check for HNSW degradation:
    ```
    brain_hnsw_tombstone_ratio{shard="<id>"}
-   brain_hnsw_recall_estimate{shard="<id>"}
    ```
-   If ratio > 30% or recall < 90%, trigger rebuild:
+   Above 0.30 the maintenance worker rebuilds on its own, so a ratio sitting
+   above it means the worker is not running — check that before rebuilding by
+   hand. Between 0.15 and 0.30 the worker logs and does nothing, and a manual
+   rebuild is the only remedy:
    ```bash
    curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
    ```
+   `brain_hnsw_recall_estimate` is not emitted, and the internal value it would
+   carry is hardcoded to `1.0`
+   (`crates/brain-workers/src/workers/hnsw_maint.rs:211`), so the tombstone
+   ratio is not just the best available signal — it is the only one. It is also
+   the right proxy: tombstones are what leave neighbour lists pointing at
+   deleted nodes.
 
-4. Check for embedder slowness:
+4. Check for embedder slowness. The `brain_embedder_*` family is deferred and
+   not emitted; an embedder stall surfaces as encode latency:
    ```
-   brain_embedder_duration_ms{quantile="0.99"}
-   brain_embedder_queue_depth
+   histogram_quantile(0.99, sum by (le) (rate(brain_request_duration_ms_bucket{op="encode"}[5m])))
    ```
-   If embedder is the bottleneck:
-   - Cache hit rate low? Increase cache size.
-   - Queue deep? Add workers.
+   If embedding is the bottleneck, raise `[embedder] cache_size` and check
+   `[embedder] batch_size` / `batch_window_ms` against the write rate.
 
-5. Check for hot agent:
-   ```
-   topk(5, sum(rate(brain_request_total{shard="<id>"}[5m])) by (space_id))
-   ```
-   (requires per-space metrics, which Brain doesn't emit by default — use audit logs instead)
+5. Check for a hot agent. There is no metric path to this: `space_id` is never
+   a metric label and neither is `shard` on the request family, so no PromQL
+   query can attribute traffic to a tenant. Per-space attribution comes from
+   the request logs: every dispatched request opens a `client.request` span
+   carrying `brain.space_id` — the effective identity, with the acting
+   principal recorded alongside it under delegation
+   (`crates/brain-server/src/network/dispatch.rs:873-885`). Run the log
+   stream through `jq`, counting that field, to rank callers. The audit trail
+   answers the same question over a longer window. The
+   cardinality rule behind this is deliberate, not an omission — a `space_id`
+   label on a counter multiplies every series by the tenant count.
 
-6. If still unresolved: capture profile:
+6. If still unresolved: profile the shard thread from outside the process.
+   `POST /v1/diagnostics/profile` answers `501` — the in-process Glommio
+   profiler is not built. Shard threads are named `brain-shard-<id>`, so:
    ```bash
-   curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile \
-     -d '{"shard":"<id>","duration":"30s","output":"/tmp/profile.pb"}'
+   perf record -g -t "$(pgrep -f brain-server | head -1)" -- sleep 30
+   perf report --sort symbol
    ```
 
 ### Escalate if
@@ -106,16 +127,26 @@ Issue not resolved within 30 minutes. Capture profile, dashboards, recent change
 
 ### Steps
 
-1. Identify which shard is heavy:
+1. Identify which shard is heavy. Resident memory is a whole-process figure —
+   Brain is one process with per-core shards, so there is no per-shard RSS to
+   rank. Rank the per-shard footprint gauges instead:
    ```
-   topk(3, process_resident_memory_bytes by (shard))
+   topk(3, brain_arena_used_bytes)
+   topk(3, brain_hnsw_node_count)
+   ```
+   Then read the process total alongside them:
+   ```
+   process_memory_resident_bytes
    ```
 
-2. Check for ongoing rebuilds:
+2. Check for an ongoing rebuild. `brain_hnsw_rebuild_in_progress` is deferred
+   and not emitted; the emitted signal is the maintenance worker's cadence:
    ```
-   brain_hnsw_rebuild_in_progress
+   brain_worker_last_run_unixtime{shard="<id>",worker="hnsw_maintenance"}
+   brain_worker_cycles_total{shard="<id>",worker="hnsw_maintenance"}
    ```
-   If rebuild is in progress: wait for completion. Memory will drop.
+   A rebuild in flight means the resident graph is doubled for its duration;
+   wait for it and memory will drop.
 
 3. Check arena and HNSW sizes:
    ```
@@ -220,37 +251,67 @@ Restart doesn't help.
 
 ---
 
-## RB-6: HNSW recall degraded
+## RB-6: HNSW index quality degraded
 
 ### Symptoms
-`BrainRecallQualityDegraded` alert. Recall estimate < 85%.
+`BrainHighTombstoneRatio`. Searches returning fewer or worse hits than the
+corpus warrants.
+
+**There is no recall-based trigger for this runbook**, and a rule that waits
+for one will wait forever. The maintenance worker stamps
+`recall_estimate = 1.0` unconditionally, because query-sample logging is not
+wired (`crates/brain-workers/src/workers/hnsw_maint.rs:14-15`, `:211`). Both
+recall branches of the decision function compare against that constant
+(`:92`, `:95`), so neither can ever be taken. **Tombstone ratio is the only
+live signal.**
 
 ### Steps
 
-1. Check tombstone ratio:
+1. Check the tombstone ratio — the one metric that drives maintenance:
    ```
    brain_hnsw_tombstone_ratio
    ```
-   If high: rebuild is needed.
+   Read it against the worker's own thresholds
+   (`crates/brain-workers/src/workers/hnsw_maint.rs:68-74`):
+
+   | Ratio | What the worker does |
+   |---|---|
+   | above 0.30 | rebuilds the index itself, automatically |
+   | 0.15 to 0.30 | **nothing reclaimable** — it logs "schedule rebuild soon" and returns |
+   | below 0.15 | nothing |
+
+   The middle band is why this runbook exists. `Action::ScheduleRebuildSoon`
+   only emits a trace line (`:220-225`); no rebuild is queued and no later pass
+   picks it up. A shard sitting at 0.2 will stay there indefinitely, degrading,
+   until either the ratio crosses 0.30 or **an operator rebuilds it by hand**.
+   That manual rebuild is step 2.
 
 2. Trigger rebuild:
    ```bash
    curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
    ```
 
-3. Monitor progress:
+3. Monitor progress. `brain_hnsw_rebuild_progress_pct` is deferred and not
+   emitted; watch the worker counters and the node count instead:
    ```
-   brain_hnsw_rebuild_progress_pct
+   brain_worker_cycles_total{shard="<id>",worker="hnsw_maintenance"}
+   brain_hnsw_node_count{shard="<id>"}
    ```
 
-4. After rebuild, verify recall:
+4. After the rebuild, verify the tombstone ratio has dropped:
    ```
-   brain_hnsw_recall_estimate
+   brain_hnsw_tombstone_ratio{shard="<id>"}
    ```
-   Should be > 95%.
+   This is the only post-rebuild confirmation available from metrics.
+   `brain_hnsw_recall_estimate` is not emitted, and the internal figure it
+   would carry is the hardcoded `1.0` described above — so it would confirm
+   success whether or not the rebuild helped. **Measuring recall means a
+   recall@K run against a known-answer set, not a scrape.**
 
 ### Escalate if
-Rebuild doesn't restore recall. Possible deeper issue.
+The tombstone ratio does not drop after a rebuild, or retrieval quality is poor
+with a low tombstone ratio — the latter is not a maintenance problem and this
+runbook does not cover it.
 
 ---
 
@@ -302,23 +363,34 @@ Requests timing out. Health endpoint slow or failing.
    - 100% on one shard's core: starvation; investigate workers / queries.
    - 100% across all: insufficient capacity.
 
-2. Check executor latency:
-   ```
-   brain_executor_latency_ms{quantile="0.99"}
-   ```
-   If > 10 ms: a task is hogging the executor.
+2. Check executor latency. `brain_executor_latency_ms` is deferred and not
+   emitted — Glommio reactor metrics need instrumentation that does not exist
+   yet. Go straight to the profile in step 3; a task hogging the executor shows
+   up there as a single frame holding the shard thread.
 
-3. Capture profile:
+3. Profile the shard thread. **`POST /v1/diagnostics/profile` answers `501`**
+   (`crates/brain-server/src/admin/handlers/diagnostics/profile.rs`): there is
+   no in-process profiler, so use the host's. Shard threads are named
+   `brain-shard-<id>` (`crates/brain-server/src/shard/mod.rs:3113`) and each is
+   pinned to one core when a cpu is assigned, so the thread and the hot core
+   are the same target:
    ```bash
-   curl -s -X POST http://127.0.0.1:9092/v1/diagnostics/profile \
-     -d '{"shard":"<id>","duration":"30s","output":"/tmp/profile.pb"}'
-   pprof -top /tmp/profile.pb
+   perf top -t "$(ps -L -o tid=,comm= -p "$(pgrep -f brain-server|head -1)" \
+                  | awk '$2=="brain-shard-0"{print $1}')"
    ```
-   Identifies the hot function.
+   The hot frame is the answer. A worker shows up as that worker's own
+   functions; a query shows up in the retriever or the HNSW search.
 
 4. If profile shows a worker as hot: stop the worker.
 
-5. If profile shows request handlers: shed load (configure rate limit, scale up).
+5. If the profile shows request handlers, the shard is simply saturated.
+   **There is no rate limiter to configure and no load shedding**: at the
+   dispatch permit bound the shard parks and back-pressures the connection
+   layer, so saturation appears as latency rather than as refusals. Nothing on
+   the request path raises `RateLimited`, and `OpError::QuotaExceeded` is
+   constructed only in a test (`crates/brain-ops/src/lib.rs:113`). The levers
+   are capacity — more cores and a higher `[storage] shard_count` — or a
+   limiter in front of the data plane.
 
 ### Escalate if
 Issue persists.
@@ -342,41 +414,59 @@ After a large delete operation, performance degrades.
    curl -s -X POST http://127.0.0.1:9092/v1/rebuild-ann -d '{"shard":"<shard-id>"}'
    ```
 
-3. Monitor rebuild:
+3. Monitor the rebuild:
    ```
-   brain_hnsw_rebuild_progress_pct
+   brain_worker_cycles_total{shard="<id>",worker="hnsw_maintenance"}
+   brain_hnsw_node_count{shard="<id>"}
    ```
+   (`brain_hnsw_rebuild_progress_pct` is deferred and not emitted.)
 
-4. After rebuild, verify recall is restored.
+4. After the rebuild, confirm `brain_hnsw_tombstone_ratio` has dropped.
 
 ### Escalate if
 Rebuild doesn't help.
 
 ---
 
-## RB-10: Network partition (future clustering)
+## RB-10: A node is unreachable
 
 ### Symptoms
-Some shards reachable, others not.
+`BrainSubstrateDown`. Scrapes to a node fail while others succeed.
 
 ### Steps
 
-1. Identify which shards are partitioned:
+1. Identify which nodes are unreachable:
    ```
-   up{job="brain"} == 0
+   up{job="brain-server"} == 0
    ```
+   `up` is Prometheus's own scrape-result series and carries `job` and
+   `instance`, never `shard` — it tells you which **process** is unreachable.
+   Shards are threads inside one process, so they are never individually
+   unreachable: either the process answers or none of its shards do.
 
-2. Investigate network:
-   - Ping reachable from this side?
-   - DNS working?
-   - Firewall changes?
+2. Distinguish unreachable from not-ready. A node that answers `/readyz` with
+   `503` is up and refusing traffic because a shard thread died:
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' http://<node>:9091/readyz
+   curl -s http://<node>:9091/readyz
+   ```
+   `{"ready":false,"shards":4,"alive":3}` is a dead shard thread, not a
+   network problem — that is RB-8, not this runbook.
 
-3. The cluster may be in degraded state but operating with the majority side.
+3. Investigate the network:
+   - Is the node reachable by ping from the scraper's side?
+   - Is DNS resolving?
+   - Have firewall rules or security groups changed?
+   - Is the metrics listener bound to an interface the scraper can reach?
+     It binds `[server] metrics_addr`, separately from the data plane.
 
-4. Resolve network. Cluster auto-reconciles when partition heals.
+4. Check whether clients are affected or only the scraper. The data plane and
+   the metrics endpoint are different ports, so a firewall change can blind
+   monitoring while traffic still flows — or the reverse, which is worse.
 
 ### Escalate if
-Network can't be resolved. Manual intervention to reduce cluster size to majority side.
+The node is reachable but not answering, or the network cannot be resolved.
+Capture `/readyz`, the scrape error, and the node's own logs.
 
 ---
 

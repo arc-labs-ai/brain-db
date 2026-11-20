@@ -2,7 +2,7 @@
 //!
 //! Plugin surface for the Brain write pipeline.
 //!
-//! Three plugin kinds, each anchored on the shared lifecycle trait
+//! Two plugin kinds, each anchored on the shared lifecycle trait
 //! [`RecallPlugin`]:
 //!
 //! - [`EnricherPlugin`] — mutate candidate items between extraction

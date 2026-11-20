@@ -4,15 +4,54 @@
 use std::collections::{HashMap, HashSet};
 
 use brain_core::RelationType;
-use brain_core::{Cardinality, EntityTypeId, RelationTypeId};
+use brain_core::{Cardinality, EdgeKindRef, EntityTypeId, NodeRef, RelationTypeId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
+use crate::tables::edge::EDGES_TABLE;
+use crate::tables::relation::{RELATION_METADATA_TABLE, RELATION_TYPE_EMBEDDINGS_TABLE};
 use crate::tables::relation_type::{
     encode_entity_type_id, RelationTypeDefinition, RelationTypeOrigin,
-    RELATION_TYPES_BY_SCOPE_TABLE, RELATION_TYPES_TABLE,
+    RELATION_TYPES_BY_SCOPE_TABLE, RELATION_TYPES_TABLE, RELATION_TYPE_ID_HIGH_WATER_TABLE,
 };
 use crate::tables::scope::{space_chain, DeclScope, SPACE_BASE};
+
+/// One relation-type declaration an incoming schema document re-states,
+/// resolved to the exact storage form an intern would write. A replace keeps
+/// its id so typed edges and relation metadata continue naming the type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationTypeRedeclaration {
+    pub name: String,
+    pub from_type: Option<EntityTypeId>,
+    pub to_type: Option<EntityTypeId>,
+    pub cardinality: Cardinality,
+    pub is_symmetric: bool,
+    pub description: String,
+}
+
+impl RelationTypeRedeclaration {
+    fn matches(&self, row: &RelationTypeDefinition) -> bool {
+        row_matches_constraints(
+            row,
+            self.from_type,
+            self.to_type,
+            self.cardinality,
+            self.is_symmetric,
+        )
+    }
+}
+
+fn row_matches_constraints(
+    row: &RelationTypeDefinition,
+    from_type: Option<EntityTypeId>,
+    to_type: Option<EntityTypeId>,
+    cardinality: Cardinality,
+    is_symmetric: bool,
+) -> bool {
+    row.cardinality == cardinality.as_u8()
+        && (row.is_symmetric != 0) == is_symmetric
+        && row.from_entity_type_id == encode_entity_type_id(from_type)
+        && row.to_entity_type_id == encode_entity_type_id(to_type)
+}
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -439,22 +478,22 @@ pub fn relation_type_intern(
         }
     };
     if let Some((id_raw, row)) = probed {
-        // Constraint-only equality (excludes schema_version) so an
-        // unchanged relation type carried forward into a new schema
-        // version is a no-op rather than a conflict.
-        let constraints_match = row.cardinality == cardinality.as_u8()
-            && (row.is_symmetric != 0) == is_symmetric
-            && row.from_entity_type_id == encode_entity_type_id(from_type)
-            && row.to_entity_type_id == encode_entity_type_id(to_type)
-            && row.description == description;
+        // Semantic constraint equality (excluding schema_version and
+        // documentation) lets an unchanged relation type carried forward
+        // into a new schema version be a no-op rather than a conflict.
+        let constraints_match =
+            row_matches_constraints(&row, from_type, to_type, cardinality, is_symmetric);
 
-        if constraints_match && row.schema_version == schema_version {
+        if constraints_match
+            && row.schema_version == schema_version
+            && row.description == description
+        {
             return Ok(RelationTypeId::from(id_raw));
         }
 
-        // Constraints match but schema_version advanced — bump the
-        // row's version in-place. Existing id is reused so relations
-        // already pointing at it stay valid.
+        // When constraints match but the schema version advances or the
+        // documentation is corrected, re-stamp the row in place. Reusing
+        // the existing id keeps relations already pointing at it valid.
         if constraints_match && row.origin().is_schema_declared() {
             let rt = RelationType {
                 id: RelationTypeId::from(id_raw),
@@ -508,19 +547,8 @@ pub fn relation_type_intern(
         });
     }
 
-    // Fresh registration. Allocate id = max(existing) + 1.
-    let next_id_raw: u32 = {
-        let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
-        let mut max: u32 = 0;
-        for entry in t.iter()? {
-            let (k, _) = entry?;
-            let id = k.value();
-            if id > max {
-                max = id;
-            }
-        }
-        max.checked_add(1).expect("RelationTypeId space exhausted")
-    };
+    // Fresh registration.
+    let next_id_raw: u32 = relation_type_next_id(wtxn)?;
 
     let rt = RelationType {
         id: RelationTypeId::from(next_id_raw),
@@ -545,6 +573,90 @@ pub fn relation_type_intern(
     }
 
     Ok(RelationTypeId::from(next_id_raw))
+}
+
+/// Allocate the next `RelationTypeId`, advancing the persisted high-water
+/// mark.
+///
+/// An id is never reused. Dropping a relation type removes its row but not
+/// the edges written against it: those still carry the number, so handing
+/// the same number to the next name interned would silently change what
+/// every one of them means. The mark only rises, so a dropped id is retired
+/// for the life of the store. Mirrors
+/// [`crate::schema::predicate`]'s allocator.
+///
+/// The mark is a single row because `RELATION_TYPES_TABLE` is keyed on the
+/// bare id — one id space serves every namespace and space in the store,
+/// which is the same space the superseded `max(existing) + 1` scan covered.
+///
+/// With no mark stored the store predates the table, so the mark is seeded
+/// from the highest id anything in the store still witnesses, not merely the
+/// highest live registry key. A store may already have dropped its
+/// highest-numbered relation type while edges or relation metadata still
+/// carry that number.
+fn relation_type_next_id(wtxn: &WriteTransaction) -> Result<u32, RelationTypeOpError> {
+    let stored: Option<u32> = wtxn
+        .open_table(RELATION_TYPE_ID_HIGH_WATER_TABLE)?
+        .get(&())?
+        .map(|v| v.value());
+    let high_water: u32 = match stored {
+        Some(mark) => mark,
+        None => relation_type_id_seed(wtxn)?,
+    };
+    let next = high_water
+        .checked_add(1)
+        .expect("RelationTypeId space exhausted");
+    {
+        let mut t = wtxn.open_table(RELATION_TYPE_ID_HIGH_WATER_TABLE)?;
+        t.insert(&(), &next)?;
+    }
+    Ok(next)
+}
+
+/// Find the highest relation-type id that any durable table still witnesses.
+/// Stores without a high-water mark may have retired ids whose registry rows
+/// are gone, so the registry alone cannot identify the next safe number.
+/// The registry and embeddings count when they still have the highest
+/// witness, while typed edges and relation sidecars pin ids that may outlive
+/// the registry row.
+fn relation_type_id_seed(wtxn: &WriteTransaction) -> Result<u32, RelationTypeOpError> {
+    let mut seed: u32 = 0;
+    let highest_registry: Option<u32> = wtxn
+        .open_table(RELATION_TYPES_TABLE)?
+        .last()?
+        .map(|(k, _)| k.value());
+    if let Some(v) = highest_registry {
+        seed = seed.max(v);
+    }
+    let highest_embedding: Option<u32> = wtxn
+        .open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?
+        .last()?
+        .map(|(k, _)| k.value());
+    if let Some(v) = highest_embedding {
+        seed = seed.max(v);
+    }
+    {
+        let t = wtxn.open_table(EDGES_TABLE)?;
+        for entry in t.iter()? {
+            let (k, _) = entry?;
+            let bytes = k.value();
+            if bytes.len() > NodeRef::BYTES {
+                if let Ok((EdgeKindRef::Typed(id), _)) =
+                    EdgeKindRef::decode_from(&bytes[NodeRef::BYTES..])
+                {
+                    seed = seed.max(id.raw());
+                }
+            }
+        }
+    }
+    {
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        for entry in t.iter()? {
+            let (_, value) = entry?;
+            seed = seed.max(value.value().relation_type_id);
+        }
+    }
+    Ok(seed)
 }
 
 /// Resolve a relation type in `scope`, coining it if nothing resolves.
@@ -572,18 +684,9 @@ pub fn relation_type_intern_or_get(
         return Ok(RelationTypeId::from(id_raw));
     }
 
-    let next_id_raw: u32 = {
-        let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
-        let mut max: u32 = 0;
-        for entry in t.iter()? {
-            let (k, _) = entry?;
-            let id = k.value();
-            if id > max {
-                max = id;
-            }
-        }
-        max.checked_add(1).expect("RelationTypeId space exhausted")
-    };
+    // Shares the high-water mark with `relation_type_intern` so id ordering
+    // stays globally monotone across both write paths.
+    let next_id_raw: u32 = relation_type_next_id(wtxn)?;
 
     let rt = RelationType {
         id: RelationTypeId::from(next_id_raw),
@@ -617,50 +720,73 @@ pub fn relation_type_intern_or_get(
     Ok(RelationTypeId::from(next_id_raw))
 }
 
-/// Drop every schema-declared relation_type row in `namespace`.
-/// Implicit-from-write rows are preserved. Counterpart to
-/// [`crate::schema::predicate::predicate_drop_schema_declared`]; used
-/// by `SCHEMA_REPLACE` to clear the existing declared vocabulary
-/// before re-running apply.
+/// One schema-declared relation type a replace would remove.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedRelationType {
+    /// Identifier of the registry row that would be removed.
+    pub id: RelationTypeId,
+    /// Declaration name used in the schema document.
+    pub name: String,
+    /// Qualified name used by the scope index.
+    pub qname: String,
+}
+
+/// Select schema-declared relation types a replace would remove from `scope`.
+pub fn relation_type_schema_declared_victims(
+    wtxn: &WriteTransaction,
+    scope: DeclScope<'_>,
+    redeclared: &[RelationTypeRedeclaration],
+) -> Result<Vec<DroppedRelationType>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    validate_namespace(namespace)?;
+    let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+    let mut out = Vec::new();
+    for entry in idx.iter()? {
+        let (k, v) = entry?;
+        let (q, sp) = k.value();
+        if sp != space {
+            continue;
+        }
+        let id = v.value();
+        let Some(row) = t.get(&id)?.map(|g| g.value()) else {
+            continue;
+        };
+        if row.namespace == namespace
+            && row.origin().is_schema_declared()
+            && !redeclared
+                .iter()
+                .any(|entry| entry.name == row.name && entry.matches(&row))
+        {
+            out.push(DroppedRelationType {
+                id: RelationTypeId::from(id),
+                name: row.name,
+                qname: q.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Drop the scope's schema-declared relation types except declarations the
+/// incoming document re-states unchanged. Preserving those rows keeps typed
+/// edges and relation metadata naming the type after the replace.
 pub fn relation_type_drop_schema_declared(
     wtxn: &WriteTransaction,
     scope: DeclScope<'_>,
+    redeclared: &[RelationTypeRedeclaration],
 ) -> Result<usize, RelationTypeOpError> {
-    let (namespace, space) = (scope.namespace(), scope.space_id());
-    validate_namespace(namespace)?;
-
-    // Victims are the declarations THIS SCOPE made, for the reason given on
-    // [`crate::schema::predicate::predicate_drop_schema_declared`].
-    let victims: Vec<(u32, String)> = {
-        let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
-        let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
-        let mut out = Vec::new();
-        for entry in idx.iter()? {
-            let (k, v) = entry?;
-            let (q, sp) = k.value();
-            if sp != space {
-                continue;
-            }
-            let id = v.value();
-            let Some(row) = t.get(&id)?.map(|g| g.value()) else {
-                continue;
-            };
-            if row.namespace == namespace && row.origin().is_schema_declared() {
-                out.push((id, q.to_string()));
-            }
-        }
-        out
-    };
+    let victims = relation_type_schema_declared_victims(wtxn, scope, redeclared)?;
     let count = victims.len();
     {
         let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
-        for (id, _) in &victims {
-            t.remove(id)?;
+        for victim in &victims {
+            t.remove(&victim.id.raw())?;
         }
     }
     {
-        for (id, q) in &victims {
-            scope_remove_entry(wtxn, q.as_str(), *id)?;
+        for victim in &victims {
+            scope_remove_entry(wtxn, victim.qname.as_str(), victim.id.raw())?;
         }
     }
     Ok(count)
@@ -836,6 +962,212 @@ mod tests {
         let got = scope_get_exact_wtxn(&wtxn, qname(ns, name).as_str(), space).unwrap();
         wtxn.commit().unwrap();
         got
+    }
+
+    /// Without this preservation probe, replacing an unchanged relation type
+    /// would orphan typed edges and relation metadata carrying its id.
+    #[test]
+    fn a_replace_that_restates_a_relation_type_keeps_its_identifier() {
+        let (_dir, db) = open_db();
+        let id = rt_at(&db, SPACE_BASE, "acme", "owns");
+        let wtxn = db.begin_write().unwrap();
+        let dropped = relation_type_drop_schema_declared(
+            &wtxn,
+            DeclScope::base("acme"),
+            &[RelationTypeRedeclaration {
+                name: "owns".into(),
+                from_type: None,
+                to_type: None,
+                cardinality: Cardinality::ManyToMany,
+                is_symmetric: false,
+                description: String::new(),
+            }],
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            rt_declares_exactly(&db, SPACE_BASE, "acme", "owns"),
+            Some(id.raw())
+        );
+    }
+
+    /// A description is documentation, so correcting it preserves the relation type's row and id.
+    #[test]
+    fn a_description_only_relation_type_replace_preserves_row_and_updates_prose() {
+        let (_dir, db) = open_db();
+        let id = rt_at(&db, SPACE_BASE, "acme", "owns");
+        let wtxn = db.begin_write().unwrap();
+        let dropped = relation_type_drop_schema_declared(
+            &wtxn,
+            DeclScope::base("acme"),
+            &[RelationTypeRedeclaration {
+                name: "owns".into(),
+                from_type: None,
+                to_type: None,
+                cardinality: Cardinality::ManyToMany,
+                is_symmetric: false,
+                description: "corrected documentation".into(),
+            }],
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            rt_declares_exactly(&db, SPACE_BASE, "acme", "owns"),
+            Some(id.raw())
+        );
+
+        let wtxn = db.begin_write().unwrap();
+        let restamped = relation_type_intern(
+            &wtxn,
+            DeclScope::base("acme"),
+            "owns",
+            None,
+            None,
+            Cardinality::ManyToMany,
+            false,
+            1,
+            "corrected documentation",
+            RT_NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(restamped, id);
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+        assert_eq!(
+            t.get(&id.raw()).unwrap().unwrap().value().description,
+            "corrected documentation"
+        );
+    }
+
+    /// A same-version re-intern must write corrected documentation instead of
+    /// retaining stale prose.
+    #[test]
+    fn a_same_version_relation_type_reintern_restamps_description() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let first = relation_type_intern(
+            &wtxn,
+            DeclScope::base("acme"),
+            "owns",
+            None,
+            None,
+            Cardinality::ManyToMany,
+            false,
+            1,
+            "original documentation",
+            RT_NOW,
+        )
+        .unwrap();
+        let second = relation_type_intern(
+            &wtxn,
+            DeclScope::base("acme"),
+            "owns",
+            None,
+            None,
+            Cardinality::ManyToMany,
+            false,
+            1,
+            "new documentation",
+            RT_NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(second, first);
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+        assert_eq!(
+            t.get(&first.raw()).unwrap().unwrap().value().description,
+            "new documentation"
+        );
+    }
+
+    /// Without selective preservation, an omitted relation type would be
+    /// removed while the re-stated type remained available.
+    #[test]
+    fn a_replace_that_omits_a_relation_type_retires_its_identifier() {
+        let (_dir, db) = open_db();
+        let owns = rt_at(&db, SPACE_BASE, "acme", "owns");
+        let reports = rt_at(&db, SPACE_BASE, "acme", "reports_to");
+        let wtxn = db.begin_write().unwrap();
+        assert_eq!(
+            relation_type_drop_schema_declared(
+                &wtxn,
+                DeclScope::base("acme"),
+                &[RelationTypeRedeclaration {
+                    name: "owns".into(),
+                    from_type: None,
+                    to_type: None,
+                    cardinality: Cardinality::ManyToMany,
+                    is_symmetric: false,
+                    description: String::new(),
+                }]
+            )
+            .unwrap(),
+            1
+        );
+        wtxn.commit().unwrap();
+        assert_eq!(
+            rt_declares_exactly(&db, SPACE_BASE, "acme", "owns"),
+            Some(owns.raw())
+        );
+        assert_eq!(
+            rt_declares_exactly(&db, SPACE_BASE, "acme", "reports_to"),
+            None
+        );
+        let next = rt_at(&db, SPACE_BASE, "acme", "escalates_to");
+        assert!(next.raw() > reports.raw());
+    }
+
+    /// Without constraint matching, a changed relation type would preserve
+    /// an id whose endpoint or cardinality semantics no longer agree.
+    #[test]
+    fn a_replace_that_changes_a_relation_type_does_not_reuse_the_identifier() {
+        let (_dir, db) = open_db();
+        let old = rt_at(&db, SPACE_BASE, "acme", "owns");
+        let wtxn = db.begin_write().unwrap();
+        assert_eq!(
+            relation_type_drop_schema_declared(
+                &wtxn,
+                DeclScope::base("acme"),
+                &[RelationTypeRedeclaration {
+                    name: "owns".into(),
+                    from_type: None,
+                    to_type: None,
+                    cardinality: Cardinality::OneToMany,
+                    is_symmetric: false,
+                    description: String::new(),
+                }]
+            )
+            .unwrap(),
+            1
+        );
+        wtxn.commit().unwrap();
+        assert_eq!(rt_declares_exactly(&db, SPACE_BASE, "acme", "owns"), None);
+        let new_id = {
+            let wtxn = db.begin_write().unwrap();
+            let id = relation_type_intern(
+                &wtxn,
+                DeclScope::base("acme"),
+                "owns",
+                None,
+                None,
+                Cardinality::OneToMany,
+                false,
+                1,
+                "",
+                RT_NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        assert_ne!(new_id, old);
+        assert!(new_id.raw() > old.raw());
     }
 
     #[test]
@@ -1318,5 +1650,253 @@ mod tests {
         // An id with no stored embedding returns None.
         let missing = relation_type_embedding_get(&rtxn, RelationTypeId::from(99)).unwrap();
         assert!(missing.is_none());
+    }
+
+    /// Relation-type identifiers remain retired after a declaration is
+    /// removed, so edges carrying the retired number can never change meaning.
+    #[test]
+    fn dropping_a_relation_type_retires_its_identifier() {
+        let (_dir, db) = open_db();
+        let dropped = rt_at(&db, SPACE_BASE, "acme", "works_at");
+
+        {
+            let wtxn = db.begin_write().unwrap();
+            assert_eq!(
+                relation_type_drop_one(&wtxn, DeclScope::base("acme"), "works_at").unwrap(),
+                Some(dropped),
+                "dropping a declared relation type returns its identifier"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        let next = rt_at(&db, SPACE_BASE, "acme", "employs");
+        assert_ne!(
+            next.raw(),
+            dropped.raw(),
+            "a new declaration must not reuse a retired identifier"
+        );
+        assert!(
+            next.raw() > dropped.raw(),
+            "new relation-type identifiers must advance past retired identifiers"
+        );
+    }
+
+    /// Relation-type identifiers increase monotonically across independent
+    /// declaration and removal transactions, preserving stable references.
+    #[test]
+    fn repeated_relation_type_churn_keeps_identifiers_strictly_increasing() {
+        let (_dir, db) = open_db();
+        let mut ids = Vec::new();
+
+        for i in 0..4 {
+            let name = format!("churn_{i}");
+            let id = rt_at(&db, SPACE_BASE, "acme", &name);
+            ids.push(id.raw());
+
+            let wtxn = db.begin_write().unwrap();
+            assert_eq!(
+                relation_type_drop_one(&wtxn, DeclScope::base("acme"), &name).unwrap(),
+                Some(id),
+                "each churned declaration must be removed by its identifier"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        assert!(
+            ids.windows(2).all(|pair| pair[1] > pair[0]),
+            "relation-type identifiers must increase across committed churn"
+        );
+        assert_eq!(
+            ids.len(),
+            ids.iter().copied().collect::<HashSet<_>>().len(),
+            "relation-type identifiers must not repeat"
+        );
+    }
+
+    /// A store without a recorded high-water mark continues numbering above
+    /// every relation type already persisted on disk, avoiding identifier clashes.
+    #[test]
+    fn seeding_relation_types_without_a_high_water_mark_continues_above_live_ids() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(7, "alpha"), (12, "beta")] {
+                let relation_type = RelationType {
+                    id: RelationTypeId::from(id_raw),
+                    namespace: "acme".to_string(),
+                    name: name.to_string(),
+                    from_type: None,
+                    to_type: None,
+                    cardinality: Cardinality::ManyToMany,
+                    is_symmetric: false,
+                    schema_version: 0,
+                    description: String::new(),
+                };
+                let row = RelationTypeDefinition::from_relation_type(&relation_type, RT_NOW);
+                {
+                    let mut t = wtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = rt_at(&db, SPACE_BASE, "acme", "gamma");
+        assert_eq!(
+            next.raw(),
+            13,
+            "a store without a mark must continue above its highest live identifier"
+        );
+        assert_ne!(
+            next.raw(),
+            7,
+            "the new identifier must not clash with seeded rows"
+        );
+        assert_ne!(
+            next.raw(),
+            12,
+            "the new identifier must not clash with seeded rows"
+        );
+    }
+
+    /// A retired relation-type identifier still carried by an edge remains
+    /// unavailable when a store has no recorded high-water mark.
+    #[test]
+    fn seeding_relation_types_without_a_high_water_mark_clears_a_dropped_but_referenced_id() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(1, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+                let relation_type = RelationType {
+                    id: RelationTypeId::from(id_raw),
+                    namespace: "acme".to_string(),
+                    name: name.to_string(),
+                    from_type: None,
+                    to_type: None,
+                    cardinality: Cardinality::ManyToMany,
+                    is_symmetric: false,
+                    schema_version: 0,
+                    description: String::new(),
+                };
+                let row = RelationTypeDefinition::from_relation_type(&relation_type, RT_NOW);
+                {
+                    let mut t = wtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            {
+                let key = crate::tables::edge::EdgeKey {
+                    from: NodeRef::Entity(brain_core::EntityId::from_bytes([1u8; 16])),
+                    kind: EdgeKindRef::Typed(RelationTypeId::from(5)),
+                    to: NodeRef::Entity(brain_core::EntityId::from_bytes([2u8; 16])),
+                    disambiguator: [3u8; 16],
+                }
+                .encode();
+                let mut t = wtxn.open_table(EDGES_TABLE).unwrap();
+                t.insert(
+                    key.as_slice(),
+                    &crate::tables::edge::EdgeData::new(1.0, 0, 0, 0),
+                )
+                .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = rt_at(&db, SPACE_BASE, "acme", "epsilon");
+        assert_eq!(
+            next.raw(),
+            6,
+            "a retired identifier that edges still carry must not be handed to a new name"
+        );
+        assert_ne!(
+            next.raw(),
+            5,
+            "a retired identifier that edges still carry must not be handed to a new name"
+        );
+    }
+
+    /// Every durable relation-type witness contributes to the seed used
+    /// without a recorded high-water mark.
+    #[test]
+    fn seeding_relation_types_without_a_high_water_mark_counts_every_table_that_witnesses_an_id() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(1, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+                let relation_type = RelationType {
+                    id: RelationTypeId::from(id_raw),
+                    namespace: "acme".to_string(),
+                    name: name.to_string(),
+                    from_type: None,
+                    to_type: None,
+                    cardinality: Cardinality::ManyToMany,
+                    is_symmetric: false,
+                    schema_version: 0,
+                    description: String::new(),
+                };
+                let row = RelationTypeDefinition::from_relation_type(&relation_type, RT_NOW);
+                {
+                    let mut t = wtxn.open_table(RELATION_TYPES_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            {
+                let mut t = wtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE).unwrap();
+                t.insert(&7u32, &[1u8, 2u8][..]).unwrap();
+            }
+            {
+                let metadata = crate::tables::relation::RelationMetadata {
+                    namespace_id: 0,
+                    space_id_bytes: [0u8; 16],
+                    session_id: 0,
+                    from_tag: 0,
+                    from_bytes: [0u8; 16],
+                    to_tag: 0,
+                    to_bytes: [0u8; 16],
+                    relation_type_id: 9,
+                    chain_root_bytes: [0u8; 16],
+                    properties_blob: Vec::new(),
+                    version: 0,
+                    confidence: 0.0,
+                    extractor_id: 0,
+                    extracted_at_unix_nanos: 0,
+                    valid_from_unix_nanos: None,
+                    valid_to_unix_nanos: None,
+                    superseded_by_bytes: None,
+                    supersedes_bytes: None,
+                    evidence_inline: Vec::new(),
+                    tombstoned: 0,
+                    tombstoned_at_unix_nanos: None,
+                    is_current: 0,
+                    is_symmetric: 0,
+                    flags: 0,
+                };
+                let mut t = wtxn.open_table(RELATION_METADATA_TABLE).unwrap();
+                t.insert(&[4u8; 16], &metadata).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = rt_at(&db, SPACE_BASE, "acme", "zeta");
+        assert_eq!(
+            next.raw(),
+            10,
+            "a witness outside the registry still retires its identifier"
+        );
     }
 }

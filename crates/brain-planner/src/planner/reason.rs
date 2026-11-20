@@ -17,12 +17,8 @@ use crate::plan::{
     recall::{
         AnnSearchStep, EmbeddingStep, FilterStep, MergeStep, MetadataLookupStep, ShardSearchStep,
     },
-    ExecutionPlan, FilterStage, SortKey,
+    FilterStage, SortKey,
 };
-
-pub fn plan_reason(req: &ReasonRequest, ctx: &PlannerContext) -> Result<ExecutionPlan, PlanError> {
-    Ok(ExecutionPlan::Reason(plan_reason_inner(req, ctx)?))
-}
 
 pub fn plan_reason_inner(
     req: &ReasonRequest,
@@ -188,16 +184,9 @@ mod tests {
         }
     }
 
-    fn unwrap_reason(plan: ExecutionPlan) -> ReasonPlan {
-        match plan {
-            ExecutionPlan::Reason(p) => p,
-            other => panic!("expected Reason, got {other:?}"),
-        }
-    }
-
     #[test]
     fn default_request_shape() {
-        let plan = unwrap_reason(plan_reason(&base_request(), &PlannerContext::default()).unwrap());
+        let plan = plan_reason_inner(&base_request(), &PlannerContext::default()).unwrap();
         assert!(plan.embedding.is_some());
         assert!(plan.base_recall.is_some());
         assert_eq!(plan.supports_traversal.max_depth, 3);
@@ -217,7 +206,7 @@ mod tests {
     fn by_memory_id_skips_embedding() {
         let mut r = base_request();
         r.observation = ObservationInput::ByMemoryId(MemoryId::from(7u128).raw());
-        let plan = unwrap_reason(plan_reason(&r, &PlannerContext::default()).unwrap());
+        let plan = plan_reason_inner(&r, &PlannerContext::default()).unwrap();
         assert!(plan.embedding.is_none());
         assert!(plan.base_recall.is_none());
     }
@@ -226,7 +215,7 @@ mod tests {
     fn zero_depth_rejected() {
         let mut r = base_request();
         r.depth = 0;
-        match plan_reason(&r, &PlannerContext::default()) {
+        match plan_reason_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "depth"),
             other => panic!("expected InvalidParameters, got {other:?}"),
         }
@@ -236,7 +225,7 @@ mod tests {
     fn depth_over_max_rejected() {
         let mut r = base_request();
         r.depth = 11;
-        match plan_reason(&r, &PlannerContext::default()) {
+        match plan_reason_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "depth"),
             other => panic!("expected InvalidParameters, got {other:?}"),
         }
@@ -246,7 +235,7 @@ mod tests {
     fn confidence_out_of_range_rejected() {
         let mut r = base_request();
         r.confidence_threshold = 2.0;
-        match plan_reason(&r, &PlannerContext::default()) {
+        match plan_reason_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => {
                 assert_eq!(field, "confidence_threshold");
             }
@@ -258,7 +247,7 @@ mod tests {
     fn zero_max_inferences_rejected() {
         let mut r = base_request();
         r.max_inferences = 0;
-        match plan_reason(&r, &PlannerContext::default()) {
+        match plan_reason_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => {
                 assert_eq!(field, "max_inferences");
             }
@@ -270,7 +259,7 @@ mod tests {
     fn max_inferences_over_cap_rejected() {
         let mut r = base_request();
         r.max_inferences = 101;
-        match plan_reason(&r, &PlannerContext::default()) {
+        match plan_reason_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, reason }) => {
                 assert_eq!(field, "max_inferences");
                 assert!(reason.contains("max_plan_results"));

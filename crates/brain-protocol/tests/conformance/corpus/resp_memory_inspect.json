@@ -119,5 +119,7 @@
       "created_at_unix_nanos": 1700000000000000001,
       "annotation": "manually asserted"
     }
-  ]
+  ],
+  "edge_total_count": 2,
+  "edges_truncated": false
 }

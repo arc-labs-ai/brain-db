@@ -425,15 +425,17 @@ fn run_bidirectional_bfs(
 
             // Fetch neighbours along this direction.
             let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> = if is_forward {
-                list_memory_edges_from(&rtxn, node, None)
+                list_memory_edges_from(&rtxn, node, None, 0)
                     .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
+                    .rows
                     .into_iter()
                     .filter(|(k, _, _)| edge_kinds.contains(k))
                     .map(|(k, t, data)| (k, t, data.weight))
                     .collect()
             } else {
-                list_memory_edges_to(&rtxn, node, None)
+                list_memory_edges_to(&rtxn, node, None, 0)
                     .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?
+                    .rows
                     .into_iter()
                     .filter(|(k, _, _)| edge_kinds.contains(k))
                     .map(|(k, s, data)| (k, s, data.weight))

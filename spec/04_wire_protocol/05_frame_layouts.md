@@ -63,7 +63,7 @@ enum WaitMode {
 
 Fields:
 
-- `text` — the content to encode. UTF-8. Maximum length is server-configurable (default: 1 MiB). Empty text is rejected with `TextEmpty`.
+- `text` — the content to encode. UTF-8. Maximum length is server-configurable (default: 1 MiB). Text that is empty, or longer than that maximum, is rejected with `InvalidArgument` naming the `text` field.
 - `session_id` — the session to encode into, an opaque client-chosen `u64`. `0` is the default session. A session is a **soft grouping within a space**, never an isolation boundary; see [`../02_data_model/03_sessions.md`](../02_data_model/03_sessions.md).
 - `request_id` — UUIDv7 recommended; required for idempotent retry.
 - `txn_id` — if non-None, the encode is buffered as part of the transaction and applied at `TXN_COMMIT`.
@@ -77,7 +77,7 @@ There is no `kind`, `salience_hint`, `edges` or `deduplicate` field. Kind and sa
 
 ### 2. ENCODE_VECTOR_DIRECT_REQ (0x2A)
 
-Admin / bulk-import path — **not** a primary client verb. Brain owns the embedding model; ordinary clients send text via `ENCODE` and let the server embed it. This op exists for bulk or administrative import from deployments running their own (often domain-specific or multi-modal) embedder outside Brain. Because the caller supplies the vector, it also supplies the mechanical fields `ENCODE` no longer takes.
+Admin / bulk-import path — **not** a primary client verb. Brain owns the embedding model; ordinary clients send text via `ENCODE` and let the server embed it. This op exists for bulk or administrative import from deployments running their own (often domain-specific or multi-modal) embedder outside Brain. Because the caller supplies the vector, it also supplies the mechanical fields `ENCODE` does not take.
 
 ```rust
 struct EncodeVectorDirectRequest {
@@ -286,7 +286,7 @@ Notes:
 - `max_inflight` is per-subscription rate control. The server stops sending events after this many unacked.
 - `spaces` is also an authorization boundary, not just a filter dimension: the server requires it to resolve to exactly the caller's own effective space (the connection principal's space, or — with `act_as` present — the effective identity's space named by `act_as`). Subscribing across spaces is not supported.
 - `memory_ids` scopes the stream to specific memories — e.g. watching one write's async derivation as it happens. This is the mechanism behind the live write-progress pattern: `ENCODE` with `wait: ack`, then `SUBSCRIBE` with `filter.memory_ids: [that memory_id]`, to receive that write's `StageCompleted` events (§43.2) as `auto_edge`/`temporal_edge`/`extractor`/`hype` each complete. See [05. Operations](../05_operations/02_write_pipeline.md) §17e.
-- `act_as` follows the standard mechanism (§10a of [`04_handshake.md`](04_handshake.md)), with one structural note: `SUBSCRIBE`/`UNSUBSCRIBE`/`CANCEL_STREAM` historically dispatched through a code path separate from the normal `act_as`-aware dispatch, so support here required resolving the effective identity explicitly in that branch rather than falling out of the shared mechanism for free. Behavior when `act_as` is absent is unchanged from before this support existed.
+- `act_as` follows the standard mechanism (§10a of [`04_handshake.md`](04_handshake.md)), with one structural note: `SUBSCRIBE`/`UNSUBSCRIBE`/`CANCEL_STREAM` dispatch through a code path separate from the normal `act_as`-aware dispatch, so the effective identity is resolved explicitly in that branch rather than inherited from the shared mechanism. With `act_as` absent, the subscription observes the connection's own identity.
 
 ### 8. UNSUBSCRIBE_REQ (0x31)
 
@@ -375,6 +375,18 @@ struct ByeRequest {
     reason: Option<String>,                  // optional log session
 }
 ```
+
+## Substrate admin frames (§16-§25, §35, §51-§60, §70) — layouts for refused opcodes
+
+The frames below are the ones the substrate admin range was designed with, and
+they are documented because the opcode numbers are allocated and must not be
+renumbered. **The dispatcher refuses every one of them** with *"admin
+operations are served over the HTTP admin listener, not the wire protocol"* —
+a permanent rejection, not a version gate. A client that needs one of these
+operations calls the corresponding route in
+[05.06 Admin operations](../05_operations/06_admin.md); §03 §1.6 maps each
+opcode to its route. The one admin frame that is served is
+`ADMIN_LIST_PENDING_CONTRADICTIONS` (§36 / §71).
 
 ### 16. ADMIN_STATS_REQ (0x60)
 
@@ -495,7 +507,7 @@ Returns a streaming response with one tombstoned memory's details per frame. Use
 
 ### 26. LINK_REQ (0x25) / UNLINK_REQ (0x26)
 
-The explicit edge verbs. `ENCODE` no longer carries an `edges` list; a client that wants a specific edge writes it with `LINK`.
+The explicit edge verbs. `ENCODE` carries no `edges` list; a client that wants a specific edge writes it with `LINK`.
 
 ```rust
 struct LinkRequest {
@@ -586,7 +598,7 @@ struct MemoryAggregateRequest {
 COUNT, SUM, AVG (and on request MIN, MAX) of salience, plus the summed access count, over the caller's `(namespace, space)` memories. Read-only, same capability as `RECALL`. The server picks the source and reports it:
 
 - **Counters.** When the request filters and groups only by kind and status and asks for no MIN / MAX, the answer comes from running totals the writer updates in the same transaction as each memory row: exact as of the last committed write, and the same cost for ten memories or a billion.
-- **Snapshot.** Any field marked *snapshot only* needs a scan. The server answers from its latest columnar snapshot of the memory fields, refreshed every `[analytics] export_interval_secs` — usually by a small delta of the memories changed since the last full snapshot, so refreshes stay cheap at any size — and *which memories* are counted is as of `as_of_unix_nanos`, not live. With `[analytics]` disabled the request fails with `CapabilityNotEnabled`; before the first export finishes, with `RetrievalUnavailable`.
+- **Snapshot.** Any field marked *snapshot only* needs a scan. The server answers from its latest columnar snapshot of the memory fields, refreshed every `[analytics] export_interval_secs` — usually by a small delta of the memories changed since the last full snapshot, so refreshes stay cheap at any size — and *which memories* are counted is as of `as_of_unix_nanos`, not live. With `[analytics]` disabled the request fails with `InvalidArgument`; before the first export finishes, with `ShardUnavailable`.
 
 Salience decays continuously, so both sources evaluate it at the time of the request, not at the snapshot time: salience sums, averages, MIN / MAX and salience filters always reflect decay up to now. Sums are floating point; the two sources agree to ~10⁻⁶ per memory.
 
@@ -687,7 +699,7 @@ struct SessionDeleteRequest {
 
 `SESSION_CREATE` is idempotent. `SESSION_LIST` returns one space's sessions newest-first by `last_active`. The default session (`session_id = 0`) is **non-deletable**.
 
-These are the tenant-facing registry ops. The admin-gated `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` (§21, §22) are a separate operator surface: they name sessions and are not `act_as`-aware.
+These are the tenant-facing registry ops, and they are the only session surface that works: `SESSION_CREATE` carries the optional `title` and is `act_as`-aware. The `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` frames (§21, §22) are refused on the wire, and nothing renames a session anywhere.
 
 ### 33a. LLM_CREDENTIAL_PUT_REQ (0x76) / GET (0x77) / DELETE (0x78) / VERIFY (0x79)
 
@@ -849,7 +861,7 @@ Fields:
 
 - `memory_id` — always returned, even on dedup (returns the existing one's id).
 - `was_deduplicated` — true when the write collapsed onto an existing row instead of creating one. Dedup is on by default; `allow_duplicates` opts out.
-- `salience` — the salience the write router assigned. The client no longer supplies a hint, so this is the only place the value appears.
+- `salience` — the salience the write router assigned. The client supplies no hint, so this is the only place the value appears.
 - `kind` — the kind the write router assigned.
 - `auto_edges_added` — count of edges derived during encode. Doesn't include explicit edges written with `LINK`.
 - `space_id` — the space the row was attributed to, echoed so the client can verify routing (particularly under `act_as`).
@@ -1588,6 +1600,8 @@ struct MemoryInspectResponse {
     text: String,
     artifact: EncodeStageArtifact,           // the same bundle shape as EncodeTrace's per-stage artifact (§37.1)
     edges: Vec<MemoryEdgeWire>,
+    edge_total_count: Option<u32>,           // edges anchored at this memory, both directions, counted before the cap; absent when the server does not report a total
+    edges_truncated: bool,                   // set when `edges` carries only part of that set
 }
 
 struct MemoryEdgeWire {
@@ -1601,6 +1615,12 @@ struct MemoryEdgeWire {
 ```
 
 `edges` carries **both directions**, each tagged. An inspect that returned only outgoing edges would not answer "what points at this memory?", which is most of what the edge view is for.
+
+`edges` is capped at **256 per direction**, so a memory with a large edge set stays inspectable rather than growing a response past the frame ceiling on a verb with no client knob. `edge_total_count` is the count before the cap and `edges_truncated` says whether the view is partial, so a caller can tell "this memory has two edges" from "two of this memory's edges are shown". Both fields carry a serde default because a client built after these fields exist must still be able to read a response from a server built before them — a missing key costs the caller the entire response, not just the field. The count is an `Option` so "the server did not report a total" stays distinct from "this memory has no edges", while `edges_truncated` defaults to `false` because silence about truncation does mean the view is whole. The complete enumeration is `GRAPH_FETCH`, which paginates.
+
+The budget is spent per direction rather than across the pair. A single combined cap consumed in walk order would answer a heavily-linked memory with an all-outgoing list and let a reader conclude it has no incoming edges at all.
+
+`annotation` is a per-edge label the wire type permits and no write path sets on a memory↔memory edge. The annotated edges the extractor writes are `Mentions` edges anchored on entities, which this view does not carry. The field is present because the edge record carries it, not because this verb populates it.
 
 There is no `found: bool` on this response. An absent, foreign or forgotten memory is `MemoryNotFound`; an empty `artifact` means the bundle has not been written yet.
 
@@ -1818,6 +1838,7 @@ enum ErrorCategory {
     ResourceExhausted,                       // out of slots, out of disk, rate-limited
     Internal,                                // server bug
     Unavailable,                             // shard unavailable, server overloaded
+    OperatorIntervention,                    // deployment is broken; no retry can clear it
 }
 
 struct ErrorDetails {

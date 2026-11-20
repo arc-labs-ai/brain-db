@@ -197,7 +197,7 @@ The execution engine consists of four parallel implementations, one per executio
 
 #### vector executor
 
-Wraps the HNSW index. The hot loop is SIMD-accelerated dot products against candidate vectors. Reads are lock-free under [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch) reclamation; writes are funneled through a single writer per shard.
+Wraps the HNSW index. The hot loop is SIMD-accelerated dot products against candidate vectors. Reads are lock-free because the index is never mutated in place beneath them: a flush builds a whole new generation and publishes it atomically behind an [`ArcSwap`](https://github.com/vorner/arc-swap), so a reader loads one generation and searches it to completion. Writes are funneled through a single writer per shard.
 
 The vector executor is Brain's vector arm of every `RECALL` — it always contributes to the retrieval fusion, and is the sole contributor for the transactional substrate path (the only case where the lexical and graph retrievers are skipped). See [09. Indexing](../09_indexing/00_purpose.md).
 
@@ -226,9 +226,15 @@ The implementation discipline:
 
 ### The single-writer-per-shard discipline
 
-Within a shard, all writes (ENCODE, FORGET, salience updates, edge additions) funnel through a single writer task on the shard's owning core. This eliminates write-write contention and removes the need for locks on most data structures — the writer is the only mutator.
+Within a shard, all writes (ENCODE, FORGET, salience updates, edge additions) happen on the shard's own core, on its own Glommio executor. That is what removes write-write contention and the need for locks on most data structures: the shard's thread is the only mutator of the shard's state.
 
-Multiple readers run concurrently on the same core (via cooperative async multitasking) and may run concurrently with the writer. Reader-writer coordination uses epoch-based reclamation rather than locks. See [14. Concurrency](../14_concurrency/00_purpose.md).
+The discipline is structural rather than a queue. A shard dispatches requests concurrently — each one is detached onto the local executor with `spawn_local`, under a permit bound derived from the WAL group-commit batch — so reads and the waiting parts of writes overlap, and a shard is not idle while one request is in an fsync. Writes nonetheless serialize against each other, because a redb write transaction contains no `await` and is therefore atomic on a single-threaded executor. No lock enforces it; the absence of a yield point does.
+
+Readers run concurrently with each other and with a write, and they need no coordination with the writer at all: the writer publishes a new generation rather than editing the one readers hold. The displaced generation's memory is returned when the last reader's `Arc` drops — exactly, by refcount, with no reclamation protocol, no reader pins and no grace period to wait out.
+
+Deletion follows the same shape. A forgotten memory's node **stays in the graph** and is filtered out at search time against a tombstone bitmap, so nothing is freed per node; the space comes back only when the generation is next replaced.
+
+Normative text, including the permit derivation and the yield-point rules the serialization depends on: [14. Concurrency](../14_concurrency/00_purpose.md).
 
 ---
 
@@ -243,6 +249,8 @@ Multiple readers run concurrently on the same core (via cooperative async multit
 A memory-mapped flat file (`mmap` with `MAP_SHARED`), one slot per memory at fixed alignment. Slot reads are zero-copy `&[f32]` views — the bytes from disk are directly readable by the SIMD code without any conversion.
 
 Slot size for our 384-dim `f32` vectors is 1600 bytes (1536 vector + 64 metadata/padding, aligned for AVX-512).
+
+The arena is a **boot-time image, not a live mirror**. Exactly one path puts a vector into a slot: WAL replay during recovery. A live `ENCODE` writes no vector into the arena — the write-time vector's durable home is the `memory_vectors` table in redb. So the arena is authoritative for the set of memories that were durable at the last start, and stale for everything written since. Any consumer that needs the complete live set — the HNSW maintenance worker, the admin index-rebuild route — reads redb; only boot recovery's own rebuild may read the arena, because at that instant the arena is the freshly-replayed image of every durable memory. The one live mutation is in the other direction: a hard `FORGET` zeroes the slot at rest once its write commits, guarded by a slot-version check so a slot already reclaimed by a newer memory is left alone.
 
 #### Episodic WAL
 
@@ -262,26 +270,28 @@ redb gives us:
 
 ### Coordination between stores
 
-The arena and metadata stores are coordinated via two-phase logging in the WAL. The sequence on `ENCODE`:
+The stores are coordinated through the WAL. The sequence on `ENCODE`:
 
-1. Allocate a slot in the arena.
-2. Write a WAL record describing the encode (slot_id, vector, metadata).
-3. fsync the WAL via group commit.
-4. Memcpy the vector to the arena slot.
-5. Update metadata in redb.
-6. Publish the new memory_id (epoch advance).
+1. Reserve a fresh `MemoryId` from the shard's monotonic slot counter. Nothing is written yet; an id that is never committed is simply skipped.
+2. Write the WAL record(s) describing the encode (slot_id, vector, metadata) and fsync them via group commit.
+3. Insert the vector into the memory HNSW. This runs before the redb transaction opens, so a failed insert abandons the encode before any metadata commits.
+4. Open **one** redb write transaction, apply every phase of the write into it (the memory row, its text, its vector), and stamp the idempotency row inside the same transaction.
+5. Commit that transaction.
+6. Publish the resulting events and advance the shard's committed watermark.
 
-A reader that sees the new memory_id sees all of: the vector in the arena, the metadata in redb, the edges in the graph. The two-phase structure ensures consistency under crash: if the WAL record is durable, recovery can reconstruct everything else; if it isn't durable, the operation is treated as never happened.
+**The ack barrier is step 5, not step 2.** The WAL fsync is an earlier barrier that makes the record recoverable; the client's acknowledgement is released after the redb commit, so a caller holding an ack is guaranteed the memory row, its text and its vector are durably queryable — not merely replayable. Because the phase applies and the idempotency stamp share one transaction, "applied but not stamped" is unreachable: either both commit or neither.
+
+A reader that sees the new memory_id sees all of: the vector in redb, the metadata in redb, the edges in the graph. If the WAL record is durable, recovery can reconstruct everything else; if it isn't durable, the operation is treated as never having happened.
 
 ### Storage-layer latency
 
 The storage layer is fast on the warm path:
 
 - WAL group commit: ~50–500 µs (dominated by NVMe fsync latency).
-- Arena slot read: ~50 ns (page cache hit) to ~10–100 µs (page cache miss, NVMe read).
-- Arena slot write: <1 µs (memcpy into mmap'd region).
+- Arena slot read: ~50 ns (page cache hit) to ~10–100 µs (page cache miss, NVMe read) — paid during recovery and by the boot rebuild, not by a live `ENCODE`.
+- Arena slot write: <1 µs (memcpy into mmap'd region) — paid once per record by WAL replay.
 - Metadata read: <10 µs (redb point lookup, copy-on-write B-tree).
-- Metadata write: 5–20 µs (redb transaction).
+- Metadata write: 5–20 µs (redb transaction). The write-time vector lands here, so this is the per-encode vector-persistence cost.
 
 For a typical `RECALL`, the storage layer contributes ~5–50 µs total — well below the 5–10 ms embedding cost.
 
@@ -353,7 +363,7 @@ Specified in [16. Sharding & Clustering](../16_sharding/00_purpose.md).
 
 ### What's deferred
 
-**Replication** is intentionally deferred from v1. The first version assumes a single replica per shard; loss of a node means loss of its spaces until restored from snapshot. This is documented as a known limitation, with replication slated for a future revision (see [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) OQ-2).
+**Replication** is intentionally deferred from v1. The first version assumes a single replica per shard; loss of a node means loss of its spaces until restored from snapshot. Replication is slated for a future revision.
 
 **Cross-region active-active** is out of scope. The architecture supports cross-region disaster recovery via snapshot replication, but not active-active across regions.
 

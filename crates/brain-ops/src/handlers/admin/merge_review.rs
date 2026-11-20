@@ -140,7 +140,7 @@ pub async fn handle_admin_approve_merge(
             proposal_id: pid.to_bytes(),
             audit_id: audit_id.to_bytes(),
         }),
-        other => Err(OpError::Internal(format!(
+        other => Err(OpError::PermanentFault(format!(
             "unexpected phase ack for ApproveMerge: {other:?}"
         ))),
     }
@@ -187,7 +187,7 @@ pub async fn handle_admin_reject_merge(
         .map_err(|e| OpError::Internal(format!("submit: {e}")))?;
     match ack.single_phase() {
         PhaseAck::MergeProposalRejected { .. } => Ok(()),
-        other => Err(OpError::Internal(format!(
+        other => Err(OpError::PermanentFault(format!(
             "unexpected phase ack for RejectMerge: {other:?}"
         ))),
     }

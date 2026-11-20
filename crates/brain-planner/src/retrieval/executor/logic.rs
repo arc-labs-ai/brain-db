@@ -104,6 +104,9 @@ pub struct RetrievalExecutorContext {
     /// (the arena is `!Send`), which keeps this context `!Send` — already
     /// true of the dispatch path.
     pub space_vectors: Option<std::rc::Rc<dyn SpaceVectorSource>>,
+    /// A query vector prepared by an async caller. Supplying it keeps the
+    /// synchronous retriever trait free of model work on the shard reactor.
+    pub semantic_query: Option<SemanticQuery>,
 }
 
 impl RetrievalExecutorContext {
@@ -1081,9 +1084,9 @@ fn invoke_semantic(
     include_statements: bool,
 ) -> Result<Vec<RankedItem>, RetrieverInvocationError> {
     let handle = &ctx.semantic;
-    let Some(text) = req.text.as_ref() else {
+    if req.text.is_none() {
         return Err(RetrieverInvocationError::Skipped("no query text"));
-    };
+    }
     let RetrieverConfig::Semantic {
         ef_search,
         similarity_threshold,
@@ -1153,7 +1156,11 @@ fn invoke_semantic(
         filters: SemanticFiltersConfigSlot(filters),
     };
 
-    let query = SemanticQuery::Text(text.clone());
+    let Some(query) = ctx.semantic_query.as_ref().cloned() else {
+        return Err(RetrieverInvocationError::Skipped(
+            "semantic query not prepared",
+        ));
+    };
     handle
         .retrieve(&query, scope, &config, ctx.space_vectors.as_deref())
         .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))

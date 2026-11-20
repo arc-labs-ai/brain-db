@@ -15,6 +15,29 @@ use redb::TableDefinition;
 pub const PREDICATES_TABLE: TableDefinition<'static, u32, PredicateDefinition> =
     TableDefinition::new("predicates");
 
+/// `predicate_id_high_water` — singleton `() -> u32` holding the highest
+/// `PredicateId` ever issued in this store.
+///
+/// Singleton convention: `()` key with `t.get(&())` / `t.insert(&(), &value)`,
+/// matching [`crate::tables::next_lsn::NEXT_LSN_TABLE`].
+///
+/// Predicate ids are allocated from this mark rather than from the highest
+/// key present in [`PREDICATES_TABLE`]. Dropping a predicate removes its row,
+/// so a scan of live rows would hand the freed id straight back to the next
+/// name interned, and every statement still holding that number would start
+/// asserting a different predicate. The mark only ever rises, so a freed id
+/// stays retired.
+///
+/// The mark is a singleton because [`PREDICATES_TABLE`] is keyed on the bare
+/// id: one id space is shared by every namespace and space in the store.
+///
+/// A store written before the mark existed has no row. The allocator then
+/// seeds the mark from the highest id still witnessed anywhere in the store,
+/// including statements, contradiction records, and leftover embeddings that
+/// may carry a retired predicate id after its registry row is gone.
+pub const PREDICATE_ID_HIGH_WATER_TABLE: TableDefinition<'static, (), u32> =
+    TableDefinition::new("predicate_id_high_water");
+
 /// `predicates_by_scope` — secondary index for `(qname, space) →
 /// PredicateId`. Key is the canonical `"namespace:name"` paired with the
 /// space the declaration belongs to; value is the predicate id.

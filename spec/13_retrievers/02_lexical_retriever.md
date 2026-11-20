@@ -38,7 +38,7 @@ pub struct LexicalRetrieverConfig {
     pub bm25_k1: f32,            // default 1.2
     pub bm25_b: f32,             // default 0.75
     pub min_score: Option<f32>,  // None = no cutoff
-    pub timeout_ms: u32,         // default 50
+    pub timeout_ms: u32,         // config default 50; the plan sets 1 s (§8)
 }
 
 pub struct RankedItem {
@@ -66,21 +66,30 @@ BM25 scores to cosine similarities is wrong.
 
 Binding for §10/06 (tantivy schema) and the tokenizer impl.
 
-Steps, in order:
+Steps, in order
+(`crates/brain-index/src/tantivy_shard/tokenizer.rs:1-66`):
 
 1. **Unicode normalization** — NFC. Non-NFC inputs normalize
    before any other step.
 2. **Lowercase** — full Unicode-aware lowercase.
-3. **Sublanguage preservation** — before generic splitting, two
-   regex passes emit standalone tokens (not stemmed, not split
-   further by the next step):
-   - URL pattern: `\bhttps?://\S+`.
-   - Code/ID pattern: `[A-Z][A-Z0-9]+-\d+` (ticket IDs like
-     `ACME-1247`), plus dot/underscore-joined identifiers
-     `[a-z_][a-zA-Z0-9_.]+`. These survive verbatim so exact-ID
-     queries work.
-4. **Generic tokenization** — split on whitespace and Unicode
-   punctuation.
+3. **Sublanguage preservation** — before generic splitting, one
+   combined regex pass emits standalone tokens (not stemmed, not
+   split further by the next step):
+   - URL: `\bhttps?://\S+`.
+   - Ticket-style code ID: `\b[A-Za-z][A-Za-z0-9]+-\d+\b` — matches
+     `ACME-1247`. Case-insensitive at match time, lowercased on
+     emission, so `acme-1247` and `ACME-1247` are one token.
+   - Dot/underscore-joined identifier:
+     `\b[a-zA-Z_][a-zA-Z0-9_]*[._][a-zA-Z0-9_.]+\b` — matches
+     `brain_storage`, `foo.bar.baz`, `module.fn`. The **internal
+     separator is required**: a plain English word has none, so it
+     falls through to step 4 and is stemmed like any other word. A
+     pattern that matched bare lowercase runs would protect the
+     whole language from stemming.
+4. **Generic tokenization** — the residue between protected
+   matches is tokenized by a positive word pattern,
+   `[\p{L}\p{N}]+` (letter and number runs), rather than by
+   enumerating separators.
 5. **Stop-word removal** — **NO**. BM25's `idf` term
    demotes high-frequency words naturally; aggressive stop-word
    removal would break exact-ID queries on tokens like `to` or
@@ -88,6 +97,11 @@ Steps, in order:
 6. **Porter / English stemming** — applied only to the
    generic-tokenization output, NOT to the sublanguage tokens
    from step 3.
+
+The analyzer registers on each per-shard `tantivy::Index` under the
+name `"default"`, overriding tantivy's built-in, so `TEXT` fields pick
+it up without a schema-version bump
+(`crates/brain-index/src/tantivy_shard/tokenizer.rs:26-29`).
 
 The pipeline is the same for both `LexicalScope::MemoryText` and
 `LexicalScope::StatementText`; per-field overrides are explicitly
@@ -157,6 +171,11 @@ commits the retriever's view is frozen.
 | `QueryParseFailed` | Empty query, invalid filter, or filter field not in scope schema. | Yes — client bug. |
 | `Timeout` | Query exceeded `config.timeout_ms`. | Yes — degraded response. |
 
+The budget the planner sets is **soft**: exceeding it records the lane as
+`Timeout` and warns, but does not cancel the in-flight tantivy query, and a
+late result still reaches fusion
+(`crates/brain-planner/src/retrieval/planner/logic.rs:55-65`).
+
 An **empty result** (`Ok(vec![])`) is NOT an error. The
 retriever does not interpret zero matches.
 
@@ -171,7 +190,16 @@ Pinned in §19 (perf targets):
 | Statement @ 1M, single-term | 10 ms | 50 ms |
 | Statement @ 1M, multi-term + filter | 15 ms | 70 ms |
 
-These are the lexical-retriever acceptance gates; validated by the lexical-retrieval benches in §19.
+These are the lexical-retriever acceptance gates. The `lexical_retrieve`
+bench (`crates/brain-index/benches/lexical_retrieve.rs`) reports per-query
+timings at a 10K corpus on manual dispatch and asserts nothing; the 100K/1M
+targets above are the acceptance gates, validated on reference hardware (see
+[`../19_benchmarks/05_acceptance_test_suite.md`](../19_benchmarks/05_acceptance_test_suite.md)
+§"Performance tests").
+
+The planned per-retriever budget is 1 s, not the 50 ms `LexicalRetrieverConfig`
+default: the figures above are the lexical lane in isolation, while the budget
+has to cover the slowest lane in a shared fan-out.
 
 ## 9. Boundaries
 

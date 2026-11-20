@@ -118,8 +118,7 @@ tuple. Circular dependencies are rejected at schema-apply time
 
 Brain supports linear chains. Diamond / multi-source
 dependencies are accepted but order is arbitrary across the
-diamond; deterministic ordering is tracked in
-[`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
+diamond.
 
 ## 7. Tests
 

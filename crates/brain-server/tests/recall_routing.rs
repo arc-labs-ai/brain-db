@@ -29,33 +29,7 @@ use brain_protocol::SchemaUploadRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::config;
 
 mod support_harness;
 
@@ -443,7 +417,7 @@ async fn unicode_cue_text_roundtrips_through_retrieval_recall() {
 }
 
 // ---------------------------------------------------------------------------
-// P3 — txn recall invariant across request shapes. For varied request
+// Txn recall invariant across request shapes. For varied request
 // shapes (cue text, top_k, salience floor), an in-txn recall walks the
 // same retrieval pipeline as a non-txn recall over the committed
 // fixture (the txn buffers no writes here), then overlays its empty

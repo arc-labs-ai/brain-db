@@ -1,6 +1,6 @@
 # 08. Storage: Arena & WAL
 
-> **TL;DR.** Per-shard durable storage. The arena is a memory-mapped flat file of fixed-size 1600-byte slots holding vectors, accessed zero-copy via `MAP_SHARED`. The WAL is an O_DIRECT append-only log fsynced via `pwritev2(RWF_DSYNC)` group commit; no operation acks until its record is durable. After a crash, the WAL is replayed to rebuild arena and metadata. The WAL is the source of truth; everything else is derived. Reflink-based snapshots provide point-in-time backups.
+> **TL;DR.** Per-shard durable storage. The arena is a memory-mapped flat file of fixed-size 1600-byte slots holding vectors, accessed zero-copy via `MAP_SHARED`, and filled by WAL replay rather than by the live write path. The WAL is an O_DIRECT append-only log fsynced via `pwritev2(RWF_DSYNC)` group commit; no operation acks until its record is durable *and* its metadata has committed. After a crash, the WAL is replayed from the shard's contiguous durable watermark to rebuild arena and metadata. The WAL is the source of truth; everything else is derived. Reflink-based snapshots provide point-in-time backups without pausing writes.
 
 ## Status
 
@@ -69,17 +69,20 @@ data/
 ├── llm_credentials.redb       # Tenant LLM provider keys, sealed; shared by every shard
 ├── llm_credential_kek         # Generated sealing key, unless [llm.credentials] kek is set
 └── <shard_uuid>/
-    ├── arena.bin              # Vector arena, mmap'd
-    ├── arena.header           # Arena metadata (4096 bytes)
+    ├── shard.uuid             # 16 bytes; the shard's stable UUIDv7
+    ├── arena.bin              # Vector arena, mmap'd; its first page is the arena header
     ├── wal/
     │   ├── 0000000000.wal     # WAL segment 0
     │   ├── 0000000001.wal     # WAL segment 1
     │   └── ...
     ├── metadata.redb          # redb metadata store ([10. Metadata + Graph Store])
-    └── checkpoints/
-        ├── 0000000003.ckpt    # Most recent checkpoint
-        └── ...
+    └── snapshots/
+        └── 00000000000000000007/   # One directory per snapshot, named by id
 ```
+
+The arena header is not a separate file: it is the first page of `arena.bin`, and the checkpoint sequence `msync`s that page so a grown capacity survives a crash. Checkpoints are likewise not files — a checkpoint is a row in the metadata store plus its `CHECKPOINT_BEGIN` / `CHECKPOINT_END` WAL records.
+
+Derived indexes live beside the substrate in the same directory and are rebuildable rather than durable: `entity.hnsw`, `statement.hnsw`, `statements.tantivy/`, `memory_text.tantivy/`, and `llm_cache.redb`. Each is created by its owning module on first use.
 
 The exact paths and naming conventions are part of the storage format. They MUST be stable within a format version.
 
@@ -90,9 +93,11 @@ After any state-mutating operation:
 - If the WAL record is fsync'd, the operation is durable. Recovery will replay it.
 - If the WAL record is not fsync'd, the operation is treated as never having happened.
 
-The arena and metadata stores are eventually-consistent with the WAL. They lag the WAL slightly (writes to them happen after the WAL fsync). On a crash, recovery replays WAL records to bring the arena and metadata back into sync.
+The metadata store lags the WAL slightly: its commit happens after the WAL fsync, within the same request. The arena lags it entirely — the live write path never writes a vector into a slot, and the arena is populated by replay ([`03_write_path.md`](03_write_path.md) §5). On a crash, recovery replays WAL records to bring both into sync.
 
-This is the standard write-ahead-log invariant. Brain uses it ruthlessly: at no point does Brain consider an operation durable just because it's reflected in the arena or metadata. The WAL fsync is the durability barrier; everything else is bookkeeping.
+This is the standard write-ahead-log invariant. Brain uses it ruthlessly: at no point does Brain consider an operation durable just because it's reflected in the arena or metadata. The WAL fsync is the durability barrier; everything else is derived.
+
+One number carries that invariant across a restart: the shard's durable watermark, the highest **contiguous** prefix of WAL records whose metadata commits have landed. Recovery skips at or below it and replays above it, so it must never run ahead of a record that has not committed. See [`04_recovery.md`](04_recovery.md) §3 and [14.02 §13a](../14_concurrency/02_writer_model.md).
 
 ## 5. The latency budget
 
@@ -104,7 +109,7 @@ Storage-layer latency targets per operation:
 | WAL fsync (with RWF_DSYNC) | bound by NVMe write latency |
 | Arena slot read (page cache hit) | < 100 ns |
 | Arena slot read (page cache miss, NVMe) | 50–200 µs |
-| Arena slot write | < 1 µs (memcpy into mmap region) |
+| Arena slot write (replay path only) | < 1 µs (memcpy into mmap region) |
 | Recovery replay (per WAL record) | < 100 µs |
 
 Recovery throughput target: at least 100K records/second (sustained), so a 1 GiB WAL recovers in ~30 seconds.

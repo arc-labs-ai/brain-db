@@ -88,13 +88,36 @@ What can go wrong with sharding and (in a future major version) clustering, and 
 
 **Failure mode.** One shard has much more load than others (hot agent, etc.).
 
-**Detection.** Per-shard latency / queue-depth metrics.
+**Detection.** Per-shard request latency — `brain_request_duration_ms` by op,
+compared across shards.
 
 **Response.**
 - The hot shard's request latency rises.
-- Backpressure (`Overloaded` errors) on extreme overload.
+- At saturation the shard **parks**: the main loop awaits a dispatch permit
+  (bound 15 at the shipped defaults) and stops taking from its request channel,
+  which fills, which back-pressures the connection layer, which narrows the TCP
+  window. The client experiences flow control, not an error.
 
-**Operator action.** Re-distribute load via override map; split the shard if needed.
+**There is no load shedding and no rate limiter.** Nothing on the request path
+raises `RateLimited`, and `OpError::QuotaExceeded` is constructed only in a test
+(`crates/brain-ops/src/lib.rs:113`). `Overloaded` exists but belongs to a
+different mechanism: it is raised only against a `SUBSCRIBE` consumer that
+cannot keep up with its event stream
+(`crates/brain-server/src/network/subscribe.rs:707, 776`), which is dropped
+rather than allowed to hold memory unbounded.
+
+Parking rather than shedding is a choice, not a gap. A shed request has to be
+retried by the client to be correct, and a client that retries into a saturated
+shard makes it worse; flow control pushes the queue back to where it can be
+reasoned about. The cost is that a hot shard shows up as latency, so latency is
+what to alert on.
+
+**Operator action.** A space maps to a shard by hash and there is no
+configurable override map (§16.02 §7), so the shard a hot space lands on cannot
+be changed and the shard cannot be split. The levers are the space layout above
+Brain — a tenant hot enough to saturate a core wants its own space set, spread
+across more shards — and vertical headroom: more cores and a higher
+`[storage] shard_count` so each space's share of a core is larger.
 
 ## 10. Shard runs out of disk
 
@@ -225,7 +248,3 @@ What can go wrong with sharding and (in a future major version) clustering, and 
 - Fall back to bootstrap nodes if all fails.
 
 **Operator action.** Update the client if buggy. Configure correct bootstrap nodes.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

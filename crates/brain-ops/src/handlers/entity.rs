@@ -44,6 +44,7 @@ use crate::context::OpsContext;
 use crate::dispatch::RequestCaller;
 use crate::error::OpError;
 use crate::handlers::events::emit_graph_event;
+use crate::handlers::limits::{check_byte_len, ENTITY_NAME_MAX_BYTES, REASON_MESSAGE_MAX_BYTES};
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 
@@ -113,6 +114,47 @@ fn entity_scope_and_type(
 /// alias set.
 pub const MAX_ENTITY_ALIASES: usize = 256;
 
+fn validate_entity_create_request(req: &EntityCreateRequest) -> Result<(), OpError> {
+    check_entity_name("canonical_name", &req.canonical_name)?;
+    check_entity_aliases(&req.aliases)?;
+    check_byte_len(
+        "attributes_blob",
+        req.attributes_blob.len(),
+        EntityAttributes::MAX_BYTES,
+    )
+}
+
+fn validate_entity_update_request(req: &EntityUpdateRequest) -> Result<(), OpError> {
+    check_entity_name("canonical_name", &req.canonical_name)?;
+    check_entity_aliases(&req.aliases)?;
+    check_byte_len(
+        "attributes_blob",
+        req.attributes_blob.len(),
+        EntityAttributes::MAX_BYTES,
+    )
+}
+
+fn check_entity_name(field: &str, value: &str) -> Result<(), OpError> {
+    if value.trim().is_empty() {
+        return Err(OpError::InvalidRequest(format!(
+            "{field} must be non-empty"
+        )));
+    }
+    check_byte_len(field, value.len(), ENTITY_NAME_MAX_BYTES)
+}
+
+fn check_entity_aliases(aliases: &[String]) -> Result<(), OpError> {
+    if aliases.len() > MAX_ENTITY_ALIASES {
+        return Err(OpError::InvalidRequest(format!(
+            "aliases must have <= {MAX_ENTITY_ALIASES} entries"
+        )));
+    }
+    for alias in aliases {
+        check_byte_len("alias", alias.len(), ENTITY_NAME_MAX_BYTES)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // ENTITY_CREATE
 // ---------------------------------------------------------------------------
@@ -121,16 +163,7 @@ pub async fn handle_entity_create(
     req: EntityCreateRequest,
     ctx: &OpsContext,
 ) -> Result<EntityCreateResponse, OpError> {
-    if req.canonical_name.trim().is_empty() {
-        return Err(OpError::InvalidRequest(
-            "canonical_name must be non-empty".into(),
-        ));
-    }
-    if req.aliases.len() > MAX_ENTITY_ALIASES {
-        return Err(OpError::InvalidRequest(format!(
-            "aliases must have <= {MAX_ENTITY_ALIASES} entries"
-        )));
-    }
+    validate_entity_create_request(&req)?;
 
     let entity_type = EntityTypeId(req.entity_type_id);
     // An id no registry row answers to is a bad argument, not an engine
@@ -183,7 +216,7 @@ pub async fn handle_entity_create(
     let created_id = match ack.single_phase() {
         PhaseAck::UpsertedEntity(eid) => *eid,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for ENTITY_CREATE: {other:?}"
             )));
         }
@@ -191,7 +224,7 @@ pub async fn handle_entity_create(
 
     // Embed + index the new entity so tier-3 resolution can find it without
     // waiting for a rebuild (best-effort; the entity is already durable).
-    index_entity_embedding(ctx, created_id, &req.canonical_name);
+    index_entity_embedding(ctx, created_id, &req.canonical_name).await;
 
     // Emit ENTITY_CREATED event post-commit.
     emit_graph_event(
@@ -260,16 +293,7 @@ pub async fn handle_entity_update(
     req: EntityUpdateRequest,
     ctx: &OpsContext,
 ) -> Result<EntityUpdateResponse, OpError> {
-    if req.canonical_name.trim().is_empty() {
-        return Err(OpError::InvalidRequest(
-            "canonical_name must be non-empty".into(),
-        ));
-    }
-    if req.aliases.len() > MAX_ENTITY_ALIASES {
-        return Err(OpError::InvalidRequest(format!(
-            "aliases must have <= {MAX_ENTITY_ALIASES} entries"
-        )));
-    }
+    validate_entity_update_request(&req)?;
     let id = EntityId::from(req.entity_id);
     let now = now_unix_nanos();
 
@@ -301,7 +325,7 @@ pub async fn handle_entity_update(
     let after = match ack.single_phase() {
         PhaseAck::EntityUpdated { snapshot, .. } => (**snapshot).clone(),
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for ENTITY_UPDATE: {other:?}"
             )));
         }
@@ -333,11 +357,7 @@ pub async fn handle_entity_rename(
     req: EntityRenameRequest,
     ctx: &OpsContext,
 ) -> Result<EntityRenameResponse, OpError> {
-    if req.new_canonical_name.trim().is_empty() {
-        return Err(OpError::InvalidRequest(
-            "new_canonical_name must be non-empty".into(),
-        ));
-    }
+    check_entity_name("new_canonical_name", &req.new_canonical_name)?;
     // `move_to_alias = false` would mean "discard old name, no alias
     // trail". The metadata rename helper always appends to aliases;
     // reject the no-trail mode until the policy is explicit.
@@ -379,7 +399,7 @@ pub async fn handle_entity_rename(
             ..
         } => (old_canonical_name.clone(), (**snapshot).clone()),
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for ENTITY_RENAME: {other:?}"
             )));
         }
@@ -411,9 +431,7 @@ pub async fn handle_entity_merge(
     req: EntityMergeRequest,
     ctx: &OpsContext,
 ) -> Result<EntityMergeResponse, OpError> {
-    if req.reason.len() > 4096 {
-        return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
-    }
+    check_byte_len("reason", req.reason.len(), REASON_MESSAGE_MAX_BYTES)?;
     let survivor = EntityId::from(req.survivor);
     let merged = EntityId::from(req.merged);
     let now = now_unix_nanos();
@@ -460,7 +478,7 @@ pub async fn handle_entity_merge(
             ..
         } => (*audit_id, *statements_rerouted, *relations_rerouted),
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for ENTITY_MERGE: {other:?}"
             )));
         }
@@ -528,7 +546,7 @@ pub async fn handle_entity_unmerge(
     let survivor = match ack.single_phase() {
         PhaseAck::EntitiesUnmerged { survivor, .. } => *survivor,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for ENTITY_UNMERGE: {other:?}"
             )));
         }
@@ -561,9 +579,7 @@ pub async fn handle_entity_tombstone(
     req: EntityTombstoneRequest,
     ctx: &OpsContext,
 ) -> Result<EntityTombstoneResponse, OpError> {
-    if req.reason.len() > 4096 {
-        return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
-    }
+    check_byte_len("reason", req.reason.len(), REASON_MESSAGE_MAX_BYTES)?;
     let id = EntityId::from(req.entity_id);
     let now = now_unix_nanos();
 
@@ -604,7 +620,7 @@ pub async fn handle_entity_tombstone(
             ..
         } => *tombstoned_at_unix_nanos,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for ENTITY_TOMBSTONE: {other:?}"
             )));
         }
@@ -721,18 +737,10 @@ fn hash_entity_unmerge_request(_req: &EntityUnmergeRequest, merged: EntityId) ->
     *h.finalize().as_bytes()
 }
 
-/// Map [`WriterError`] onto [`OpError`] for the entity handlers. Mirrors
-/// the substrate link / forget mappers — Conflict surfaces as ExecError,
-/// internal failures pass through, and "not found" tagged internals
-/// project back to NotFound for the wire.
+/// Project a writer fault into the wire error taxonomy. The writer's own
+/// variants already carry the classification, so this forwards them intact.
 fn map_writer_err(err: WriterError) -> OpError {
-    match err {
-        WriterError::Internal(msg) if msg.contains("not found") => OpError::NotFound {
-            what: "entity",
-            detail: msg,
-        },
-        other => OpError::ExecError(brain_planner::ExecError::WriterFailed(other)),
-    }
+    OpError::ExecError(brain_planner::ExecError::WriterFailed(err))
 }
 
 // ---------------------------------------------------------------------------
@@ -835,11 +843,11 @@ pub async fn handle_entity_resolve(
             "candidate_name must be non-empty".into(),
         ));
     }
-    if req.candidate_name.len() > 256 {
-        return Err(OpError::InvalidRequest(
-            "candidate_name exceeds 256 bytes".into(),
-        ));
-    }
+    check_byte_len(
+        "candidate_name",
+        req.candidate_name.len(),
+        ENTITY_NAME_MAX_BYTES,
+    )?;
     // No type hint → cross-type EXACT resolve across every declared entity
     // type. This is the grounded-read default: a caller asking about "Alice"
     // shouldn't have to know her entity type. One exact hit → resolved;
@@ -1041,10 +1049,10 @@ async fn create_fallback_entity(
         PhaseAck::UpsertedEntity(eid) => {
             let eid = *eid;
             // Index the fresh entity so an immediate tier-3 re-resolve finds it.
-            index_entity_embedding(ctx, eid, &req.candidate_name);
+            index_entity_embedding(ctx, eid, &req.candidate_name).await;
             Ok(eid)
         }
-        other => Err(OpError::Internal(format!(
+        other => Err(OpError::PermanentFault(format!(
             "unexpected phase ack for resolver create-fallback: {other:?}"
         ))),
     }
@@ -1057,11 +1065,11 @@ async fn create_fallback_entity(
 /// vector is the name embedding, matching the rebuild path. A missing index
 /// (tests) or an embed error is a no-op — the entity is already durable, just
 /// tier-3-unreachable until a rebuild.
-fn index_entity_embedding(ctx: &OpsContext, entity_id: EntityId, canonical_name: &str) {
+async fn index_entity_embedding(ctx: &OpsContext, entity_id: EntityId, canonical_name: &str) {
     let Some(index) = ctx.entity_vector_index.as_ref() else {
         return;
     };
-    match ctx.executor.embedder.embed(canonical_name) {
+    match crate::embedding::embed_off_reactor(&ctx.executor.embedder, canonical_name).await {
         Ok(vector) => index.insert(entity_id, &vector),
         Err(e) => tracing::warn!(
             target: "brain_ops::write_trace",
@@ -1088,10 +1096,8 @@ async fn resolve_via_embedding(
     } else {
         format!("{} {}", req.candidate_name, ctx_snippet)
     };
-    let vector = ctx
-        .executor
-        .embedder
-        .embed(&to_embed)
+    let vector = crate::embedding::embed_off_reactor(&ctx.executor.embedder, &to_embed)
+        .await
         .map_err(|e| OpError::Internal(format!("resolver embed: {e}")))?;
 
     // The per-shard entity HNSW mixes every tenant's entities and types, so a
@@ -1246,4 +1252,55 @@ pub async fn handle_entity_type_list(
         .collect();
     let total = items.len() as u32;
     Ok(EntityTypeListResponseFrame { items, total })
+}
+
+#[cfg(test)]
+mod validate_entity_tests {
+    use super::{check_entity_aliases, check_entity_name, ENTITY_NAME_MAX_BYTES};
+    use crate::error::OpError;
+
+    /// A name at the cap is accepted; one byte past it is refused as a
+    /// client-actionable error. The bound matches the one `ENTITY_RESOLVE`
+    /// already enforces on `candidate_name`, so every stored name stays
+    /// resolvable by name.
+    #[test]
+    fn canonical_name_cap_is_enforced_at_the_boundary() {
+        let at_cap = "x".repeat(ENTITY_NAME_MAX_BYTES);
+        assert!(check_entity_name("canonical_name", &at_cap).is_ok());
+
+        let over = "x".repeat(ENTITY_NAME_MAX_BYTES + 1);
+        let err = check_entity_name("canonical_name", &over).expect_err("over-cap name must fail");
+        let OpError::InvalidField { field, .. } = err else {
+            panic!("an over-cap name must name the offending field");
+        };
+        assert_eq!(field, "canonical_name");
+    }
+
+    /// An empty or whitespace-only name is refused before the length check.
+    #[test]
+    fn blank_canonical_name_is_refused() {
+        assert!(matches!(
+            check_entity_name("canonical_name", "   "),
+            Err(OpError::InvalidRequest(_))
+        ));
+    }
+
+    /// The count cap and the per-string cap are independent: a short alias
+    /// list whose entries are oversized is still refused, which is what
+    /// bounds the alias set rather than only its length.
+    #[test]
+    fn oversize_alias_string_is_refused_within_the_count_cap() {
+        let aliases = vec!["x".repeat(ENTITY_NAME_MAX_BYTES + 1)];
+        let err = check_entity_aliases(&aliases).expect_err("over-cap alias must be refused");
+        let OpError::InvalidField { field, .. } = err else {
+            panic!("an over-cap alias must name the offending field");
+        };
+        assert_eq!(field, "alias");
+    }
+
+    #[test]
+    fn aliases_at_both_caps_are_accepted() {
+        let aliases = vec!["x".repeat(ENTITY_NAME_MAX_BYTES); super::MAX_ENTITY_ALIASES];
+        assert!(check_entity_aliases(&aliases).is_ok());
+    }
 }

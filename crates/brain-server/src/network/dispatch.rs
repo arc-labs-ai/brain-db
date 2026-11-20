@@ -16,13 +16,6 @@
 //! aside from `Frame` construction — testable as a pure state machine.
 
 #![cfg(target_os = "linux")]
-// Several fields/variants are wired into the response shape but
-// don't fan out into the connection-loop's match arms yet: SPACE id is
-// captured at AUTH_OK but not yet used to authorize ops;
-// `Action::Close` is the no-frame close case (CLIENT_PONG today) — not
-// yet emitted but reserved. Allow rather than churn the
-// surface in/out as each lands.
-#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,8 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use brain_core::SpaceId;
 use brain_metadata::api_keys::bits;
 use brain_ops::error::OpError;
+use brain_planner::PlanError;
 use brain_protocol::connection::handshake::{
-    AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, SpacePermissions, WelcomePayload,
+    AuthOkPayload, AuthPayload, HelloPayload, ServerCapabilities, WelcomePayload,
 };
 use brain_protocol::error::ErrorCode;
 
@@ -41,9 +35,10 @@ use crate::auth::{
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::{
-    ErrorCategoryWire, ErrorCodeWire, ErrorResponse, PongResponse, ResponseBody, ServerPingResponse,
+    ErrorCategoryWire, ErrorCodeWire, ErrorDetails, ErrorResponse, PongResponse, ResponseBody,
+    ServerPingResponse,
 };
-use brain_protocol::{Frame, ProtocolError};
+use brain_protocol::{Frame, ProtocolError, MAX_PAYLOAD_BYTES};
 
 use crate::routing::{shard_for_memory, RoutingTable};
 use crate::shard::{DispatchError, ShardHandle};
@@ -58,11 +53,11 @@ pub(crate) enum ConnPhase {
     AwaitingHello,
     AwaitingAuth,
     Established {
-        space: SpaceId,
         bound_shard: u16,
-        permissions: SpacePermissions,
         /// Resolved scope for this connection, derived entirely from the
-        /// presented API key.
+        /// presented API key. The authoritative record of who the caller is:
+        /// the space id and permissions are read from here rather than
+        /// duplicated alongside it.
         scope: RequestScope,
     },
 }
@@ -278,10 +273,13 @@ impl TxnShardRouter {
     }
 
     /// Total routing entries currently held (active + terminated window).
-    /// Test/introspection helper; the active tier is bounded by
-    /// [`ACTIVE_TXN_ROUTE_CAP`] and the terminated tier by
-    /// [`TERMINATED_TXN_ROUTE_WINDOW`].
-    pub(crate) fn len(&self) -> usize {
+    ///
+    /// Only the tests need this: it is how they assert that neither tier
+    /// grows without bound (`ACTIVE_TXN_ROUTE_CAP` and
+    /// `TERMINATED_TXN_ROUTE_WINDOW`). Gated rather than suppressed, so the
+    /// lib build is not carrying a method nothing calls.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
         self.active.len() + self.terminated.len()
     }
 }
@@ -337,7 +335,6 @@ pub(crate) enum Action {
     /// and the per-sub task emits its own final EOS.
     CancelSubscribe(CancelSubscribe),
     CloseWith(Frame),
-    Close,
     Nothing,
 }
 
@@ -763,9 +760,7 @@ fn on_auth(frame: Frame, state: &mut ConnState, topology: &Topology) -> Action {
     let bound_shard = routing.shard_for_space(space);
     let permissions = scope.to_space_permissions();
     state.phase = ConnPhase::Established {
-        space,
         bound_shard,
-        permissions,
         scope: scope.clone(),
     };
     // AUTH is the authoritative revocation check; anchor the live-re-check
@@ -871,8 +866,9 @@ pub(crate) async fn run_op_dispatch(
     };
     // Root of the per-request trace. Held open for the whole op; the shard
     // re-enters a clone via `.instrument()` so `brain.encode` nests under it
-    // across the Tokio→Glommio hop. In Phase 1 this is a trace root; once the
-    // wire carries `traceparent` it becomes a child of the remote context.
+    // across the Tokio→Glommio hop. This is a trace root while the wire carries
+    // no `traceparent`; once the wire carries one it becomes a child of the
+    // remote context.
     //
     // `brain.space_id` is the EFFECTIVE identity (the target under act_as).
     // Under delegation we also record the acting connection principal —
@@ -975,12 +971,19 @@ pub(crate) async fn run_op_dispatch(
                 vec![build_response_frame(stream_id, true, body)]
             }
             brain_ops::DispatchOutcome::Stream(bodies) => {
+                // A replaced frame carries EOS, so the stream is over at that
+                // point; emitting the remaining bodies would put frames on a
+                // stream the client has already seen terminate.
                 let n = bodies.len();
-                bodies
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, body)| build_response_frame(stream_id, i + 1 == n, body))
-                    .collect()
+                let mut out = Vec::with_capacity(n);
+                for (i, body) in bodies.into_iter().enumerate() {
+                    let (frame, replaced) = encode_response_frame(stream_id, i + 1 == n, body);
+                    out.push(frame);
+                    if replaced {
+                        break;
+                    }
+                }
+                out
             }
         },
         Err(DispatchError::ShardDisconnected) => vec![error_frame(
@@ -1326,10 +1329,49 @@ pub(crate) fn build_server_ping_frame() -> Frame {
 const FLAG_EOS: u8 = 1 << 7;
 
 fn build_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> Frame {
+    encode_response_frame(stream_id, eos, body).0
+}
+
+/// Encode one response body into a frame, reporting whether the body had to
+/// be replaced because it did not fit a frame.
+///
+/// Every response the server emits passes through here, which is why the
+/// frame-size bound is enforced at this point rather than in each handler:
+/// the per-item limits a handler enforces (rows per page, bytes per memory)
+/// multiply out past the 16 MiB frame cap, and `Frame::new` asserts on that,
+/// which under `panic = "abort"` would end the process rather than the
+/// request.
+fn encode_response_frame(stream_id: u32, eos: bool, body: ResponseBody) -> (Frame, bool) {
     let opcode = body.opcode().as_u16();
     let flags = if eos { FLAG_EOS } else { 0 };
     let payload = body.encode();
-    Frame::new(opcode, flags, stream_id, payload)
+    let len = payload.len();
+    match Frame::try_new(opcode, flags, stream_id, payload) {
+        Ok(frame) => (frame, false),
+        Err(_) => (oversize_response_frame(stream_id, len), true),
+    }
+}
+
+/// The frame sent in place of a response body that exceeds the frame cap.
+///
+/// Built with `Frame::new` directly, and deliberately not routed back
+/// through `encode_response_frame`: the message is fixed-shape and a few
+/// dozen bytes, so it fits by construction, and the oversize path therefore
+/// has no way to re-enter itself. It always carries EOS — the stream this
+/// terminates has no further frame coming.
+fn oversize_response_frame(stream_id: u32, encoded_len: usize) -> Frame {
+    let code = ErrorCode::OversizePayload;
+    let body = ResponseBody::Error(ErrorResponse {
+        code: ErrorCodeWire::from(code) as u16,
+        category: ErrorCategoryWire::from(code.category()) as u8,
+        message: format!(
+            "response body is {encoded_len} bytes, over the \
+             {MAX_PAYLOAD_BYTES}-byte frame limit; request fewer items per page"
+        ),
+        details: None,
+        retry_after_ms: None,
+    });
+    Frame::new(body.opcode().as_u16(), FLAG_EOS, stream_id, body.encode())
 }
 
 /// Whether a SUBSCRIBE's `filter.spaces` is allowed for this scope.
@@ -1345,13 +1387,41 @@ fn subscribe_spaces_allowed(own: SpaceId, spaces: Option<&[[u8; 16]]>) -> bool {
 
 pub(crate) fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {
     let body = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::from(code),
-        category: ErrorCategoryWire::from(code.category()),
+        code: ErrorCodeWire::from(code) as u16,
+        category: ErrorCategoryWire::from(code.category()) as u8,
         message: message.to_owned(),
         details: None,
         retry_after_ms: None,
     });
     build_response_frame(stream_id, true, body)
+}
+
+/// The structured detail block for an `OpError`, when the error knows which
+/// input it is complaining about.
+///
+/// Clients branch on `details.field` rather than parsing the message, so
+/// every error that carries the offending input's name must surface it here.
+/// Errors that only have a sentence return `None` and the client falls back
+/// to the message.
+fn error_details_for(e: &OpError) -> Option<ErrorDetails> {
+    match e {
+        OpError::InvalidField {
+            field,
+            expected,
+            actual,
+            ..
+        } => Some(ErrorDetails {
+            field: Some(field.clone()),
+            expected: expected.clone(),
+            actual: actual.clone(),
+        }),
+        OpError::PlanError(PlanError::InvalidParameters { field, .. }) => Some(ErrorDetails {
+            field: Some((*field).to_owned()),
+            expected: None,
+            actual: None,
+        }),
+        _ => None,
+    }
 }
 
 fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
@@ -1380,13 +1450,15 @@ fn error_frame_from_op_error(stream_id: u32, e: &OpError) -> Frame {
         }
         brain_ops::error::ErrorCode::Overloaded => (ErrorCode::Overloaded, Some(1000u32)),
         brain_ops::error::ErrorCode::RetrievalUnavailable => (ErrorCode::ShardUnavailable, None),
+        brain_ops::error::ErrorCode::ShardStorageFaulted => (ErrorCode::ShardStorageFaulted, None),
+        brain_ops::error::ErrorCode::PermanentFault => (ErrorCode::UnrecoverableInternal, None),
         brain_ops::error::ErrorCode::InternalError => (ErrorCode::Internal, None),
     };
     let body = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::from(code),
-        category: ErrorCategoryWire::from(code.category()),
+        code: ErrorCodeWire::from(code) as u16,
+        category: ErrorCategoryWire::from(code.category()) as u8,
         message: e.to_string(),
-        details: None,
+        details: error_details_for(e),
         retry_after_ms,
     });
     build_response_frame(stream_id, true, body)
@@ -1467,6 +1539,35 @@ pub(crate) enum Tick {
 mod tests {
     use super::*;
     use brain_protocol::connection::handshake::{AuthCredentials, AuthMethod, HelloCapabilities};
+
+    #[test]
+    fn oversized_response_body_becomes_an_error_frame() {
+        let stream_id = 41;
+        let body = ResponseBody::Error(ErrorResponse {
+            code: ErrorCodeWire::InvalidArgument as u16,
+            category: ErrorCategoryWire::Validation as u8,
+            message: "x".repeat(MAX_PAYLOAD_BYTES + 1),
+            details: None,
+            retry_after_ms: None,
+        });
+
+        let frame = build_response_frame(stream_id, true, body);
+
+        assert!(frame.payload.len() <= MAX_PAYLOAD_BYTES);
+        assert_eq!(frame.header.flags_u8() & FLAG_EOS, FLAG_EOS);
+        assert_eq!(frame.header.stream_id_u32(), stream_id);
+        let decoded = ResponseBody::decode(Opcode::Error, &frame.payload)
+            .expect("replacement frame payload decodes");
+        match decoded {
+            ResponseBody::Error(error) => {
+                assert_eq!(
+                    error.code,
+                    ErrorCodeWire::from(ErrorCode::OversizePayload) as u16
+                )
+            }
+            other => panic!("expected an error response, got {other:?}"),
+        }
+    }
 
     fn test_topology() -> Topology {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -2057,7 +2158,7 @@ mod tests {
                 match ResponseBody::decode(Opcode::Error, &reply.payload) {
                     Ok(ResponseBody::Error(e)) => assert_eq!(
                         e.code,
-                        ErrorCodeWire::from(ErrorCode::TransactionLimitExceeded),
+                        ErrorCodeWire::from(ErrorCode::TransactionLimitExceeded) as u16,
                         "a begin at the cap must fail as TransactionLimitExceeded"
                     ),
                     other => panic!("expected an Error body, got {other:?}"),
@@ -2226,7 +2327,7 @@ mod tests {
                     "error should be on the offending stream id"
                 );
             }
-            Action::CloseWith(_) => panic!("F-3 regression: connection closed on unknown opcode"),
+            Action::CloseWith(_) => panic!("connection closed on unknown opcode"),
             _ => panic!("expected Action::Inline(ERROR)"),
         }
     }
@@ -2243,11 +2344,10 @@ mod tests {
         }
     }
 
-    /// Regression for FIX (1): dispatching a `TXN_COMMIT` must NOT demote the
-    /// route at dispatch time. Previously `terminate()` ran synchronously here,
-    /// parking the route in the small retry window before the terminal outcome
-    /// was known; the route must instead stay in the active tier until the
-    /// shard confirms the terminal.
+    /// Dispatching a `TXN_COMMIT` must NOT demote the route at dispatch time.
+    /// Running `terminate()` synchronously here parks the route in the small
+    /// retry window before the terminal outcome is known; the route stays in
+    /// the active tier until the shard confirms the terminal.
     #[test]
     fn txn_commit_dispatch_does_not_demote_route() {
         let topo = test_topology_shards(8);
@@ -2431,5 +2531,26 @@ mod tests {
             ))),
         );
         assert!(out.is_none());
+    }
+
+    /// A corrupt row has no useful retry delay: the wire category must tell
+    /// clients and HTTP proxies to stop immediately.
+    #[test]
+    fn permanent_fault_error_frame_is_operator_intervention() {
+        let frame = error_frame_from_op_error(
+            7,
+            &brain_ops::error::OpError::PermanentFault("chain dangling at 7".into()),
+        );
+        match ResponseBody::decode(Opcode::Error, &frame.payload).unwrap() {
+            ResponseBody::Error(error) => {
+                assert_eq!(error.code, ErrorCodeWire::UnrecoverableInternal as u16);
+                assert_eq!(
+                    error.category,
+                    ErrorCategoryWire::OperatorIntervention as u8
+                );
+                assert_eq!(error.retry_after_ms, None);
+            }
+            other => panic!("expected an Error body, got {other:?}"),
+        }
     }
 }

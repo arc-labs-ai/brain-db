@@ -41,6 +41,11 @@ pub enum GraphNodeKindWire {
     /// `include_memory_edges`, as the far endpoint of a memory↔memory
     /// edge. `label` is a text snippet.
     Memory = 2,
+    /// A node kind this build cannot name reads as unknown; the surrounding
+    /// graph response still decodes, so a peer one version ahead can describe
+    /// a node kind this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// Kind of a graph edge.
@@ -93,6 +98,11 @@ pub enum GraphEdgeKindWire {
     /// Memory→memory: the source is part of the target. `label` is
     /// `"part_of"`.
     PartOf = 11,
+    /// An edge kind this build cannot name reads as unknown; the surrounding
+    /// graph frame still decodes, so a peer one version ahead can describe an
+    /// edge kind this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// One graph node. `id` is the 16-byte entity / statement / memory id; the

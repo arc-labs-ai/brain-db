@@ -17,10 +17,13 @@ use redb::TableDefinition;
 /// Discriminants match `brain_extractors::ExtractionStatus::as_u8()`
 /// byte-for-byte so the extractors crate and metadata crate share
 /// the same wire-equivalent enum.
+///
+/// Byte 3 is unassigned and stays unassigned. These bytes are positional
+/// on disk, so handing an unassigned byte to a new meaning would silently
+/// give every row already carrying it that new meaning.
 pub mod extraction_status {
     pub const SUCCESS: u8 = 1;
     pub const FAILURE: u8 = 2;
-    pub const SKIPPED_BUDGET: u8 = 3;
     pub const SKIPPED_FILTER: u8 = 4;
     pub const SKIPPED_DUPLICATE: u8 = 5;
     pub const SKIPPED_DISABLED: u8 = 6;
@@ -83,6 +86,14 @@ pub struct ExtractionAudit {
     /// BLAKE3 of `memory.text` (32 bytes). The idempotency probe uses
     /// this to detect text edits.
     pub input_hash: [u8; 32],
+    /// The namespace name this extraction is billed to, matching the key the
+    /// `llm_spend` ledger uses for the same tenant. A namespace's durable model
+    /// spend is this field's `cost_micro_usd` summed with that ledger, so the
+    /// two must name the tenant identically.
+    ///
+    /// Empty when the writer did not attribute the row. An unattributed row is
+    /// counted toward no namespace rather than toward a guessed one.
+    pub namespace: String,
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +139,7 @@ impl ExtractionAudit {
             cost_micro_usd: 0,
             model_metadata: Vec::new(),
             input_hash,
+            namespace: String::new(),
         }
     }
 
@@ -162,6 +174,7 @@ impl ExtractionAudit {
             cost_micro_usd: 0,
             model_metadata: Vec::new(),
             input_hash,
+            namespace: String::new(),
         }
     }
 
@@ -173,6 +186,13 @@ impl ExtractionAudit {
     #[must_use]
     pub fn memory_id(&self) -> MemoryId {
         MemoryId::from_be_bytes(self.memory_id_bytes)
+    }
+
+    /// Attribute this row to the namespace being billed for the extraction.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: String) -> Self {
+        self.namespace = namespace;
+        self
     }
 
     /// True iff `status == SUCCESS`.
@@ -354,10 +374,20 @@ mod tests {
         // These bytes are part of the on-disk format. Never renumber.
         assert_eq!(extraction_status::SUCCESS, 1);
         assert_eq!(extraction_status::FAILURE, 2);
-        assert_eq!(extraction_status::SKIPPED_BUDGET, 3);
         assert_eq!(extraction_status::SKIPPED_FILTER, 4);
         assert_eq!(extraction_status::SKIPPED_DUPLICATE, 5);
         assert_eq!(extraction_status::SKIPPED_DISABLED, 6);
+
+        // Byte 3 is unassigned: no status constant may hand it a meaning.
+        for b in [
+            extraction_status::SUCCESS,
+            extraction_status::FAILURE,
+            extraction_status::SKIPPED_FILTER,
+            extraction_status::SKIPPED_DUPLICATE,
+            extraction_status::SKIPPED_DISABLED,
+        ] {
+            assert_ne!(b, 3);
+        }
 
         assert_eq!(output_kind::ENTITY, 1);
         assert_eq!(output_kind::STATEMENT, 2);

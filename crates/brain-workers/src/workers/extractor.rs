@@ -36,14 +36,19 @@
 //!
 //! - Full channel: writer drops the enqueue with a warn (encode never
 //!   fails). Backfill is the recovery path (post-v1 admin op).
-//! - Per-memory apply error: the worker logs at warn level and audits
-//!   the memory as `PARTIAL_FAILURE` / `FAILURE` so a re-drain doesn't
-//!   loop on the same memory.
+//! - Per-memory apply and gate failures use bounded, widening retries;
+//!   deterministic failures and exhausted retries receive a durable
+//!   terminal failure audit and leave the extraction queue.
 //! - LLM tier unavailable: the registered LLM extractor returns
 //!   `Failure(reason)` deterministically; pattern + classifier still run.
+//! - A transient LLM-tier failure retries with widening backoff under a bounded
+//!   budget. It is charged to the memory only when the provider is demonstrably
+//!   reachable; an exhausted memory gets a terminal audit row and leaves the
+//!   extraction queue.
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,17 +78,19 @@ use brain_metadata::tables::edge::{
     self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
 use brain_metadata::tables::extractor_audit::{
-    pipeline_status, record_extracted, tier_status, ExtractorItemCounts,
-    ExtractorPipelineAuditEntry,
+    pipeline_status, record_extracted, tier_status, transient_budget_spent, ExtractorItemCounts,
+    ExtractorPipelineAuditEntry, TransientRetryBudget,
 };
 use brain_metadata::tables::predicate::{PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
 use brain_metadata::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
 use brain_metadata::{
     entity_get_inside_wtxn, hype_has_vectors, pipeline_has_extracted, resolution_audit_write,
 };
+use brain_metadata::{llm_spend_add, tables::llm_spend::llm_spend_stage};
 use brain_ops::apply::encode_helpers::{
     fetch_extractor_context, ExtractorContextFetchConfig, DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
 };
+use brain_ops::apply::{RedbFault, StorageFault};
 use brain_ops::writer::extractor_writes::{
     relation_create_internal, statement_create_internal, RelationCreatePayload,
     StatementCreatePayload,
@@ -117,15 +124,6 @@ pub struct ExtractorKnobs {
     /// 256 because extraction is heavier (pattern + classifier inference
     /// + LLM round-trip).
     pub drain_per_cycle: usize,
-    /// Cycle-wide LLM cost budget in dollar-micro-units (1e-6 USD).
-    /// When the per-cycle sum exceeds this, the worker still runs
-    /// pattern + classifier on remaining memories but stops invoking
-    /// the LLM tier until the next cycle. This is an observability stub
-    /// for now — the framework's per-call budget
-    /// (`CostBudget::per_call_micro_usd`) is the active enforcement
-    /// surface. Per-cycle accounting wires through here in a later
-    /// iteration; for now this field tracks the configured ceiling.
-    pub llm_budget_per_cycle_micro_usd: u64,
     /// When `true`, the worker probes the per-memory audit table and
     /// skips memories that have already been processed. The plan's
     /// "queue-replay idempotency" guard. Set to `false` for tests
@@ -145,25 +143,51 @@ pub struct ExtractorKnobs {
     /// once its typed-graph neighborhood has grown (so multi-hop bridge
     /// questions become writable after the connecting facts land). Each
     /// examined memory is a cheap neighborhood-hash check; only the ones
-    /// whose neighborhood actually changed cost an LLM call, and those are
-    /// still bounded by `llm_budget_per_cycle_micro_usd`. `0` disables the
-    /// sweep. A round-robin cursor advances across cycles so the whole
+    /// whose neighborhood actually changed cost an LLM call. `0` disables
+    /// the sweep. A round-robin cursor advances across cycles so the whole
     /// corpus is revisited over time.
     pub hype_refresh_per_cycle: usize,
 }
 
 pub const DEFAULT_EXTRACTOR_DRAIN_PER_CYCLE: usize = 32;
-pub const DEFAULT_EXTRACTOR_LLM_BUDGET_MICRO_USD: u64 = 50_000;
 pub const DEFAULT_EXTRACTOR_SKIP_AUDITED: bool = true;
 /// Memories examined per cycle by the HyPE refresh sweep. Small: the sweep
 /// is a steady background trickle, and each changed neighborhood costs an
-/// LLM call against the shared per-cycle budget.
+/// LLM call.
 pub const DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE: usize = 8;
-/// Memories per classifier forward pass. 8 is the sweet spot on the
-/// dev container's CPU: the backbone GEMM saturates well before then,
-/// and going higher adds latency without throughput gains. Bigger
-/// hosts can lift this via `[workers.extractor] batch_size`.
-pub const DEFAULT_EXTRACTOR_BATCH_SIZE: usize = 8;
+/// Memories per micro-batch.
+///
+/// This one number does TWO jobs with different sweet spots, which is why it
+/// is worth stating both:
+///
+///   * the classifier's forward pass, where batching is a real win — a
+///     batched backbone pass over 8 memories costs about what one costs
+///     alone — and where the GEMM saturates around 8;
+///   * the LLM fan-out width, since the extractor and HyPE tiers issue one
+///     provider call per memory and overlap them across the micro-batch.
+///     That is network-bound and wants to be much wider than 8.
+///
+/// Measured end to end on a one-shard dev box, 120 memories each:
+///
+/// | width | drained | rate     |
+/// |-------|---------|----------|
+/// | 8     | 357 s   | 20 / min |
+/// | 32    | 181 s   | 40 / min |
+/// | 128   | —       | the WRITE path began returning 503 (9 of 120) |
+///
+/// So 32 it is: twice the throughput of 8, with nothing observed to pay for
+/// it. The classifier may lose a little at this width and the LLM stage wins
+/// far more, which is what the end-to-end number reflects.
+///
+/// DO NOT raise this much further on one shard. At 128 the single executor
+/// lane is saturated enough that writes start failing — derivation throughput
+/// is bought with write availability, which is never the right trade. More
+/// shards, not more width, is how this scales; `storage.shard_count` now
+/// sizes itself to the machine.
+///
+/// The honest follow-up is to split this into two knobs, since the two jobs
+/// want different numbers.
+pub const DEFAULT_EXTRACTOR_BATCH_SIZE: usize = 32;
 
 /// How many rows `load_pending_batch` over-drains per `want`: it scans up
 /// to `want * FACTOR` front rows (bounded by [`EXTRACTION_QUEUE_MAX_SCAN`])
@@ -177,11 +201,78 @@ const EXTRACTION_QUEUE_OVERDRAIN_FACTOR: usize = 8;
 /// of the queue is backing off.
 const EXTRACTION_QUEUE_MAX_SCAN: usize = 1024;
 
+/// Upper bound on how many memories may have their preparation stage
+/// resident at the same moment across a whole cycle.
+///
+/// A micro-batch's preparation — each memory's neighbour context, its
+/// candidate-predicate embeddings, and a cloned copy of its text — is held
+/// for the life of that batch and is NOT covered by the write path's byte
+/// admission control. Overlapping micro-batches multiply it, so the overlap
+/// has to be capped by the quantity that actually grows: memories in flight.
+///
+/// The number is this worker's own measurement, the one recorded on
+/// [`DEFAULT_EXTRACTOR_BATCH_SIZE`]: 32 memories in flight on a one-shard
+/// box is measured-good end to end, and 128 is measured-bad — the single
+/// executor lane saturates and the WRITE path starts returning 503, which
+/// is never a trade worth making. Everything this worker overlaps shares
+/// that one lane, so the ceiling is counted in memories rather than in
+/// batches, and it is the step that stays strictly between the two
+/// measurements.
+///
+/// Bytes one memory's own text is budgeted at while it waits to be priced.
+///
+/// Used only to size the pre-admission window below. It does not need to
+/// be accurate per memory — it is multiplied by a count to answer "how
+/// many memories may sit unpriced at once", and the real cost of a batch
+/// is measured from the loaded texts a moment later.
+const ESTIMATED_MEMORY_TEXT_BYTES: u64 = 4 * 1024;
+
+/// Share of the derivation budget the unpriced window may occupy.
+///
+/// The window holds text only; the priced stage that follows holds the
+/// same text plus every neighbour's full text, the candidate-predicate
+/// embeddings and the vocabulary blocks — roughly an order of magnitude
+/// more. A sixteenth leaves the budget overwhelmingly to the work that
+/// was actually measured.
+const PRE_ADMISSION_BUDGET_SHARE: u64 = 16;
+
+/// How many memories may sit in flight before their batch is priced.
+///
+/// `process_chunk` resolves every queued id to its text before
+/// `drain_batch` prices the batch and reserves against the machine
+/// budget, so that text is held unpriced. Byte admission bounds
+/// everything after the reservation; this bounds the window before it.
+///
+/// Derived from the same machine-sensed budget the reservation draws on,
+/// so a small container runs a narrower window without anyone configuring
+/// it — the engine's standing rule that a bound comes from the machine
+/// rather than from a constant someone measured once on their own box.
+/// Floored at one micro-batch's worth so derivation always makes
+/// progress, and capped at the width the write path was measured to
+/// tolerate: 32 memories in flight on one shard is measured-good end to
+/// end, 128 is measured-bad — the single executor lane saturates and the
+/// WRITE path starts returning 503, which is never a trade worth making.
+fn inflight_memory_ceiling() -> usize {
+    const FLOOR: u64 = 8;
+    const CEILING: u64 = 64;
+    let budget = brain_llm::admission::global().budget_bytes();
+    let affordable = budget / PRE_ADMISSION_BUDGET_SHARE / ESTIMATED_MEMORY_TEXT_BYTES;
+    usize::try_from(affordable.clamp(FLOOR, CEILING)).unwrap_or(FLOOR as usize)
+}
+
+/// Bytes a single namespace's rendered vocabulary block is budgeted at.
+///
+/// The block lists a namespace's declared entity types, predicates and
+/// relation types as prompt text. A schema large enough to exceed this is
+/// possible but not typical, and the consequence of under-pricing it is
+/// only that the batch runs alongside slightly more than it should — the
+/// per-memory terms dominate the estimate by orders of magnitude.
+const VOCABULARY_BYTES_PER_NAMESPACE_ESTIMATE: u64 = 8 * 1024;
+
 impl Default for ExtractorKnobs {
     fn default() -> Self {
         Self {
             drain_per_cycle: DEFAULT_EXTRACTOR_DRAIN_PER_CYCLE,
-            llm_budget_per_cycle_micro_usd: DEFAULT_EXTRACTOR_LLM_BUDGET_MICRO_USD,
             skip_already_extracted: DEFAULT_EXTRACTOR_SKIP_AUDITED,
             batch_size: DEFAULT_EXTRACTOR_BATCH_SIZE,
             hype_refresh_per_cycle: DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE,
@@ -218,11 +309,8 @@ pub struct CausalEdgeFeed {
 pub struct ExtractorWorker {
     config: WorkerConfig,
     knobs: ExtractorKnobs,
+    retry_policy: ExtractorRetryPolicy,
     queue: flume::Receiver<ExtractorEnqueue>,
-    /// Per-cycle LLM cost accumulator. `Mutex` so the worker's
-    /// `&self` cycle can still mutate it; lock contention is nil
-    /// because a single shard drains its own queue.
-    llm_spend: Mutex<u64>,
     /// Shared with the writer's enqueue path; both sides bump the
     /// same atomics. Defaults to a fresh local instance when the
     /// scheduler doesn't wire one.
@@ -234,7 +322,7 @@ pub struct ExtractorWorker {
     /// `try_send`s matching `StatementId`s.
     causal_edge: Option<CausalEdgeFeed>,
     /// Optional entity-HNSW + embedder bundle passed through to the
-    /// resolver as tier-3b. `None` means the resolver runs in legacy
+    /// resolver as tier-3b. `None` means the resolver runs in plain
     /// 4-tier mode (no embedding probe, no synchronous HNSW population
     /// on entity create). Substrate-only deployments and tests that
     /// don't care about entity-paraphrase resolution leave this unset;
@@ -258,9 +346,20 @@ pub struct ExtractorWorker {
     /// Round-robin cursor for the HyPE refresh sweep: the last memory key
     /// examined, so each cycle resumes after it and the whole corpus is
     /// revisited over time. Wraps to the start of `TEXTS_TABLE` at the end.
-    /// `Mutex` for the same reason as `llm_spend` — the `&self` cycle mutates
-    /// it with no real contention (one shard, one drainer).
+    /// `Mutex` so the `&self` cycle can mutate it with no real contention
+    /// (one shard, one drainer).
     refresh_cursor: Mutex<[u8; 16]>,
+    /// Consecutive apply/gate infra failures per memory, with the instant
+    /// the next attempt becomes due. The map is bounded by construction.
+    apply_failures: Mutex<HashMap<MemoryId, ApplyFailureState>>,
+    /// Unix nanos of the most recent successful LLM-tier run on this shard.
+    /// A transient LLM failure within the policy's
+    /// [`ExtractorRetryPolicy::provider_reachable_window_nanos`] of a
+    /// success is charged to the memory; without that evidence it is charged
+    /// to the provider and spends only the absolute attempt budget. In-memory
+    /// rather than durable: a restart falls back to charging the provider,
+    /// which is the direction that preserves a memory's grounding.
+    last_llm_success_unix_nanos: AtomicU64,
     /// Materialize dependencies + tier gate captured at shard spawn so
     /// the worker can rebuild the registry when a `SCHEMA_UPLOAD` adds
     /// or changes an extractor. `None` (tests, substrate deployments)
@@ -291,16 +390,25 @@ impl ExtractorWorker {
         Self {
             config: WorkerConfig::defaults_for(WorkerKind::Extractor),
             knobs: ExtractorKnobs::default(),
+            retry_policy: ExtractorRetryPolicy::default(),
             queue,
-            llm_spend: Mutex::new(0),
             metrics: Arc::new(ExtractorMetrics::new()),
             causal_edge: None,
             embed_deps: None,
             entity_disambiguator: None,
             hype: None,
             refresh_cursor: Mutex::new([0u8; 16]),
+            apply_failures: Mutex::new(HashMap::new()),
+            last_llm_success_unix_nanos: AtomicU64::new(0),
             rebuild_deps: None,
         }
+    }
+
+    /// Configure retry and provider-attribution policy for extraction work.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: ExtractorRetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Wire the registry-rebuild dependencies. Without this call the
@@ -417,6 +525,17 @@ async fn do_extractor_cycle(
     worker: &ExtractorWorker,
     ctx: &WorkerContext,
 ) -> Result<usize, WorkerError> {
+    crate::derivation_probe::timed(
+        crate::derivation_probe::Stage::CycleTotal,
+        do_extractor_cycle_inner(worker, ctx),
+    )
+    .await
+}
+
+async fn do_extractor_cycle_inner(
+    worker: &ExtractorWorker,
+    ctx: &WorkerContext,
+) -> Result<usize, WorkerError> {
     let cfg = worker.config.clone();
     if cfg.batch_size == 0 {
         return Ok(0);
@@ -428,14 +547,7 @@ async fn do_extractor_cycle(
     // classifier model / LLM router, which the handler must not touch.
     maybe_rebuild_registry(worker, ctx);
 
-    // Reset per-cycle LLM spend. Re-entering the cycle restarts the
-    // budget window.
-    {
-        *worker.llm_spend.lock() = 0;
-    }
-
     let started = Instant::now();
-    let mut processed = 0usize;
 
     // Log entry only when the queue has something in it. The cycle
     // fires every interval_ms regardless; logging the empty case
@@ -453,10 +565,10 @@ async fn do_extractor_cycle(
     }
 
     // Drain up to the full `drain_per_cycle` each cycle, processing it in
-    // `batch_size` micro-batches (the `while processed < cycle_cap` loop
-    // below). Previously this was `min(drain_per_cycle, batch_size)`, which
-    // silently pinned throughput to one micro-batch (8) even though
-    // `drain_per_cycle` was 32 — starving derivation under a write burst.
+    // `batch_size` micro-batches. The cycle cap is the whole drain, not one
+    // micro-batch: capping it at the batch width would pin derivation
+    // throughput to a single batch per cycle and starve it under a write
+    // burst, however large the queue got.
     let cycle_cap = worker.knobs.drain_per_cycle;
     let micro_batch = worker.knobs.batch_size.max(1);
 
@@ -476,145 +588,74 @@ async fn do_extractor_cycle(
         let tick = async {
             sleep(cfg.interval).await;
         };
-        recv.or(tick).await;
+        crate::derivation_probe::timed(crate::derivation_probe::Stage::CycleWait, recv.or(tick))
+            .await;
     }
     // Drain whatever else is on the channel so it doesn't accumulate;
     // the contents are ignored — text comes from TEXTS_TABLE, the work
     // list from the durable queue.
     while worker.queue.try_recv().is_ok() {}
 
-    while processed < cycle_cap {
-        if started.elapsed() >= cfg.max_runtime {
-            break;
-        }
-        if ctx.is_shutdown() {
-            break;
-        }
-
-        // Pull the next micro-batch of pending memory ids from the
-        // durable queue, bounded by what's left of the cycle cap.
-        let want = micro_batch.min(cycle_cap - processed);
-        let pending = match load_pending_batch(ctx, want) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    target: "brain_workers::extractor",
-                    error = %e,
-                    "extraction queue drain failed; ending cycle",
-                );
-                break;
-            }
-        };
-        if pending.is_empty() {
-            break;
-        }
-
-        // Resolve each pending id to its text from TEXTS_TABLE. A
-        // missing text means the memory was forgotten before extraction
-        // ran — remove the stale queue row and skip it.
-        let mut micro: Vec<ExtractorEnqueue> = Vec::with_capacity(pending.len());
-        for memory_id in pending {
-            match load_memory_text(ctx, memory_id) {
-                Ok(Some(text)) => micro.push((memory_id, text)),
-                Ok(None) => {
-                    trace!(
-                        memory_id = ?memory_id,
-                        "queued memory has no text (forgotten?); removing stale queue row",
-                    );
-                    if let Err(e) = remove_queue_row(ctx, memory_id) {
-                        warn!(memory_id = ?memory_id, error = %e, "queue row remove failed");
-                    }
-                    processed += 1;
-                }
-                Err(e) => {
-                    warn!(memory_id = ?memory_id, error = %e, "text load failed; leaving in queue");
-                    processed += 1;
-                }
-            }
-        }
-        if micro.is_empty() {
-            // Every id in this batch resolved to a stale/erroring row.
-            // Loop again to make progress on the rest of the queue.
-            continue;
-        }
-
-        // Run the whole micro-batch through one pipeline invocation.
-        // `drain_batch` returns one StageDecision per memory in input
-        // order so we can publish per-memory StageCompleted exactly
-        // once even when the batched classifier pass amortises across
-        // multiple memories.
-        let batch_decisions = drain_batch(worker, ctx, &micro).await;
-        for ((memory_id, _), decision) in micro.iter().zip(batch_decisions) {
-            // Remove the durable queue row only for outcomes that reached a
-            // terminal state. Failure variants stay queued for a retry:
-            // GateFailed (read_txn/audit probe errored before any work),
-            // AppliedFailed (a transient apply error that rolled back without
-            // writing an audit row), and Applied{retry_pending} (a transient
-            // LLM-tier timeout under the attempt budget — the audit row is
-            // written to advance the attempt count, but the queue row is kept
-            // so the next cycle re-runs the LLM tier). A terminal Applied
-            // commits an audit row the idempotency gate honors; AlreadyExtracted is a
-            // stale row left by a crash between commit and remove — the remove
-            // here is the cleanup. A crash between the audit commit and this
-            // remove leaves a stale row the next cycle folds into
-            // AlreadyExtracted and removes — at-least-once with idempotent
-            // extraction.
-            let keep_queued = matches!(
-                decision,
-                StageDecision::GateFailed { .. }
-                    | StageDecision::AppliedFailed { .. }
-                    | StageDecision::Applied {
-                        retry_pending: true,
-                        ..
-                    }
+    // ONE read of the durable queue for the whole cycle, chunked below into
+    // micro-batches.
+    //
+    // This is what makes overlapping micro-batches safe. A queue row is
+    // removed only once that memory's extraction has committed, so a read
+    // taken while other batches are still in flight would hand back the very
+    // ids those batches are working on — two batches extracting the same
+    // memory. One read, partitioned into disjoint chunks, makes that
+    // impossible by construction, and costs one read transaction per cycle
+    // instead of `drain_per_cycle / batch_size` of them.
+    let cycle_ids = match crate::derivation_probe::timed_sync(
+        crate::derivation_probe::Stage::LoadPending,
+        || load_pending_batch(worker, ctx, cycle_cap),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                target: "brain_workers::extractor",
+                error = %e,
+                "extraction queue drain failed; ending cycle",
             );
-            let (counts, audit_status, reason) = match decision {
-                StageDecision::Applied {
-                    counts,
-                    status_byte,
-                    reason,
-                    ..
-                } => (counts, audit_status_from_byte(status_byte), reason),
-                StageDecision::AppliedFailed { reason } | StageDecision::GateFailed { reason } => (
-                    ExtractorItemCounts::zero(),
-                    StageAuditStatus::Failed,
-                    reason,
-                ),
-                StageDecision::AlreadyExtracted => (
-                    ExtractorItemCounts::zero(),
-                    StageAuditStatus::Skipped,
-                    String::new(),
-                ),
-            };
-            if !keep_queued {
-                if let Err(e) = remove_queue_row(ctx, *memory_id) {
-                    warn!(memory_id = ?memory_id, error = %e, "queue row remove failed");
-                }
-            }
-            let produced_statements = counts.statements > 0;
-            let space_id = memory_scope_and_session(ctx, *memory_id).0.space();
-            publish_extracted_graph(ctx, *memory_id, space_id, counts, audit_status, reason).await;
-            // Reclassify the memory kind from what extraction produced: an
-            // Event-shaped statement → Episodic, timeless facts/preferences →
-            // Semantic. Only on a terminal apply (`!keep_queued`) that produced
-            // statements; a no-statement memory keeps the Episodic default.
-            if !keep_queued && produced_statements {
-                writeback_memory_kind(ctx, *memory_id);
-            }
+            Vec::new()
         }
-        processed += micro.len();
+    };
 
-        // Cooperative yield after every micro-batch so the scheduler
-        // stays responsive even when a batch lands in one tick.
-        glommio::executor().yield_if_needed().await;
-    }
+    // Micro-batches are independent of one another: each resolves its own
+    // texts, runs its own pipeline, and settles its own durable queue rows and
+    // stage announcements. Running them strictly one after another made every
+    // batch wait on the previous batch's LLM round-trips, which is the longest
+    // convoy on the derivation path. They overlap instead, inside a bounded
+    // window — see `inflight_memory_ceiling` for what the bound counts and
+    // where the number comes from.
+    //
+    // The runtime budget and the shutdown signal gate LAUNCHING only. Once
+    // either trips, no further batch starts and the ones already in flight are
+    // awaited to completion: abandoning a batch mid-flight would drop its
+    // queue-row removals and its per-memory `StageCompleted` publishes, leaving
+    // memories both extracted and un-announced, or extracted and still queued.
+    let max_in_flight = inflight_memory_ceiling() / micro_batch;
+    let processed = crate::derivation_probe::timed(
+        crate::derivation_probe::Stage::Chunks,
+        run_bounded_concurrently(
+            cycle_ids
+                .chunks(micro_batch)
+                .map(|chunk| process_chunk(worker, ctx, chunk)),
+            max_in_flight,
+            || started.elapsed() >= cfg.max_runtime || ctx.is_shutdown(),
+        ),
+    )
+    .await;
 
-    // Graph-aware HyPE refresh: with the cycle's extraction committed, spend
-    // any remaining LLM budget revisiting already-encoded memories whose
-    // typed-graph neighborhood has since grown, regenerating their bridge
-    // questions. Bounded per cycle and budget-gated, so it's a steady
+    // Graph-aware HyPE refresh: with the cycle's extraction committed, revisit
+    // already-encoded memories whose typed-graph neighborhood has since grown,
+    // regenerating their bridge questions. Bounded per cycle, so it's a steady
     // background trickle that converges as the graph stabilises.
-    run_hype_refresh_sweep(worker, ctx).await;
+    crate::derivation_probe::timed(
+        crate::derivation_probe::Stage::HypeRefresh,
+        run_hype_refresh_sweep(worker, ctx),
+    )
+    .await;
 
     let elapsed = started.elapsed();
     worker.metrics.observe_cycle_duration(elapsed.as_secs_f64());
@@ -624,6 +665,186 @@ async fn do_extractor_cycle(
         "extractor cycle",
     );
     Ok(processed)
+}
+
+/// Run one micro-batch end to end: resolve each queued id to its text, put the
+/// survivors through the extraction pipeline, and settle every memory's
+/// durable queue row and stage announcement.
+///
+/// Returns how many queue entries this batch accounted for, which the cycle
+/// sums into its processed count. A stale or unreadable row counts as
+/// accounted for too — the cycle made a decision about it either way.
+async fn process_chunk(
+    worker: &ExtractorWorker,
+    ctx: &WorkerContext,
+    pending: &[MemoryId],
+) -> usize {
+    let mut processed = 0usize;
+
+    // Resolve each pending id to its text from TEXTS_TABLE. A
+    // missing text means the memory was forgotten before extraction
+    // ran — remove the stale queue row and skip it.
+    let mut micro: Vec<ExtractorEnqueue> = Vec::with_capacity(pending.len());
+    let text_load_started = std::time::Instant::now();
+    for &memory_id in pending {
+        match load_memory_text(ctx, memory_id) {
+            Ok(Some(text)) => micro.push((memory_id, text)),
+            Ok(None) => {
+                trace!(
+                    memory_id = ?memory_id,
+                    "queued memory has no text (forgotten?); removing stale queue row",
+                );
+                if let Err(e) = remove_queue_row(ctx, memory_id) {
+                    warn!(memory_id = ?memory_id, error = %e, "queue row remove failed");
+                }
+                processed += 1;
+            }
+            Err(e) => {
+                warn!(memory_id = ?memory_id, error = %e, "text load failed; leaving in queue");
+                processed += 1;
+            }
+        }
+    }
+    crate::derivation_probe::record(
+        crate::derivation_probe::Stage::TextLoad,
+        text_load_started.elapsed().as_nanos() as u64,
+    );
+    if micro.is_empty() {
+        // Every id in this batch resolved to a stale or erroring row, so there
+        // is nothing to extract. The rows are already accounted for; the rest
+        // of the queue is other batches' work.
+        return processed;
+    }
+
+    // Run the whole micro-batch through one pipeline invocation.
+    // `drain_batch` returns one StageDecision per memory in input
+    // order so we can publish per-memory StageCompleted exactly
+    // once even when the batched classifier pass amortises across
+    // multiple memories.
+    let batch_decisions = crate::derivation_probe::timed(
+        crate::derivation_probe::Stage::DrainBatch,
+        drain_batch(worker, ctx, &micro),
+    )
+    .await;
+    for ((memory_id, _), decision) in micro.iter().zip(batch_decisions) {
+        // Remove the durable queue row only for outcomes that reached a
+        // terminal state. GateFailed and AppliedFailed stay queued while their
+        // bounded infra-failure retry still has budget; the backoff lives in
+        // the worker's ladder, which `load_pending_batch` consults, so a kept
+        // row is not re-drained the next second. Applied{retry_pending} stays
+        // queued while the retry budget holds — its audit row advances the LLM
+        // attempt count while the queue row keeps the memory reprocessable.
+        //
+        // Abandoned leaves the queue. The extraction queue measures work still
+        // to do, so an item that will never be done must leave it: held there,
+        // it would pin brain_extraction_queue_oldest_age_seconds above the
+        // staleness threshold on a condition the shard can never clear, and
+        // mask real backlog behind an alert nobody can action. Its durable
+        // FAILURE audit row is the record that the memory has no typed-graph
+        // grounding, and an operator backfill with `skip_already_extracted`
+        // cleared is the recovery path.
+        //
+        // A terminal Applied commits an audit row the idempotency gate honors;
+        // AlreadyExtracted is a stale row left by a crash between commit and
+        // remove — the remove here is the cleanup. A crash between the audit
+        // commit and this remove leaves a stale row the next cycle folds into
+        // AlreadyExtracted and removes — at-least-once with idempotent
+        // extraction.
+        let keep_queued = matches!(
+            decision,
+            StageDecision::GateFailed { .. }
+                | StageDecision::AppliedFailed { .. }
+                | StageDecision::Applied {
+                    retry_pending: true,
+                    ..
+                }
+        );
+        let (counts, audit_status, reason) = match decision {
+            StageDecision::Applied {
+                counts,
+                status_byte,
+                reason,
+                ..
+            } => (counts, audit_status_from_byte(status_byte), reason),
+            StageDecision::AppliedFailed { reason, .. }
+            | StageDecision::GateFailed { reason }
+            | StageDecision::Abandoned { reason } => (
+                ExtractorItemCounts::zero(),
+                StageAuditStatus::Failed,
+                reason,
+            ),
+            StageDecision::AlreadyExtracted => (
+                ExtractorItemCounts::zero(),
+                StageAuditStatus::Skipped,
+                String::new(),
+            ),
+        };
+        if !keep_queued {
+            if let Err(e) = remove_queue_row(ctx, *memory_id) {
+                warn!(memory_id = ?memory_id, error = %e, "queue row remove failed");
+            }
+        }
+        let produced_statements = counts.statements > 0;
+        let space_id = memory_scope_and_session(ctx, *memory_id).0.space();
+        publish_extracted_graph(ctx, *memory_id, space_id, counts, audit_status, reason).await;
+        // Reclassify the memory kind from what extraction produced: an
+        // Event-shaped statement → Episodic, timeless facts/preferences →
+        // Semantic. Only on a terminal apply (`!keep_queued`) that produced
+        // statements; a no-statement memory keeps the Episodic default.
+        if !keep_queued && produced_statements {
+            writeback_memory_kind(ctx, *memory_id);
+        }
+    }
+    processed += micro.len();
+
+    // Cooperative yield after every micro-batch so the scheduler
+    // stays responsive even when a batch lands in one tick.
+    glommio::executor().yield_if_needed().await;
+    processed
+}
+
+/// Drive `tasks` with at most `max_in_flight` of them live at once, summing
+/// what each one reports.
+///
+/// Tasks are pulled lazily, so a task that is never launched is never even
+/// built — which is what lets the caller's preparation work stay inside the
+/// task rather than ahead of the window.
+///
+/// `should_stop` gates LAUNCHING, never completion: a task already in flight
+/// always runs to the end. This is for work whose side effects — a durable row
+/// removed, an event published — must not be left half-done when a deadline or
+/// a shutdown arrives.
+async fn run_bounded_concurrently<I, Fut, S>(
+    tasks: I,
+    max_in_flight: usize,
+    should_stop: S,
+) -> usize
+where
+    I: IntoIterator<Item = Fut>,
+    Fut: Future<Output = usize>,
+    S: Fn() -> bool,
+{
+    use futures_util::stream::StreamExt;
+
+    // A zero-width window would launch nothing and silently drain no work, so
+    // the floor is one task at a time — exactly the strictly-ordered behaviour.
+    let window = max_in_flight.max(1);
+    let mut queued = tasks.into_iter();
+    let mut in_flight = futures_util::stream::FuturesUnordered::new();
+    let mut total = 0usize;
+
+    loop {
+        while in_flight.len() < window && !should_stop() {
+            match queued.next() {
+                Some(task) => in_flight.push(task),
+                None => break,
+            }
+        }
+        match in_flight.next().await {
+            Some(done) => total = total.saturating_add(done),
+            None => return total,
+        }
+    }
 }
 
 /// Rebuild the extractor registry from the live `EXTRACTORS_TABLE` when
@@ -730,7 +951,11 @@ fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
 /// queue. The queue is the source of truth for "needs extraction";
 /// draining it each cycle is what makes the worker resumable across
 /// restarts.
-fn load_pending_batch(ctx: &WorkerContext, limit: usize) -> Result<Vec<MemoryId>, String> {
+fn load_pending_batch(
+    worker: &ExtractorWorker,
+    ctx: &WorkerContext,
+    limit: usize,
+) -> Result<Vec<MemoryId>, String> {
     let rtxn = ctx
         .ops
         .executor
@@ -762,11 +987,23 @@ fn load_pending_batch(ctx: &WorkerContext, limit: usize) -> Result<Vec<MemoryId>
     let pending = brain_metadata::extraction_queue_drain(&rtxn, scan_cap)
         .map_err(|e| format!("extraction_queue_drain: {e}"))?;
     let mut due = Vec::with_capacity(limit.min(pending.len()));
+    let apply_failures = worker.apply_failures.lock();
     for (id, _) in pending {
         if due.len() >= limit {
             break;
         }
-        match brain_metadata::pipeline_extraction_retry_due(&rtxn, id, now) {
+        if apply_failures
+            .get(&id)
+            .is_some_and(|failure| failure.next_due_unix_nanos > now)
+        {
+            continue;
+        }
+        match brain_metadata::pipeline_extraction_retry_due(
+            &rtxn,
+            id,
+            now,
+            worker.retry_policy.transient,
+        ) {
             Ok(true) => due.push(id),
             Ok(false) => {} // backing off — leave queued, retry when due
             Err(e) => {
@@ -841,21 +1078,184 @@ enum StageDecision {
         /// published stage event can say what the audit row already knows.
         reason: String,
     },
-    /// `apply_outcome` returned a transient error and rolled back without
-    /// persisting anything (no audit row written). The durable queue row is
-    /// left in place so the next cycle retries; the publish records `Failed`
-    /// with zero counts so subscribers unblock.
+    /// `apply_outcome` returned an infra error and rolled back without
+    /// persisting anything. The durable queue row remains until the bounded
+    /// retry is due; the publish records `Failed` with zero counts.
     ///
-    /// No audit row means the stage event is the ONLY record this attempt
-    /// happened, so `reason` is the only place its cause can be read.
-    AppliedFailed { reason: String },
+    /// The terminal record for an abandoned memory is written by the drain
+    /// sweep, after the bounded retry budget or deterministic classification.
+    AppliedFailed { reason: String, deterministic: bool },
     /// A pre-pipeline gate (read_txn open, audit probe) errored
     /// before any work was attempted. The publish still records
     /// `Failed` with zero counts so subscribers unblock.
     GateFailed { reason: String },
+    /// The apply or gate path failed and the memory exhausted its infra-failure
+    /// attempt budget or failed deterministically. Its durable failure audit
+    /// row records that the typed graph has no grounding for this memory.
+    Abandoned { reason: String },
     /// `skip_already_extracted` saw an existing audit row for this
     /// memory. No work attempted; publish records `Skipped`.
     AlreadyExtracted,
+}
+
+/// Retry and attribution policy for the extraction pipeline. These bound work,
+/// not hardware: how many times a memory is retried and how recently the
+/// provider must have answered for a failure to count against the memory rather
+/// than against the provider. No machine property determines any of them, so
+/// they are policy with documented defaults rather than constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtractorRetryPolicy {
+    /// Total apply/gate infra-failure attempts a memory gets before extraction
+    /// is abandoned. The shard keeps making progress on the rest of the queue
+    /// while one memory that cannot be applied stops consuming a cycle's worth
+    /// of pipeline work — and, on the LLM-bearing path, a provider round-trip —
+    /// every single cycle.
+    pub max_apply_attempts_per_memory: u32,
+    /// How recently an LLM-tier run must have succeeded for a transient failure
+    /// to be charged to the memory rather than to the provider.
+    ///
+    /// Policy. Wide enough that a shard extracting normally keeps the evidence
+    /// alive between a backing-off memory's retries, narrow enough that it
+    /// expires well inside an outage; nothing in the ladder or the storage
+    /// fixes the number.
+    pub provider_reachable_window_nanos: u64,
+    /// The transient-failure budgets the durable audit row is held to.
+    pub transient: TransientRetryBudget,
+}
+
+impl Default for ExtractorRetryPolicy {
+    fn default() -> Self {
+        Self {
+            // The backfill worker abandons a stuck item at its own per-item cap.
+            // Sharing that number is what makes the two paths give up together,
+            // so an operator reasoning about one is reasoning about both.
+            max_apply_attempts_per_memory: crate::workers::backfill::MAX_ATTEMPTS_PER_ITEM,
+            provider_reachable_window_nanos: 900 * 1_000_000_000,
+            transient: TransientRetryBudget::default(),
+        }
+    }
+}
+
+/// Delay before the first infra-failure retry, doubling per attempt up to
+/// [`APPLY_RETRY_BACKOFF_CAP_NANOS`]. The cycle interval is one second, so
+/// without a ladder a rolled-back apply re-runs at 1 Hz; the base is set well
+/// above the interval so a busy shard or a contended write txn gets room to
+/// clear before the budget is spent on it.
+const APPLY_RETRY_BACKOFF_BASE_NANOS: u64 = 5_000_000_000;
+const APPLY_RETRY_BACKOFF_CAP_NANOS: u64 = 60_000_000_000;
+/// Hard ceiling on tracked memories. The map holds only memories currently in
+/// an infra-failure ladder, which is a small set under any healthy shard, but
+/// it must be bounded by construction rather than by that assumption.
+const MAX_TRACKED_APPLY_FAILURES: usize = 4_096;
+/// How long an untouched ladder entry survives. An entry whose memory stopped
+/// failing (forgotten, or re-extracted by a backfill) is otherwise never
+/// revisited, so age is what reclaims it.
+const APPLY_FAILURE_STATE_TTL_NANOS: u64 = 3_600_000_000_000;
+
+/// One memory's position in the infra-failure attempt ladder.
+///
+/// Deliberately in-memory, not durable: a restart clears the ladder, and that
+/// is the behaviour worth having — a process restart is exactly the kind of
+/// event that clears the transient conditions this ladder exists for. The
+/// worst case it allows is
+/// [`ExtractorRetryPolicy::max_apply_attempts_per_memory`] further attempts
+/// per restart, never the unbounded 1 Hz replay that an absent ladder gives.
+struct ApplyFailureState {
+    attempts: u32,
+    last_attempt_unix_nanos: u64,
+    next_due_unix_nanos: u64,
+}
+
+enum ApplyRetryVerdict {
+    /// Stay queued; `load_pending_batch` skips the memory until `due_at`.
+    Retry {
+        attempts: u32,
+        due_at_unix_nanos: u64,
+    },
+    /// Attempts are exhausted, or the failure is deterministic. Terminal.
+    Abandon { attempts: u32 },
+}
+
+/// `min(CAP, BASE << (attempts - 1))`. Mirrors the LLM tier's
+/// `retry_backoff_nanos` ladder so the two failure paths widen the same way.
+fn apply_retry_backoff_nanos(attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1).min(63);
+    APPLY_RETRY_BACKOFF_BASE_NANOS
+        .saturating_mul(1u64 << shift)
+        .min(APPLY_RETRY_BACKOFF_CAP_NANOS)
+}
+
+/// Record one infra failure for `memory_id` and say whether it is worth
+/// another attempt.
+///
+/// A deterministic failure spends the whole budget at once: a redb
+/// `Corrupted` or `ValueTooLarge` reproduces byte-for-byte on every retry, so
+/// the attempts would only delay the same verdict while re-running the
+/// pipeline each time. An unclassified or transient failure walks the ladder
+/// and widens its backoff until the budget is spent.
+///
+/// Pure over its `state` argument so the ladder, the bound and the eviction
+/// policy are testable without a worker or an executor.
+fn note_apply_failure(
+    state: &mut HashMap<MemoryId, ApplyFailureState>,
+    memory_id: MemoryId,
+    now_unix_nanos: u64,
+    deterministic: bool,
+    max_attempts: u32,
+) -> ApplyRetryVerdict {
+    if deterministic {
+        state.remove(&memory_id);
+        return ApplyRetryVerdict::Abandon { attempts: 1 };
+    }
+
+    let attempts = state
+        .get(&memory_id)
+        .map_or(1, |failure| failure.attempts.saturating_add(1));
+    if attempts >= max_attempts {
+        state.remove(&memory_id);
+        return ApplyRetryVerdict::Abandon { attempts };
+    }
+
+    // Make room for a new key: expire first, and only then evict the
+    // least-recently-failed entry, so a memory still actively walking its
+    // ladder is the last thing dropped.
+    if !state.contains_key(&memory_id) && state.len() >= MAX_TRACKED_APPLY_FAILURES {
+        state.retain(|_, failure| {
+            failure
+                .last_attempt_unix_nanos
+                .saturating_add(APPLY_FAILURE_STATE_TTL_NANOS)
+                > now_unix_nanos
+        });
+        if state.len() >= MAX_TRACKED_APPLY_FAILURES {
+            if let Some((&oldest, _)) = state
+                .iter()
+                .min_by_key(|(_, failure)| failure.last_attempt_unix_nanos)
+            {
+                state.remove(&oldest);
+            }
+        }
+    }
+    let due_at_unix_nanos = now_unix_nanos.saturating_add(apply_retry_backoff_nanos(attempts));
+    state.insert(
+        memory_id,
+        ApplyFailureState {
+            attempts,
+            last_attempt_unix_nanos: now_unix_nanos,
+            next_due_unix_nanos: due_at_unix_nanos,
+        },
+    );
+    ApplyRetryVerdict::Retry {
+        attempts,
+        due_at_unix_nanos,
+    }
+}
+
+/// Drop a memory's ladder entry once its apply commits. Attempts count
+/// consecutive failures, so a memory that fails twice and then succeeds must
+/// start from zero if it ever fails again rather than inheriting a nearly
+/// spent budget from an unrelated earlier incident.
+fn clear_apply_failure(state: &mut HashMap<MemoryId, ApplyFailureState>, memory_id: MemoryId) {
+    state.remove(&memory_id);
 }
 
 /// Drain a micro-batch of `(memory_id, text)` pairs through the
@@ -866,8 +1266,8 @@ enum StageDecision {
 ///
 /// The classifier tier sees ALL non-skipped memories in one
 /// `run_batch` call (amortising the GLiNER forward pass). Pattern +
-/// LLM tiers run per-memory because pattern is fast and LLM
-/// per-memory accounting drives the budget gate.
+/// LLM tiers run per-memory because pattern is fast and LLM cost is
+/// accounted per memory.
 /// Row-derived facts about one queued memory, read once per micro-batch.
 ///
 /// Carries the event/write timestamps (so the temporal extractor can
@@ -1041,13 +1441,16 @@ async fn drain_batch(
     // (input_index, memory_id, text) we still want to process.
     type LiveRow<'a> = (usize, MemoryId, Arc<str>);
     let mut live: Vec<LiveRow<'_>> = Vec::with_capacity(items.len());
+    let gate_started = std::time::Instant::now();
     for (idx, (memory_id, text)) in items.iter().enumerate() {
         if worker.knobs.skip_already_extracted {
             let probe = {
                 let db_guard = ctx.ops.executor.metadata.as_ref();
                 match db_guard.read_txn() {
-                    Ok(rtxn) => pipeline_has_extracted(&rtxn, *memory_id)
-                        .map_err(|e| format!("pipeline_has_extracted: {e}")),
+                    Ok(rtxn) => {
+                        pipeline_has_extracted(&rtxn, *memory_id, worker.retry_policy.transient)
+                            .map_err(|e| format!("pipeline_has_extracted: {e}"))
+                    }
                     Err(e) => Err(format!("extractor read_txn: {e}")),
                 }
             };
@@ -1072,6 +1475,10 @@ async fn drain_batch(
         }
         live.push((idx, *memory_id, text.clone()));
     }
+    crate::derivation_probe::record(
+        crate::derivation_probe::Stage::GateProbe,
+        gate_started.elapsed().as_nanos() as u64,
+    );
 
     // HyPE generation is deferred to AFTER this batch's extraction (see the
     // `run_hype_pass` call at the end). It is graph-aware: each memory's
@@ -1086,6 +1493,7 @@ async fn drain_batch(
     // gets them. Idempotent on the memory's own vector presence.
     if live.is_empty() {
         run_hype_pass(worker, ctx, items).await;
+        classify_apply_failures(worker, ctx, items, &mut decisions);
         return decisions;
     }
 
@@ -1096,10 +1504,6 @@ async fn drain_batch(
         reg.iter_enabled().cloned().collect()
     };
 
-    let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
-    let spent_so_far = { *worker.llm_spend.lock() };
-    let skip_llm_budget_exhausted = cycle_budget > 0 && spent_so_far >= cycle_budget;
-
     // Fetch each live memory's row facts in one read txn for the whole
     // micro-batch: the event/write timestamps (so the temporal extractor
     // can anchor relative dates like "last week" to the real event time —
@@ -1109,8 +1513,59 @@ async fn drain_batch(
     // `where memory.kind = ...` evaluates against the stored kind, not a
     // hardcoded one). A row miss falls back to zero timestamps, the system
     // namespace, and Episodic — never drops the memory.
-    let row_facts = load_row_facts(ctx, &live);
-    let live_mems: Vec<CoreMemory> = build_extraction_core_memories(&live, &row_facts);
+    // Reserve this micro-batch's preparation memory against the machine
+    // budget before any of it is fetched, and hold the reservation for the
+    // rest of this function.
+    //
+    // Prep is what derivation holds that nothing else bounds: each memory's
+    // own text, the full text of every neighbour fetched for its context,
+    // the candidate-predicate embeddings, and the per-namespace vocabulary
+    // blocks. All of it stays resident while the LLM tier reads from it, so
+    // the payload admitted at the provider seam sits ON TOP of this rather
+    // than instead of it — which is why both draw on one budget.
+    //
+    // The estimate is deliberately biased high. Under-pricing lets the
+    // machine overcommit, which kills the process; over-pricing only makes
+    // derivation run narrower.
+    let prep_reservation = {
+        let text_bytes: u64 = live
+            .iter()
+            .map(|(_, _, text)| text.len() as u64)
+            .sum::<u64>()
+            .checked_div(live.len() as u64)
+            .unwrap_or(0);
+        let workload = brain_llm::prep::PrepWorkload {
+            memories: live.len(),
+            memory_text_bytes: text_bytes,
+            neighbours_per_memory: DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
+            // Neighbours are memories drawn from this same corpus, so the
+            // batch's own mean is the best prior available before the fetch
+            // that would measure them.
+            neighbour_text_bytes: text_bytes,
+            // A rolling summary condenses a session; budget it at twice a
+            // single memory rather than pricing it at zero.
+            summary_bytes: text_bytes.saturating_mul(2),
+            predicate_candidates: CANDIDATE_PREDICATE_K,
+            embedding_dimensions: brain_embed::VECTOR_DIM,
+            // The namespace split is not resolved until `row_facts` lands
+            // below. One namespace per memory is the worst case and the safe
+            // direction to be wrong in.
+            namespaces: live.len(),
+            vocabulary_bytes_per_namespace: VOCABULARY_BYTES_PER_NAMESPACE_ESTIMATE,
+        };
+        crate::derivation_probe::timed(
+            crate::derivation_probe::Stage::PrepAdmit,
+            brain_llm::admission::reserve_prep(&workload),
+        )
+        .await
+    };
+
+    let (row_facts, live_mems) =
+        crate::derivation_probe::timed_sync(crate::derivation_probe::Stage::RowFacts, || {
+            let row_facts = load_row_facts(ctx, &live);
+            let live_mems: Vec<CoreMemory> = build_extraction_core_memories(&live, &row_facts);
+            (row_facts, live_mems)
+        });
 
     // Resolve each live memory's owning namespace to its name so the LLM
     // tier can scope selection: a namespace's own enabled LLM extractor
@@ -1118,19 +1573,26 @@ async fn drain_batch(
     // Distinct ids resolve once against one read txn; an unresolved id (or
     // a row miss) falls back to the system namespace so the system default
     // runs — never a silent drop, never a cross-tenant over-run.
-    let mem_namespaces: Vec<String> =
-        resolve_namespace_names(ctx, live.iter().map(|(_, mid, _)| *mid), &row_facts);
+    let mem_namespaces: Vec<String> = crate::derivation_probe::timed_sync(
+        crate::derivation_probe::Stage::NamespaceResolve,
+        || resolve_namespace_names(ctx, live.iter().map(|(_, mid, _)| *mid), &row_facts),
+    );
 
     // Fetch bounded LLM context (top-m similar memories + optional
     // rolling summary) per memory before running tiers. The fetch
     // happens once for the whole micro-batch so the per-memory cost
-    // amortises against the LLM call that follows. Skipped when the
-    // cycle LLM budget is exhausted or no LLM-tier extractors are
-    // registered — there's nothing to feed.
-    let extractor_context_map = if skip_llm_budget_exhausted || llm_exts_count(&extractors) == 0 {
+    // amortises against the LLM call that follows. Skipped when no
+    // LLM-tier extractors are registered — there's nothing to feed.
+    let extractor_context_map = if llm_exts_count(&extractors) == 0 {
         None
     } else {
-        Some(fetch_extractor_context_for_batch(ctx, &live_mems, &worker.metrics).await)
+        Some(
+            crate::derivation_probe::timed(
+                crate::derivation_probe::Stage::ContextFetch,
+                fetch_extractor_context_for_batch(ctx, &live_mems, &worker.metrics),
+            )
+            .await,
+        )
     };
 
     // Per-memory neighbor-count + approximate token observation. We
@@ -1167,31 +1629,34 @@ async fn drain_batch(
     // Snapshot the active schema's entity types + kind taxonomy as the
     // prompt blocks for the LLM tier. Read per cycle from ONE read txn so
     // both reflect a single consistent schema view; a user's SCHEMA_UPLOAD
-    // takes effect on the next batch without a restart. Empty string on any
-    // read error degrades to an unconstrained prompt rather than failing
-    // extraction.
+    // takes effect on the next batch without a restart. A read error yields
+    // no vocabulary, degrading to an unconstrained prompt rather than
+    // failing extraction.
     //
-    // The kind taxonomy is batch-level. The entity-type vocabulary is PER
-    // MEMORY NAMESPACE: Brain's built-in types + that namespace's own
-    // declared types (+ unclaimed ones), never another tenant's schema types.
-    // The same per-namespace label set feeds the classifier (GLiNER) tier, so
-    // a `SCHEMA_UPLOAD` that adds entity types reaches it on the next batch
-    // without a shard restart (the labels baked in at spawn are only the
-    // fallback). The pipeline runs once per namespace group so every
-    // LLM/classifier call carries its own namespace's labels.
-    let (entity_vocab, declared_kinds_block): (HashMap<String, NamespaceEntityVocab>, String) =
-        match ctx.ops.executor.metadata.read_txn() {
+    // Both the kind taxonomy and the entity-type vocabulary are PER MEMORY
+    // NAMESPACE: Brain's built-in vocabulary plus that namespace's own
+    // declared types and kinds (+ unclaimed entity types), never another
+    // tenant's schema vocabulary. Each prompt is billed to the owning
+    // tenant's credentials, so a block it did not declare is both that
+    // tenant's private schema leaving its boundary and a cost charged to
+    // whoever happens to share the batch. The pipeline runs once per
+    // namespace group so every LLM/classifier call carries only its own
+    // tenant's vocabulary, and the same per-namespace label set feeds the
+    // classifier (GLiNER) tier, so a `SCHEMA_UPLOAD` that adds entity types
+    // reaches it on the next batch without a shard restart.
+    let (entity_vocab, declared_kinds): (
+        HashMap<String, NamespaceEntityVocab>,
+        HashMap<String, String>,
+    ) = crate::derivation_probe::timed_sync(
+        crate::derivation_probe::Stage::Vocabulary,
+        || match ctx.ops.executor.metadata.read_txn() {
             Ok(rtxn) => (
                 entity_vocab_by_namespace(&rtxn, &mem_namespaces),
-                brain_metadata::render_declared_kinds_block(&rtxn).unwrap_or_default(),
+                declared_kinds_blocks(&rtxn, &mem_namespaces),
             ),
-            Err(_) => (HashMap::new(), String::new()),
-        };
-    let declared_kinds = if declared_kinds_block.is_empty() {
-        None
-    } else {
-        Some(declared_kinds_block.as_str())
-    };
+            Err(_) => (HashMap::new(), HashMap::new()),
+        },
+    );
 
     // Per-memory candidate predicates: for each memory, the top-K existing
     // `brain:` predicates nearest its text, so the LLM reuses this DB's real
@@ -1200,15 +1665,12 @@ async fn drain_batch(
     // Best-effort: computed only when an embedder is wired and an LLM tier
     // will consume it; any embed/scan hiccup degrades a memory to an empty
     // block rather than failing extraction.
+    let candidate_predicates_started = std::time::Instant::now();
     let mut candidate_predicate_map: Option<HashMap<MemoryId, String>> =
         match worker.embed_deps.as_ref() {
-            Some(deps) if !skip_llm_budget_exhausted && llm_exts_count(&extractors) > 0 => ctx
-                .ops
-                .executor
-                .metadata
-                .read_txn()
-                .ok()
-                .map(|rtxn| build_candidate_predicate_map(&rtxn, deps, &live_mems)),
+            Some(deps) if llm_exts_count(&extractors) > 0 => Some(
+                build_candidate_predicate_map(&ctx.ops.executor.metadata, deps, &live_mems).await,
+            ),
             _ => None,
         };
 
@@ -1220,7 +1682,7 @@ async fn drain_batch(
     // per-namespace — a memory never sees another namespace's vocabulary —
     // and independent of the embedder (the declared list is exact, not a
     // nearest-neighbor recall). Best-effort: a read error adds nothing.
-    if !skip_llm_budget_exhausted && llm_exts_count(&extractors) > 0 {
+    if llm_exts_count(&extractors) > 0 {
         if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
             let blocks = declared_vocab_blocks(&rtxn, &mem_namespaces);
             if !blocks.is_empty() {
@@ -1229,6 +1691,10 @@ async fn drain_batch(
             }
         }
     }
+    crate::derivation_probe::record(
+        crate::derivation_probe::Stage::CandidatePredicates,
+        candidate_predicates_started.elapsed().as_nanos() as u64,
+    );
 
     // Extraction and HyPE are independent, unordered async stages.
     // `build_neighborhood` resolves the entities a memory mentions
@@ -1242,31 +1708,46 @@ async fn drain_batch(
     // memory's own just-extracted facts feeding its own bridge questions;
     // prior-graph bridging is unaffected.
     let extract_and_apply = async {
-        let outcomes = run_pipeline_per_namespace(
-            extractors,
-            &live_mems,
-            &mem_namespaces,
-            skip_llm_budget_exhausted,
-            extractor_context_map,
-            &entity_vocab,
-            candidate_predicate_map.as_ref(),
-            declared_kinds,
+        let outcomes = crate::derivation_probe::timed(
+            crate::derivation_probe::Stage::Pipeline,
+            run_pipeline_per_namespace(
+                extractors,
+                &live_mems,
+                &mem_namespaces,
+                extractor_context_map,
+                &entity_vocab,
+                candidate_predicate_map.as_ref(),
+                &declared_kinds,
+            ),
         )
         .await;
 
-        // Cycle-LLM-budget bookkeeping + per-tier-run metrics.
+        // Provider spend this batch incurred, plus per-tier-run metrics. The
+        // sum is what the tenant is billed for the batch, so it is reported
+        // whole even when a memory's own apply later fails.
         let mut total_llm_micro: u64 = 0;
         for outcome in &outcomes {
             total_llm_micro = total_llm_micro.saturating_add(outcome.llm_cost_micro_usd);
             publish_tier_run_metrics(&worker.metrics, outcome);
         }
+        // A tier that ran is proof the provider answered this shard, which is
+        // what separates a memory failing on its own content from a memory
+        // caught in an outage. Recorded before the apply loop so a failure in
+        // the same batch as a success is charged to the memory.
+        if outcomes
+            .iter()
+            .any(|o| o.llm == brain_metadata::tier_status::RAN)
+        {
+            worker
+                .last_llm_success_unix_nanos
+                .store(now_unix_nanos(), Ordering::Relaxed);
+        }
         if total_llm_micro > 0 {
-            let mut spend = worker.llm_spend.lock();
-            *spend = spend.saturating_add(total_llm_micro);
             worker.metrics.add_llm_micro_usd(total_llm_micro);
         }
 
         // Apply each outcome and fold into the per-memory decision slot.
+        let apply_started = std::time::Instant::now();
         for ((idx, memory_id, _), outcome) in live.into_iter().zip(outcomes) {
             let decision = match apply_outcome(worker, ctx, memory_id, &outcome).await {
                 Ok(applied) => StageDecision::Applied {
@@ -1276,30 +1757,52 @@ async fn drain_batch(
                     reason: applied.reason,
                 },
                 Err(e) => {
-                    // A per-item data-shape problem (bad predicate, rejected
-                    // create) is handled inside `apply_outcome` (skip + count),
-                    // so a returned Err is a TRANSIENT infra failure: the apply
-                    // wtxn rolled back, nothing persisted. Do NOT write a
-                    // FAILURE audit — that would bar re-extraction via the
-                    // idempotency gate and permanently abandon a real memory's
-                    // graph for a momentary hiccup. Leave the durable queue row
-                    // in place so the next cycle retries.
+                    // A per-item data-shape problem is handled inside
+                    // `apply_outcome`; a returned Err is an infra failure that
+                    // is either deterministic and terminal immediately or
+                    // transient with bounded retries and widening backoff.
+                    // Retry attempts write no audit row so the idempotency gate
+                    // does not mistake an incomplete apply for grounding.
+                    let deterministic = apply_failure_is_deterministic(&e);
                     warn!(
                         memory_id = ?memory_id,
                         error = %e,
-                        "extractor apply failed (transient); leaving queued for retry",
+                        deterministic,
+                        "extractor apply failed; classifying for bounded retry",
                     );
                     StageDecision::AppliedFailed {
-                        reason: format!("extractor apply failed (transient): {e}"),
+                        reason: format!("extractor apply failed: {e}"),
+                        deterministic,
                     }
                 }
             };
+            if matches!(&decision, StageDecision::Applied { .. }) {
+                clear_apply_failure(&mut worker.apply_failures.lock(), memory_id);
+            }
             decisions[idx] = decision;
         }
+        crate::derivation_probe::record(
+            crate::derivation_probe::Stage::Apply,
+            apply_started.elapsed().as_nanos() as u64,
+        );
     };
 
-    futures_lite::future::zip(extract_and_apply, run_hype_pass(worker, ctx, items)).await;
+    crate::derivation_probe::timed(
+        crate::derivation_probe::Stage::ExtractAndHype,
+        futures_lite::future::zip(
+            extract_and_apply,
+            crate::derivation_probe::timed(
+                crate::derivation_probe::Stage::HypePass,
+                run_hype_pass(worker, ctx, items),
+            ),
+        ),
+    )
+    .await;
 
+    // Everything the reservation priced is out of scope past this point.
+    drop(prep_reservation);
+
+    classify_apply_failures(worker, ctx, items, &mut decisions);
     decisions
 }
 
@@ -1311,15 +1814,13 @@ async fn drain_batch(
 ///
 /// Idempotent on the memory's OWN question-vector presence — never on the
 /// extraction audit row — so a re-run skips memories that already have
-/// vectors rather than double-inserting them into the live index. Shares
-/// the per-cycle LLM budget with the extractor tiers; once spent, the rest
-/// pick up on a later cycle. A no-op when HyPE has no provider (substrate
-/// deployment) — `worker.hype` is then `None`.
+/// vectors rather than double-inserting them into the live index. A no-op
+/// when HyPE has no provider (substrate deployment) — `worker.hype` is then
+/// `None`.
 async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[ExtractorEnqueue]) {
     let Some(hype) = worker.hype.as_ref() else {
         return;
     };
-    let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
 
     // Owning namespace per memory, resolved once for the whole pass. HyPE is
     // mandatory and runs on every write, so under BYOK it is the largest LLM
@@ -1339,17 +1840,22 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
     // instead of N serial ones. Every future runs on this single glommio task
     // and interleaves only at await points — the network round-trips overlap
     // while redb reads and HNSW index inserts stay serialized (single-writer
-    // preserved). The per-cycle LLM budget is a soft cap here: a concurrent
-    // fan-out can overshoot by at most the in-flight set (bounded by the
-    // micro-batch size), which is the intended trade for the latency win.
     let futs =
         items
             .iter()
             .zip(hype_namespaces.iter())
             .map(|((memory_id, text), namespace)| async move {
-                if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
-                    return;
-                }
+                // Resolved before any exit below, because EVERY exit publishes.
+                // `StageKind::Hype` is enqueued 1:1 with `Extractor` at submit
+                // time, so a path that returns without publishing leaves a
+                // pending stage that never completes: a `WaitMode::Derived`
+                // caller blocks until its timeout and then reports a timeout,
+                // and the memory ends up with no questions and nothing
+                // anywhere saying why. Measured on a 629-write run: 2 memories
+                // reached `extractor` and had no `hype` row at all, with zero
+                // stage failures recorded — the same invisibility
+                // `HypeGenOutcome::failure` exists to end, one level up.
+                let scope = memory_scope_and_session(ctx, *memory_id).0;
                 // Skip memories that already own question vectors — HyPE generates
                 // once per memory, idempotent across re-ingest, and a second insert
                 // would duplicate vectors in the live HNSW index.
@@ -1358,6 +1864,15 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
                     Err(_) => false,
                 };
                 if already {
+                    // A completed stage that wrote nothing, not a failure and
+                    // not an absence: the questions are already there.
+                    publish_hype_completed(
+                        ctx,
+                        *memory_id,
+                        scope.space(),
+                        HypeGenOutcome::default(),
+                    )
+                    .await;
                     return;
                 }
                 // Render the typed-graph facts already known about the entities this
@@ -1365,15 +1880,14 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
                 // span more than this one memory (read-side multi-hop then resolves to
                 // a single cheap ANN probe — no read LLM). Empty for the first memory
                 // about a subject; fills in as the graph grows (and on re-ingest).
-                let scope = memory_scope_and_session(ctx, *memory_id).0;
                 let neighborhood = build_neighborhood(ctx, scope, text.as_ref());
                 let outcome = hype
                     .generate_for(namespace, *memory_id, text.as_ref(), &neighborhood)
                     .await;
-                // Stage journal (S4 HyPE). Success was previously metrics-only;
-                // this makes the per-memory question count observable so the eval
-                // probe can tell an empty HyPE pass (0 questions) apart from a
-                // skipped one.
+                // Stage journal (S4 HyPE). Journalling the per-memory question
+                // count, rather than leaving success to a metric, is what lets
+                // the eval probe tell an empty HyPE pass (0 questions) apart
+                // from a skipped one.
                 tracing::debug!(
                     target: "brain_debug::stage",
                     stage = "S4_hype",
@@ -1383,8 +1897,6 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
                     "write stage: HyPE hypothetical questions generated",
                 );
                 if outcome.cost_micro_usd > 0 {
-                    let mut spend = worker.llm_spend.lock();
-                    *spend = spend.saturating_add(outcome.cost_micro_usd);
                     worker.metrics.add_llm_micro_usd(outcome.cost_micro_usd);
                 }
                 if outcome.questions_written > 0 {
@@ -1417,11 +1929,11 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
 /// reports-to and prior-employer facts both exist, even though they landed in
 /// separate memories at different times.
 ///
-/// Bounded two ways: at most `hype_refresh_per_cycle` memories examined per
-/// cycle (a round-robin cursor advances across cycles so the whole corpus is
-/// revisited), and every regeneration is charged against the same per-cycle
-/// LLM budget the extraction tiers use — once spent, the rest wait for a later
-/// cycle. No-op when HyPE has no provider or the knob is `0`.
+/// Bounded by `hype_refresh_per_cycle` memories examined per cycle, with a
+/// round-robin cursor advancing across cycles so the whole corpus is
+/// revisited. Every regeneration's provider spend is reported into the same
+/// cost metric the extraction tiers use. No-op when HyPE has no provider or
+/// the knob is `0`.
 async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
     use brain_metadata::tables::text::TEXTS_TABLE;
 
@@ -1432,11 +1944,6 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
     if limit == 0 {
         return;
     }
-    let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
-    if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
-        return;
-    }
-
     // Scan a bounded window of (memory_id, text) starting strictly after the
     // cursor. Read into an owned Vec and drop the txn before any async work —
     // a read txn must never be held across the refresh `.await`.
@@ -1518,9 +2025,6 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
 
     let mut last_examined = start;
     for ((memory_id, text), namespace) in batch.iter().zip(refresh_namespaces.iter()) {
-        if cycle_budget > 0 && *worker.llm_spend.lock() >= cycle_budget {
-            break;
-        }
         let neighborhood = build_neighborhood(
             ctx,
             memory_scope_and_session(ctx, *memory_id).0,
@@ -1534,8 +2038,6 @@ async fn run_hype_refresh_sweep(worker: &ExtractorWorker, ctx: &WorkerContext) {
             .refresh_for(namespace, *memory_id, text.as_str(), &neighborhood)
             .await;
         if outcome.cost_micro_usd > 0 {
-            let mut spend = worker.llm_spend.lock();
-            *spend = spend.saturating_add(outcome.cost_micro_usd);
             worker.metrics.add_llm_micro_usd(outcome.cost_micro_usd);
         }
         if outcome.questions_written > 0 {
@@ -1953,11 +2455,41 @@ async fn fetch_extractor_context_for_batch(
         top_m: DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
         same_session_only: true,
     };
-    let mut out = HashMap::with_capacity(mems.len());
-    for m in mems {
+    context_map_from_fetches(mems, metrics, |m| {
+        fetch_extractor_context(&ctx.ops, m.id, m.text.as_deref().unwrap_or(""), cfg)
+    })
+    .await
+}
+
+/// Fold one `fetch` per memory into the batch's context map.
+///
+/// Each memory's context is an independent, read-only lookup — a semantic
+/// search plus a read txn, nothing written — so the batch issues them as one
+/// fan-out and the whole micro-batch costs about one search instead of `N`
+/// of them. Every future lives on this single glommio task and interleaves
+/// only at await points, so the reads stay serialized against the writer.
+///
+/// A failed fetch becomes an empty context rather than a dropped memory:
+/// extraction without neighbours is still extraction, and dropping the
+/// memory would lose its graph. The map is built in input order, so a
+/// repeated memory id resolves to its last entry.
+///
+/// The fetch is a parameter because what this function decides is the
+/// concurrency, not the retrieval.
+async fn context_map_from_fetches<'a, F, Fut, E>(
+    mems: &'a [CoreMemory],
+    metrics: &ExtractorMetrics,
+    fetch: F,
+) -> HashMap<MemoryId, ExtractorContext>
+where
+    F: Fn(&'a CoreMemory) -> Fut,
+    Fut: Future<Output = Result<ExtractorContext, E>>,
+    E: std::fmt::Display,
+{
+    let fetch = &fetch;
+    let fetches = mems.iter().map(move |m| async move {
         let started = Instant::now();
-        let cue_text = m.text.as_deref().unwrap_or("");
-        let entry = match fetch_extractor_context(&ctx.ops, m.id, cue_text, cfg).await {
+        let entry = match fetch(m).await {
             Ok(ec) => ec,
             Err(e) => {
                 warn!(
@@ -1970,9 +2502,12 @@ async fn fetch_extractor_context_for_batch(
             }
         };
         metrics.observe_context_fetch_duration(started.elapsed().as_secs_f64());
-        out.insert(m.id, entry);
-    }
-    out
+        (m.id, entry)
+    });
+    futures_util::future::join_all(fetches)
+        .await
+        .into_iter()
+        .collect()
 }
 
 /// Per-call audit facts for one tier of a pipeline run: which extractor
@@ -2024,9 +2559,9 @@ struct NamespaceEntityVocab {
 
 /// Per-namespace entity-type vocabulary for every DISTINCT namespace in the
 /// batch (see [`brain_metadata::entity_type_labels_for_namespaces`]). On a
-/// scoping read error this degrades to the global label set for every
-/// namespace — the pre-scoping behavior — rather than an empty vocabulary
-/// (which would silently fall back to the classifier's spawn-time labels).
+/// scoping read error yields no vocabulary rather than a shard-wide one: the
+/// whole point of this read is that a tenant sees only its own types, and a
+/// fallback that drops that scope is worse than extracting nothing.
 fn entity_vocab_by_namespace(
     rtxn: &redb::ReadTransaction,
     mem_namespaces: &[String],
@@ -2040,13 +2575,9 @@ fn entity_vocab_by_namespace(
             warn!(
                 target: "brain_workers::extractor",
                 error = %e,
-                "per-namespace entity-type scoping failed; using the global label set",
+                "per-namespace entity-type scoping failed; this cycle extracts with no entity-type vocabulary",
             );
-            let global = brain_metadata::entity_type_label_qnames(rtxn).unwrap_or_default();
-            distinct
-                .iter()
-                .map(|ns| ((*ns).to_string(), global.clone()))
-                .collect()
+            HashMap::new()
         }
     };
     labels_by_ns
@@ -2072,50 +2603,71 @@ fn group_indices_by_namespace(mem_namespaces: &[String]) -> Vec<(&str, Vec<usize
     groups
 }
 
-/// Run the extraction pipeline once per memory-namespace group, handing
-/// each group ITS namespace's entity-type prompt block and classifier
-/// labels, and scatter the outcomes back into batch order. A namespace-B
-/// memory therefore never sees namespace A's schema entity types. A
-/// single-namespace batch (the common case) runs exactly one pipeline over
-/// the original slices.
+/// Run the extraction pipeline once per memory-namespace group, handing each
+/// group ITS namespace's entity-type prompt block, declared kind taxonomy and
+/// classifier labels, and scatter the outcomes back into batch order. A
+/// namespace-B memory therefore never sees namespace A's schema entity types
+/// or declared kinds. A single-namespace batch (the common case) runs exactly
+/// one pipeline over the original slices.
 #[allow(clippy::too_many_arguments)]
 async fn run_pipeline_per_namespace(
     extractors: Vec<Arc<dyn Extractor>>,
     mems: &[CoreMemory],
     mem_namespaces: &[String],
-    skip_llm_budget_exhausted: bool,
     mut extractor_context_map: Option<HashMap<MemoryId, ExtractorContext>>,
     entity_vocab: &HashMap<String, NamespaceEntityVocab>,
     candidate_predicate_map: Option<&HashMap<MemoryId, String>>,
-    declared_kinds: Option<&str>,
+    declared_kinds: &HashMap<String, String>,
 ) -> Vec<PipelineOutcome> {
+    const NO_LABELS: &[String] = &[];
     let vocab_for = |ns: &str| -> (Option<&str>, Option<&[String]>) {
-        match entity_vocab.get(ns) {
-            Some(v) => (
-                Some(v.block.as_str()).filter(|b| !b.is_empty()),
-                Some(v.labels.as_slice()).filter(|l| !l.is_empty()),
-            ),
-            None => (None, None),
-        }
+        let v = entity_vocab.get(ns);
+        // None makes the classifier use labels baked into the shard-wide
+        // registry. The namespace set is authoritative even when empty:
+        // extracting nothing is the only safe result when this tenant
+        // resolves no entity types.
+        (
+            v.map(|v| v.block.as_str()).filter(|b| !b.is_empty()),
+            Some(v.map_or(NO_LABELS, |v| v.labels.as_slice())),
+        )
+    };
+    let kinds_for = |ns: &str| -> Option<&str> {
+        declared_kinds
+            .get(ns)
+            .map(String::as_str)
+            .filter(|b| !b.is_empty())
     };
     let groups = group_indices_by_namespace(mem_namespaces);
     if groups.len() <= 1 {
         let ns = groups.first().map_or(SYSTEM_NAMESPACE, |(ns, _)| *ns);
         let (block, labels) = vocab_for(ns);
+        let kinds = kinds_for(ns);
         return run_pipeline_batch(
             extractors,
             mems,
             mem_namespaces,
-            skip_llm_budget_exhausted,
             extractor_context_map,
             block,
             candidate_predicate_map,
-            declared_kinds,
+            kinds,
             labels,
         )
         .await;
     }
-    let mut slots: Vec<Option<PipelineOutcome>> = (0..mems.len()).map(|_| None).collect();
+    // Namespace groups are independent: each reads only shared immutable
+    // inputs and owns a disjoint set of output slots, so they run as one
+    // concurrent fan-out and their LLM round-trips overlap on the executor
+    // lane instead of queueing behind one another. Memory stays bounded by the
+    // LLM client's byte admission controller, which parks excess work at the
+    // client seam rather than letting a wider fan-out grow the heap.
+    //
+    // The per-memory extractor context is partitioned into one owned map per
+    // group BEFORE any group starts, because draining the shared map from
+    // inside a group would hold a mutable borrow of it across every await. A
+    // memory whose id has no context entry simply contributes nothing to its
+    // group's map and still runs.
+    let mut group_indices: Vec<Vec<usize>> = Vec::with_capacity(groups.len());
+    let mut group_runs = Vec::with_capacity(groups.len());
     for (ns, idxs) in groups {
         let group_mems: Vec<CoreMemory> = idxs.iter().map(|&i| mems[i].clone()).collect();
         let group_namespaces: Vec<String> = vec![ns.to_string(); idxs.len()];
@@ -2126,18 +2678,29 @@ async fn run_pipeline_per_namespace(
                 .collect::<HashMap<MemoryId, ExtractorContext>>()
         });
         let (block, labels) = vocab_for(ns);
-        let outs = run_pipeline_batch(
-            extractors.clone(),
-            &group_mems,
-            &group_namespaces,
-            skip_llm_budget_exhausted,
-            group_context,
-            block,
-            candidate_predicate_map,
-            declared_kinds,
-            labels,
-        )
-        .await;
+        let kinds = kinds_for(ns);
+        let extractors = extractors.clone();
+        group_indices.push(idxs);
+        group_runs.push(async move {
+            run_pipeline_batch(
+                extractors,
+                &group_mems,
+                &group_namespaces,
+                group_context,
+                block,
+                candidate_predicate_map,
+                kinds,
+                labels,
+            )
+            .await
+        });
+    }
+    let group_outcomes = futures_util::future::join_all(group_runs).await;
+
+    // Scatter back into batch order: a group's k-th outcome belongs to the
+    // k-th original index it carried.
+    let mut slots: Vec<Option<PipelineOutcome>> = (0..mems.len()).map(|_| None).collect();
+    for (idxs, outs) in group_indices.into_iter().zip(group_outcomes) {
         for (i, o) in idxs.into_iter().zip(outs) {
             slots[i] = Some(o);
         }
@@ -2178,7 +2741,6 @@ async fn run_pipeline_batch(
     extractors: Vec<Arc<dyn Extractor>>,
     mems: &[CoreMemory],
     mem_namespaces: &[String],
-    skip_llm_budget_exhausted: bool,
     extractor_context_map: Option<HashMap<MemoryId, ExtractorContext>>,
     declared_entity_types: Option<&str>,
     candidate_predicate_map: Option<&HashMap<MemoryId, String>>,
@@ -2255,12 +2817,15 @@ async fn run_pipeline_batch(
             declared_kinds,
             entity_type_labels: None,
         };
-        run_tier_into(
-            &pattern_exts,
-            &ctx,
-            mems,
-            &mut outcomes,
-            ExtractorKind::Pattern,
+        crate::derivation_probe::timed(
+            crate::derivation_probe::Stage::PatternTier,
+            run_tier_into(
+                &pattern_exts,
+                &ctx,
+                mems,
+                &mut outcomes,
+                ExtractorKind::Pattern,
+            ),
         )
         .await;
     }
@@ -2280,40 +2845,22 @@ async fn run_pipeline_batch(
             declared_kinds,
             entity_type_labels,
         };
-        run_tier_into(
-            &classifier_exts,
-            &ctx,
-            mems,
-            &mut outcomes,
-            ExtractorKind::Classifier,
+        crate::derivation_probe::timed(
+            crate::derivation_probe::Stage::ClassifierTier,
+            run_tier_into(
+                &classifier_exts,
+                &ctx,
+                mems,
+                &mut outcomes,
+                ExtractorKind::Classifier,
+            ),
         )
         .await;
     }
     accumulate_into_prior(&outcomes, mems, &mut prior_items);
 
     // ----- Tier 3: llm -----------------------------------------------
-    if skip_llm_budget_exhausted {
-        // Cycle-budget gate: skip the LLM tier across the whole batch
-        // when prior cycles have eaten the budget. Pattern + classifier
-        // already ran so cheap-tier output still lands under load.
-        // Attribute the skip to the first configured LLM extractor so the
-        // per-call audit records a SkippedBudget row rather than dropping
-        // the tier silently.
-        let llm_ident = llm_exts
-            .first()
-            .map(|e| (e.id().raw(), e.extractor_version()));
-        for o in &mut outcomes {
-            o.llm = tier_status::SKIPPED;
-            if let Some((extractor_id, extractor_version)) = llm_ident {
-                o.llm_audit = Some(TierAudit {
-                    extractor_id,
-                    extractor_version,
-                    status: extraction_status::SKIPPED_BUDGET,
-                    reason: "cycle LLM budget exhausted".to_string(),
-                });
-            }
-        }
-    } else {
+    {
         // Bounded inferential context per memory: top-10 similar
         // priors + (when wired) a rolling summary. Without this the
         // LLM can only see the memory it's extracting and cannot
@@ -2335,7 +2882,11 @@ async fn run_pipeline_batch(
             declared_kinds,
             entity_type_labels: None,
         };
-        run_llm_tier_into(&llm_exts, &ctx, mems, mem_namespaces, &mut outcomes).await;
+        crate::derivation_probe::timed(
+            crate::derivation_probe::Stage::LlmTier,
+            run_llm_tier_into(&llm_exts, &ctx, mems, mem_namespaces, &mut outcomes),
+        )
+        .await;
     }
 
     // Statement kind is owned by the tiers that can judge it correctly and
@@ -2365,6 +2916,18 @@ fn statement_kind_to_byte(k: StatementKind) -> u8 {
 /// per-tier RAN/SKIPPED/FAILED byte on the slot, and appends Success
 /// items to `outcomes[i].items` so the next tier sees them via
 /// `accumulate_into_prior`.
+///
+/// Extractors sharing a tier are independent of one another — each reads the
+/// same immutable context and produces its own per-memory results, and nothing
+/// in the tier feeds anything else in it — so their batches are composed into
+/// one concurrent fan-out. Only the boundary BETWEEN tiers is ordered, and
+/// that ordering is the caller's: `run_pipeline_batch` awaits this per tier so
+/// the LLM tier still observes the cheap tiers' output.
+///
+/// The fold stays serial and follows registration order. `fold_tier_result`
+/// combines the tier byte order-dependently (among two real outcomes the later
+/// wins), so folding on completion order would make the recorded outcome
+/// depend on which extractor's network round-trip returned first.
 async fn run_tier_into(
     tier_exts: &[Arc<dyn Extractor>],
     ctx: &ExtractionContext<'_>,
@@ -2372,10 +2935,15 @@ async fn run_tier_into(
     outcomes: &mut [PipelineOutcome],
     tier_kind: brain_core::ExtractorKind,
 ) {
+    let mut runs = Vec::with_capacity(tier_exts.len());
     for extractor in tier_exts {
+        runs.push(extractor.run_batch(ctx, mems));
+    }
+    let batches = futures_util::future::join_all(runs).await;
+
+    for (extractor, results) in tier_exts.iter().zip(batches) {
         let ext_id = extractor.id().raw();
         let ext_version = extractor.extractor_version();
-        let results = extractor.run_batch(ctx, mems).await;
         debug_assert_eq!(results.len(), mems.len());
         for (i, result) in results.into_iter().enumerate() {
             fold_tier_result(
@@ -2450,9 +3018,10 @@ fn fold_tier_result(
         }
     }
     // Real provider cost flows from the LLM extractor's result into the
-    // per-memory outcome, which the caller sums into the per-cycle spend
-    // gate and the cost metric. Non-LLM tiers report zero, so the
-    // unconditional add is correct.
+    // per-memory outcome, which the caller sums into the cost metric and the
+    // per-memory audit row. The add is unconditional on tier status because a
+    // call the provider billed is owed whether or not its output validated;
+    // non-LLM tiers and cache hits report zero.
     slot.llm_cost_micro_usd = slot
         .llm_cost_micro_usd
         .saturating_add(result.cost_micro_usd);
@@ -2888,8 +3457,7 @@ fn tier_outcome_for(result: &ExtractionResult) -> u8 {
     match result.status {
         ExtractionStatus::Success => tier_status::RAN,
         ExtractionStatus::Failure => tier_status::FAILED,
-        ExtractionStatus::SkippedBudget
-        | ExtractionStatus::SkippedFilter
+        ExtractionStatus::SkippedFilter
         | ExtractionStatus::SkippedDuplicate
         | ExtractionStatus::SkippedDisabled => tier_status::SKIPPED,
     }
@@ -2979,6 +3547,30 @@ fn memory_text_hash(wtxn: &redb::WriteTransaction, memory_id: MemoryId) -> [u8; 
         .unwrap_or([0u8; 32])
 }
 
+/// The namespace name the memory's extraction is billed to, read from the
+/// memory row inside the open extraction `wtxn`.
+///
+/// Resolved from the row rather than from the worker's context: derivation runs
+/// after the write is acknowledged and one batch can hold memories from
+/// different tenants. Falls back to the system namespace, matching
+/// [`namespace_name_for`] — the two must agree or the extraction audit and the
+/// `llm_spend` ledger would attribute one memory's spend to two tenants.
+fn memory_namespace_name(wtxn: &redb::WriteTransaction, memory_id: MemoryId) -> String {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let fallback = || brain_extractors::SYSTEM_NAMESPACE.to_string();
+    let Ok(t) = wtxn.open_table(MEMORIES_TABLE) else {
+        return fallback();
+    };
+    let Ok(Some(g)) = t.get(&memory_id.to_be_bytes()) else {
+        return fallback();
+    };
+    let ns_id = g.value().namespace_id;
+    brain_metadata::namespace::namespace_name_wtxn(wtxn, brain_core::NamespaceId::from(ns_id))
+        .ok()
+        .flatten()
+        .unwrap_or_else(fallback)
+}
+
 /// Emit one historical [`ExtractionAudit`] row per extractor tier that ran
 /// (or was skipped) for `memory_id`, into `EXTRACTOR_AUDIT_TABLE` + its
 /// three secondary indexes, inside the caller's extraction `wtxn` so the
@@ -3003,6 +3595,9 @@ fn emit_per_call_extraction_audit(
         (&outcome.classifier_audit, 0u64),
         (&outcome.llm_audit, outcome.llm_cost_micro_usd),
     ];
+    // Every tier call for one memory bills the memory's owning tenant, so the
+    // name is resolved once for the batch of rows rather than per tier.
+    let namespace = memory_namespace_name(wtxn, memory_id);
     for (tier_audit, cost_micro_usd) in tiers {
         let Some(t) = tier_audit else { continue };
         // `schema_version` is 1: the pipeline runs every tier at
@@ -3036,7 +3631,8 @@ fn emit_per_call_extraction_audit(
                 t.reason.clone(),
                 input_hash,
             )
-        };
+        }
+        .with_namespace(namespace.clone());
         row.cost_micro_usd = cost_micro_usd;
         if let Err(e) = audit_write(wtxn, &row) {
             warn!(
@@ -3079,7 +3675,7 @@ async fn apply_outcome(
         let mut pending: Vec<PendingVerdict> = Vec::new();
         let plan_txn = db_guard
             .write_txn()
-            .map_err(|e| ApplyError::Storage(format!("write_txn: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("write_txn", &e))?;
         let (plan_txn, plan_body) = run_apply_body(
             worker,
             ctx,
@@ -3095,19 +3691,48 @@ async fn apply_outcome(
             // nothing), so commit it directly instead of re-running.
             plan_txn
                 .commit()
-                .map_err(|e| ApplyError::Storage(format!("commit: {e:?}")))?;
+                .map_err(|e| ApplyError::storage("commit", &e))?;
             plan_body
         } else {
             drop(plan_txn); // roll back the plan pass; re-run with verdicts
             let mut verdicts = PrecomputedVerdicts::new();
             let namespace = namespace_name_for(ctx, memory_id);
+            let mut disambiguation_micro: u64 = 0;
             for p in pending {
-                let verdict = dis.confirm(&namespace, &p.view, &p.raw_surface).await;
-                verdicts.insert(p.norm_surface, p.candidate, verdict);
+                let outcome = dis.confirm(&namespace, &p.view, &p.raw_surface).await;
+                disambiguation_micro = disambiguation_micro.saturating_add(outcome.cost_micro_usd);
+                verdicts.insert(p.norm_surface, p.candidate, outcome.verdict);
+            }
+            if disambiguation_micro > 0 {
+                worker.metrics.add_llm_micro_usd(disambiguation_micro);
+                // The plan txn is dropped and the replay txn is not opened until
+                // after this loop, leaving the only safe window for a short
+                // ledger txn without holding redb's single writer across awaits.
+                if let Err(e) = (|| -> Result<(), String> {
+                    let wtxn = db_guard
+                        .write_txn()
+                        .map_err(|e| format!("write_txn: {e:?}"))?;
+                    llm_spend_add(
+                        &wtxn,
+                        &namespace,
+                        llm_spend_stage::ENTITY_DISAMBIGUATION,
+                        disambiguation_micro,
+                    )
+                    .map_err(|e| format!("llm_spend_add: {e}"))?;
+                    wtxn.commit().map_err(|e| format!("commit: {e:?}"))
+                })() {
+                    tracing::warn!(
+                        target: "brain_workers::extractor",
+                        memory_id = ?memory_id,
+                        error = %e,
+                        "failed to persist entity disambiguation spend \
+                         (best-effort; extraction unaffected)",
+                    );
+                }
             }
             let wtxn = db_guard
                 .write_txn()
-                .map_err(|e| ApplyError::Storage(format!("write_txn: {e:?}")))?;
+                .map_err(|e| ApplyError::storage("write_txn", &e))?;
             let (wtxn, body) = run_apply_body(
                 worker,
                 ctx,
@@ -3118,13 +3743,13 @@ async fn apply_outcome(
                 &mut Disambiguation::Replay(&verdicts),
             )?;
             wtxn.commit()
-                .map_err(|e| ApplyError::Storage(format!("commit: {e:?}")))?;
+                .map_err(|e| ApplyError::storage("commit", &e))?;
             body
         }
     } else {
         let wtxn = db_guard
             .write_txn()
-            .map_err(|e| ApplyError::Storage(format!("write_txn: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("write_txn", &e))?;
         let (wtxn, body) = run_apply_body(
             worker,
             ctx,
@@ -3135,7 +3760,7 @@ async fn apply_outcome(
             &mut Disambiguation::Off,
         )?;
         wtxn.commit()
-            .map_err(|e| ApplyError::Storage(format!("commit: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("commit", &e))?;
         body
     };
 
@@ -3320,14 +3945,18 @@ fn run_apply_body(
 
     let db_guard = ctx.ops.executor.metadata.as_ref();
 
-    // Read this memory's prior attempt count so a retryable failure
-    // advances the retry budget. Single-writer-per-shard means no
-    // concurrent writer can change it between this read and the audit
-    // write below. Absent row → 0. Recomputed per pass, but a rolled-back
-    // plan pass leaves it unchanged, so both passes see the same value.
-    let prior_attempts = match db_guard.read_txn() {
-        Ok(rtxn) => brain_metadata::pipeline_extraction_attempts(&rtxn, memory_id).unwrap_or(0),
-        Err(_) => 0,
+    // Read this memory's prior audit row so a retryable failure advances both
+    // durable retry counters. Single-writer-per-shard means no concurrent
+    // writer can change it between this read and the audit write below. An
+    // absent row supplies zero counters. Recomputed per pass, but a rolled-back
+    // plan pass leaves the row unchanged, so both passes see the same values.
+    let (prior_attempts, prior_item_attributable_failures) = match db_guard.read_txn() {
+        Ok(rtxn) => brain_metadata::pipeline_audit_entry(&rtxn, memory_id)
+            .ok()
+            .flatten()
+            .map(|entry| (entry.attempts, entry.item_attributable_failures))
+            .unwrap_or((0, 0)),
+        Err(_) => (0, 0),
     };
 
     // The writing space's self-entity. First-person statement subjects
@@ -3685,7 +4314,7 @@ fn run_apply_body(
                 if !sm.subject_is_memory {
                     continue;
                 }
-                // The resolved `event_at_unix_nanos` wins, else the legacy
+                // The resolved `event_at_unix_nanos` wins, else the raw
                 // unix-nanos object text.
                 if let Some(ts) = sm.event_at_unix_nanos.or_else(|| {
                     sm.object_text
@@ -4488,16 +5117,16 @@ fn run_apply_body(
     // would deduplicate but at the cost of an extra LLM call.
     //
     // The audit row records this pipeline run's LLM cost (so per-row
-    // forensics show "this memory cost N µ$"); the worker's per-cycle
-    // accumulator drives the cross-memory budget gate separately.
+    // forensics show "this memory cost N µ$"); the shard-wide cost metric
+    // is bumped once per batch from the same per-memory figures.
     let (status_byte, reason) = decide_status(outcome, counts);
     let attempts = prior_attempts.saturating_add(1);
     // A retryable failure is specifically the LLM tier failing with a
-    // transient cause. A TRANSIENT failure (timeout / rate-limit / 5xx) keeps
-    // the memory queued and is retried with backoff until it succeeds — a
-    // passing provider outage must never permanently strip a memory's
-    // grounding. A PERMANENT failure (bad key, no balance, malformed) is
-    // terminal at once: retrying can't help and only hides the problem.
+    // transient cause and retaining both retry budgets. A transient failure
+    // (timeout / rate-limit / 5xx) keeps the memory queued while its bounded
+    // backoff ladder remains. A PERMANENT failure (bad key, no balance,
+    // malformed) is terminal at once: retrying cannot help and only hides the
+    // problem.
     //
     // A retry re-runs the whole pipeline, so the already-committed
     // pattern/classifier-tier rows are re-applied. That is safe because
@@ -4508,13 +5137,63 @@ fn run_apply_body(
     // so the content-dedup is what prevents the leak). Distinct multi-values
     // still coexist; only exact re-applications collapse.
     let llm_failed = outcome.llm == brain_metadata::tier_status::FAILED;
-    let failure_class_byte = match outcome.llm_failure_class {
-        ExtractionFailureClass::Transient => brain_metadata::failure_class::TRANSIENT,
-        ExtractionFailureClass::Permanent => brain_metadata::failure_class::PERMANENT,
-        ExtractionFailureClass::Unclassified => brain_metadata::failure_class::UNCLASSIFIED,
-    };
     let permanent = outcome.llm_failure_class == ExtractionFailureClass::Permanent;
-    let retry_pending = llm_failed && !permanent;
+    // A transient failure inside the reachability window landed while the
+    // provider was answering other memories, so the memory's own content is
+    // what failed and the attempt is charged to it. Outside the window there
+    // is no evidence the provider was up, so the attempt is charged to the
+    // provider: it still widens the backoff but leaves the per-item budget
+    // intact.
+    let provider_reachable = now
+        .saturating_sub(worker.last_llm_success_unix_nanos.load(Ordering::Relaxed))
+        < worker.retry_policy.provider_reachable_window_nanos;
+    let attributable = llm_failed && !permanent && provider_reachable;
+    let item_attributable_failures =
+        prior_item_attributable_failures.saturating_add(u8::from(attributable));
+    let exhausted = llm_failed
+        && !permanent
+        && transient_budget_spent(
+            attempts,
+            item_attributable_failures,
+            worker.retry_policy.transient,
+        );
+    let retry_pending = llm_failed && !permanent && !exhausted;
+    // Terminality rides on the failure class so the status can keep describing
+    // what the pattern and classifier tiers committed.
+    let failure_class_byte = if exhausted {
+        brain_metadata::failure_class::PERMANENT
+    } else {
+        match outcome.llm_failure_class {
+            ExtractionFailureClass::Transient => brain_metadata::failure_class::TRANSIENT,
+            ExtractionFailureClass::Permanent => brain_metadata::failure_class::PERMANENT,
+            ExtractionFailureClass::Unclassified => brain_metadata::failure_class::UNCLASSIFIED,
+        }
+    };
+    let reason = if exhausted {
+        format!(
+            "extraction abandoned after {attempts} attempt(s), {item_attributable_failures} attributable to this memory: {reason}"
+        )
+    } else {
+        reason
+    };
+    if exhausted {
+        let label = if item_attributable_failures
+            >= worker.retry_policy.transient.max_item_attributable_failures
+        {
+            "llm_abandoned_item"
+        } else {
+            "llm_abandoned_provider"
+        };
+        worker.metrics.inc_apply_dropped(label);
+        tracing::error!(
+            target: "brain_workers::extractor",
+            memory_id = ?memory_id,
+            attempts,
+            item_attributable_failures,
+            reason = %reason,
+            "extraction retry budget spent; memory has no LLM-tier grounding, backfill is the recovery path",
+        );
+    }
     if llm_failed && permanent {
         // Operator-actionable: a permanent extraction failure means this
         // memory's typed-graph grounding will not be created without operator
@@ -4539,7 +5218,8 @@ fn run_apply_body(
         outcome.llm_cost_micro_usd,
     )
     .with_attempts(attempts)
-    .with_failure_class(failure_class_byte);
+    .with_failure_class(failure_class_byte)
+    .with_item_attributable_failures(item_attributable_failures);
     record_extracted(&wtxn, &audit)
         .map_err(|e| ApplyError::Audit(format!("record_extracted: {e}")))?;
 
@@ -4681,20 +5361,18 @@ async fn publish_extracted_graph(
 
 /// Publish a `StageCompleted{Hype}` event so subscribers waiting via
 /// `--wait` can decrement their pending-stage checklist for this memory.
-/// Called once per memory that actually ran [`HypeGenerator::generate_for`]
-/// (skipped entirely for memories the idempotency check or the per-cycle
-/// LLM budget bypassed — those never reach this point).
+/// Called once per memory that actually ran [`HypeGenerator::generate_for`].
 ///
 /// `generate_for` stays best-effort: an internal LLM/embed/persist failure is
 /// logged and folded into a zero-question outcome rather than failing the
-/// surrounding write. It is no longer INDISTINGUISHABLE, though. Every zero
-/// outcome used to publish `StageOutcome::Empty`, and the encode trace maps
-/// `Empty` to `Ok` — so a namespace with no LLM provider key produced a
-/// `hype` stage reporting `status: 0, questions=0`, identical to text that
-/// simply warranted no questions. The write looked healthy, the graph came
-/// back empty, and nothing connected the two.
+/// surrounding write. What it is not is INDISTINGUISHABLE. Publishing
+/// `StageOutcome::Empty` for every zero outcome would be: the encode trace
+/// maps `Empty` to `Ok`, so a namespace with no LLM provider key reports a
+/// `hype` stage of `status: 0, questions=0`, identical to text that simply
+/// warranted no questions. The write looks healthy, the graph comes back
+/// empty, and nothing connects the two.
 ///
-/// So the three cases now separate: `failed` → `Failed` (could not run),
+/// So the three cases separate: `failed` → `Failed` (could not run),
 /// zero questions → `Empty` (ran, found nothing), questions → `Ok`.
 async fn publish_hype_completed(
     ctx: &WorkerContext,
@@ -4937,10 +5615,10 @@ fn predicate_declared_kind_in_write_txn(
     use brain_metadata::tables::predicate::decode_kind_constraint;
     let t = wtxn
         .open_table(PREDICATES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("predicates open: {e}")))?;
+        .map_err(|e| ApplyError::storage("predicates open", &e))?;
     let row = t
         .get(&pid.raw())
-        .map_err(|e| ApplyError::Storage(format!("predicates get: {e}")))?;
+        .map_err(|e| ApplyError::storage("predicates get", &e))?;
     Ok(row.and_then(|g| decode_kind_constraint(g.value().kind_constraint)))
 }
 
@@ -5139,19 +5817,25 @@ fn select_candidate_predicates(
 /// Best-effort throughout — a candidate-scan error yields no blocks and a
 /// per-memory embed failure simply omits that memory, so extraction proceeds
 /// with an empty `{CANDIDATE_PREDICATES}` rather than failing.
-fn build_candidate_predicate_map(
-    rtxn: &redb::ReadTransaction,
+async fn build_candidate_predicate_map(
+    metadata: &brain_metadata::MetadataDb,
     deps: &EmbeddingDeps,
     mems: &[CoreMemory],
 ) -> HashMap<MemoryId, String> {
     let mut out = HashMap::new();
-    let candidates =
+    // The candidate list is owned, so release the read snapshot before the
+    // per-memory embedding loop.
+    let candidates = {
+        let Ok(rtxn) = metadata.read_txn() else {
+            return out;
+        };
         match brain_metadata::schema::predicate::predicate_consolidation_candidates_rtxn(
-            rtxn, "brain",
+            &rtxn, "brain",
         ) {
             Ok(c) if !c.is_empty() => c,
             _ => return out,
-        };
+        }
+    };
     for m in mems {
         let Some(text) = m.text.as_deref() else {
             continue;
@@ -5159,7 +5843,7 @@ fn build_candidate_predicate_map(
         if text.is_empty() {
             continue;
         }
-        let Ok(query) = deps.embedder.embed(text) else {
+        let Ok(query) = brain_ops::embedding::embed_off_reactor(&deps.embedder, text).await else {
             continue;
         };
         let names = select_candidate_predicates(&query, &candidates, CANDIDATE_PREDICATE_K);
@@ -5196,6 +5880,29 @@ fn declared_vocab_blocks(
             brain_metadata::declared_vocabulary(rtxn, brain_metadata::DeclScope::base(ns))
         {
             let block = vocab.render_prompt_block();
+            if !block.is_empty() {
+                out.insert(ns.clone(), block);
+            }
+        }
+    }
+    out
+}
+
+/// Each namespace's memories are extracted with that namespace's own kind
+/// taxonomy, so one tenant's declared kinds and hint text can never reach a
+/// prompt billed to another tenant. A read error contributes nothing for that
+/// namespace rather than failing extraction.
+fn declared_kinds_blocks(
+    rtxn: &redb::ReadTransaction,
+    mem_namespaces: &[String],
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for ns in mem_namespaces {
+        if !seen.insert(ns.as_str()) {
+            continue;
+        }
+        if let Ok(block) = brain_metadata::render_declared_kinds_block(rtxn, ns) {
             if !block.is_empty() {
                 out.insert(ns.clone(), block);
             }
@@ -5403,10 +6110,10 @@ fn declared_predicate_in_namespace(
     };
     let t = wtxn
         .open_table(PREDICATES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("predicates open: {e}")))?;
+        .map_err(|e| ApplyError::storage("predicates open", &e))?;
     let row = t
         .get(&pid.raw())
-        .map_err(|e| ApplyError::Storage(format!("predicates get: {e}")))?
+        .map_err(|e| ApplyError::storage("predicates get", &e))?
         .map(|g| g.value());
     Ok(row
         .filter(|r| r.namespace == v.namespace && r.origin().is_schema_declared())
@@ -5435,10 +6142,10 @@ fn declared_relation_type_in_namespace(
     };
     let t = wtxn
         .open_table(RELATION_TYPES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("relation_types open: {e}")))?;
+        .map_err(|e| ApplyError::storage("relation_types open", &e))?;
     let row = t
         .get(&rt.raw())
-        .map_err(|e| ApplyError::Storage(format!("relation_types get: {e}")))?
+        .map_err(|e| ApplyError::storage("relation_types get", &e))?
         .map(|g| g.value());
     Ok(row
         .filter(|r| r.namespace == v.namespace && r.origin().is_schema_declared())
@@ -5650,10 +6357,10 @@ fn predicate_declared_object_constraint_in_write_txn(
 ) -> Result<Option<u8>, ApplyError> {
     let t = wtxn
         .open_table(PREDICATES_TABLE)
-        .map_err(|e| ApplyError::Storage(format!("predicates open: {e}")))?;
+        .map_err(|e| ApplyError::storage("predicates open", &e))?;
     let row = t
         .get(&pid.raw())
-        .map_err(|e| ApplyError::Storage(format!("predicates get: {e}")))?;
+        .map_err(|e| ApplyError::storage("predicates get", &e))?;
     Ok(row.and_then(|g| {
         let b = g.value().object_type_constraint_byte;
         if b == 0 {
@@ -5730,9 +6437,9 @@ fn resolve_statement_object(
         // No mention edge to write here: every site that populates `entity_map`
         // (pass 1, `resolve_statement_subject`, `resolve_relation_endpoint`)
         // links the entity to this memory as it inserts, so an `entity_map` hit
-        // is by construction already in `mentioned`. That invariant is unchanged
-        // by the gating above — the map is still a strict subset of `mentioned`;
-        // we simply no longer consult it for a triple whose object is a value.
+        // is by construction already in `mentioned`. The gating above does not
+        // touch that invariant — the map is a strict subset of `mentioned`; it
+        // is simply not consulted for a triple whose object is a value.
         if let Some(id) = entity_map.get(text).copied() {
             return Ok(Some(StatementObject::Entity(id)));
         }
@@ -6488,10 +7195,10 @@ fn ensure_space_self_entity(
         use brain_metadata::tables::entity::ENTITIES_TABLE;
         let t = wtxn
             .open_table(ENTITIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open ENTITIES: {e}")))?;
+            .map_err(|e| ApplyError::storage("open ENTITIES", &e))?;
         let present = t
             .get(&self_id.to_bytes())
-            .map_err(|e| ApplyError::Storage(format!("get self entity: {e}")))?
+            .map_err(|e| ApplyError::storage("get self entity", &e))?
             .is_some();
         present
         // `t` drops here so entity_put can reopen ENTITIES_TABLE mutably below.
@@ -6511,7 +7218,7 @@ fn ensure_space_self_entity(
     // its first-mention session is meaningless, so it lands in the default
     // session.
     brain_metadata::entity::ops::entity_put(wtxn, scope, brain_core::SessionId::DEFAULT, &entity)
-        .map_err(|e| ApplyError::Storage(format!("entity_put(self): {e}")))?;
+        .map_err(|e| ApplyError::storage_opaque("entity_put(self)", e))?;
     Ok(())
 }
 
@@ -6525,7 +7232,7 @@ fn reuse_cross_type_exact(
     text: &str,
 ) -> Result<Option<EntityId>, ApplyError> {
     let hits = brain_metadata::entity_resolve_canonical_all_types_wtxn(wtxn, scope, text)
-        .map_err(|e| ApplyError::Storage(format!("cross-type resolve: {e}")))?;
+        .map_err(|e| ApplyError::storage_opaque("cross-type resolve", e))?;
     Ok(if hits.len() == 1 { Some(hits[0]) } else { None })
 }
 
@@ -6651,8 +7358,176 @@ enum ApplyError {
     Edge(String),
     #[error("audit: {0}")]
     Audit(String),
-    #[error("storage: {0}")]
-    Storage(String),
+    #[error("storage {fault}: {detail}")]
+    Storage { fault: StorageFault, detail: String },
+}
+
+impl ApplyError {
+    /// Wrap a redb failure with the operation that produced it, keeping the
+    /// retry classification alongside the text an operator reads. `context`
+    /// names the table and the operation; the redb value renders with `Debug`
+    /// so its constructor and payload both reach the log.
+    fn storage<E: RedbFault + std::fmt::Debug>(context: &str, e: &E) -> Self {
+        Self::Storage {
+            fault: e.storage_fault(),
+            detail: format!("{context}: {e:?}"),
+        }
+    }
+
+    /// Wrap a storage failure whose redb value was already flattened by a
+    /// lower layer. Classified `Transient` because that is the fallback that
+    /// costs a retry instead of abandoning work on a guess.
+    fn storage_opaque(context: &str, e: impl std::fmt::Display) -> Self {
+        Self::Storage {
+            fault: StorageFault::Transient,
+            detail: format!("{context}: {e}"),
+        }
+    }
+}
+
+/// Whether an apply-path failure will fail identically on every retry.
+///
+/// The redb kind travels on the error value, so this reads it directly.
+/// Only a transient storage fault is retryable, which leaves every
+/// unclassified failure retryable: a misclassification costs retries,
+/// never grounding.
+fn apply_failure_is_deterministic(err: &ApplyError) -> bool {
+    match err {
+        ApplyError::Storage { fault, .. } => fault.is_deterministic(),
+        ApplyError::Resolver(_) | ApplyError::Edge(_) | ApplyError::Audit(_) => false,
+    }
+}
+
+/// Commit the terminal record for a memory whose extraction is abandoned.
+///
+/// `FAILURE` + `failure_class::PERMANENT` is what makes the idempotency gate
+/// report the memory terminal, so the queue row can be dropped without the
+/// next cycle re-queueing it. All three tier bytes are `SKIPPED`: the apply
+/// txn rolled back, or the gate errored before a tier was reached, so no
+/// tier's output survives to describe. Item counts and spend are zero here —
+/// the batch reports its provider spend whole from `drain_batch`, and
+/// double-counting it on the memory's own row would misattribute it.
+///
+/// Written in its own small write txn rather than alongside the queue-row
+/// removal, so the two cannot be made atomic. That is safe in the order used:
+/// a crash after this commit and before the removal leaves a stale queue row
+/// that the next cycle's gate folds into `AlreadyExtracted` and removes.
+///
+/// Best-effort. A failure to write the record must not fail the cycle, since
+/// the cycle is what makes progress on every other memory in the batch.
+fn record_abandoned_audit(
+    ctx: &WorkerContext,
+    memory_id: MemoryId,
+    reason: &str,
+    attempts: u32,
+    now_unix_nanos: u64,
+) {
+    let result = (|| {
+        let wtxn = ctx
+            .ops
+            .executor
+            .metadata
+            .write_txn()
+            .map_err(|e| format!("write_txn: {e:?}"))?;
+        let audit = ExtractorPipelineAuditEntry::new(
+            memory_id,
+            now_unix_nanos,
+            pipeline_status::FAILURE,
+            format!("extraction abandoned after {attempts} attempt(s): {reason}"),
+            tier_status::SKIPPED,
+            tier_status::SKIPPED,
+            tier_status::SKIPPED,
+            ExtractorItemCounts::zero(),
+            0,
+        )
+        .with_attempts(attempts.min(u8::MAX as u32) as u8)
+        .with_failure_class(brain_metadata::failure_class::PERMANENT);
+        record_extracted(&wtxn, &audit).map_err(|e| format!("record_extracted: {e}"))?;
+        wtxn.commit().map_err(|e| format!("commit: {e:?}"))
+    })();
+    if let Err(error) = result {
+        warn!(
+            target: "brain_workers::extractor",
+            memory_id = ?memory_id,
+            error = %error,
+            "abandoned extraction audit write failed",
+        );
+    }
+}
+
+/// Fold every infra-failure decision in one drained micro-batch through the
+/// attempt ladder, exactly once per memory per cycle.
+///
+/// This is the single place that sees every slot in `decisions`, which is what
+/// makes "one attempt counted per memory per cycle" true for all three sources
+/// of an infra failure: a rolled-back apply, a gate probe that errored before
+/// any tier ran, and the initialiser placeholder left behind when no path
+/// claimed a memory. A `Retry` verdict leaves the decision untouched, so the
+/// caller keeps the durable queue row and `load_pending_batch` skips the memory
+/// until its backoff elapses. An `Abandon` verdict rewrites the slot to
+/// [`StageDecision::Abandoned`], which drops the queue row and leaves the
+/// durable failure audit as the record of the missing grounding.
+fn classify_apply_failures(
+    worker: &ExtractorWorker,
+    ctx: &WorkerContext,
+    items: &[ExtractorEnqueue],
+    decisions: &mut [StageDecision],
+) {
+    let now = now_unix_nanos();
+    let mut state = worker.apply_failures.lock();
+    for (idx, decision) in decisions.iter_mut().enumerate() {
+        // The reason is cloned rather than moved out so the slot keeps a valid
+        // decision throughout: only the abandoning branch overwrites it, and a
+        // retry needs no rewrite at all.
+        let (is_gate_failure, deterministic, reason) = match &*decision {
+            StageDecision::AppliedFailed {
+                reason,
+                deterministic,
+            } => (false, *deterministic, reason.clone()),
+            StageDecision::GateFailed { reason } => (true, false, reason.clone()),
+            _ => continue,
+        };
+        let memory_id = items[idx].0;
+        match note_apply_failure(
+            &mut state,
+            memory_id,
+            now,
+            deterministic,
+            worker.retry_policy.max_apply_attempts_per_memory,
+        ) {
+            ApplyRetryVerdict::Retry {
+                attempts,
+                due_at_unix_nanos,
+            } => {
+                trace!(
+                    target: "brain_workers::extractor",
+                    memory_id = ?memory_id,
+                    attempts,
+                    due_at_unix_nanos,
+                    "extractor infra failure queued for bounded retry",
+                );
+            }
+            ApplyRetryVerdict::Abandon { attempts } => {
+                let label = if is_gate_failure {
+                    "gate_abandoned"
+                } else if deterministic {
+                    "apply_abandoned_deterministic"
+                } else {
+                    "apply_abandoned_exhausted"
+                };
+                worker.metrics.inc_apply_dropped(label);
+                tracing::error!(
+                    target: "brain_workers::extractor",
+                    memory_id = ?memory_id,
+                    attempts,
+                    reason = %reason,
+                    "extraction abandoned; no typed-graph grounding exists, backfill is the recovery path",
+                );
+                record_abandoned_audit(ctx, memory_id, &reason, attempts, now);
+                *decision = StageDecision::Abandoned { reason };
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6661,11 +7536,82 @@ enum ApplyError {
 
 #[cfg(test)]
 mod tests {
+    type RecordingSeen =
+        std::sync::Arc<std::sync::Mutex<Vec<(u128, Option<String>, Option<Vec<String>>)>>>;
+
+    /// Stands in for a tier extractor and records the per-dispatch schema
+    /// vocabulary it was handed, so a test can assert which tenant's
+    /// vocabulary reached the call.
+    struct RecordingLabels {
+        id: brain_core::ExtractorId,
+        kind: brain_core::ExtractorKind,
+        name: String,
+        seen: RecordingSeen,
+    }
+
+    impl brain_extractors::Extractor for RecordingLabels {
+        fn id(&self) -> brain_core::ExtractorId {
+            self.id
+        }
+
+        fn kind(&self) -> brain_core::ExtractorKind {
+            self.kind
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn extractor_version(&self) -> u32 {
+            1
+        }
+
+        fn run<'a>(
+            &'a self,
+            ctx: &'a super::ExtractionContext<'a>,
+            mem: &'a super::CoreMemory,
+        ) -> brain_extractors::ExtractionFuture<'a> {
+            let seen = self.seen.clone();
+            let rec = (
+                mem.id.raw(),
+                ctx.declared_entity_types.map(str::to_string),
+                ctx.entity_type_labels.map(<[String]>::to_vec),
+            );
+            let item = super::ExtractedItem::EntityMention(super::EntityMention {
+                entity_type_qname: "brain:Person".into(),
+                text: format!("m{}", mem.id.raw()),
+                start: 0,
+                end: 0,
+                confidence: 0.9,
+                extractor_id: self.id.raw(),
+                extractor_version: 1,
+            });
+            Box::pin(async move {
+                seen.lock().unwrap().push(rec);
+                super::ExtractionResult::success(vec![item], 0, 0)
+            })
+        }
+    }
+
+    fn glommio_run<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        glommio::LocalExecutorBuilder::default()
+            .name("extractor-test")
+            .spawn(move || async move { f().await })
+            .expect("spawn glommio test executor")
+            .join()
+            .expect("test executor join")
+    }
+
     /// `candidate_cmp` must be a TOTAL order: `slice::sort_by` panics on any
     /// comparator that isn't ("comparison function does not correctly implement
-    /// a total order"), which previously crashed the whole shard. The prior
-    /// epsilon-*band* form is non-transitive, so an epsilon-chain of scores
-    /// (each neighbour within TIE_EPS, endpoints far apart) trips the panic.
+    /// a total order"), and that panic takes the whole shard down. An
+    /// epsilon-*band* comparator is non-transitive, so an epsilon-chain of
+    /// scores (each neighbour within TIE_EPS, endpoints far apart) trips it.
     /// This builds such a chain, shuffles it, and sorts — it must not panic and
     /// must come out consistently ordered.
     #[test]
@@ -6696,6 +7642,84 @@ mod tests {
                 assert!(w[0].1 <= w[1].1, "within a bucket, id must ascend");
             }
         }
+    }
+
+    #[test]
+    fn candidate_predicate_embed_allows_sibling_progress() {
+        use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        glommio_run(|| async {
+            struct SlowDispatcher {
+                started: Arc<AtomicBool>,
+                finished: Arc<AtomicBool>,
+            }
+
+            impl Dispatcher for SlowDispatcher {
+                fn embed(&self, _text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                    self.started.store(true, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    self.finished.store(true, Ordering::SeqCst);
+                    Ok([1.0; VECTOR_DIM])
+                }
+
+                fn embed_batch(
+                    &self,
+                    texts: &[&str],
+                ) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                    texts.iter().map(|text| self.embed(text)).collect()
+                }
+
+                fn fingerprint(&self) -> [u8; 16] {
+                    [0xAF; 16]
+                }
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let metadata =
+                brain_metadata::MetadataDb::open(dir.path().join("metadata.redb")).unwrap();
+            {
+                let wtxn = metadata.write_txn().unwrap();
+                let predicate = predicate_intern_or_get(
+                    &wtxn,
+                    brain_metadata::DeclScope::base("brain"),
+                    "candidate_predicate",
+                    0,
+                    1,
+                )
+                .unwrap();
+                brain_metadata::predicate_embedding_put(&wtxn, predicate, &[1.0; VECTOR_DIM])
+                    .unwrap();
+                wtxn.commit().unwrap();
+            }
+            let started = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
+            let embedder: Arc<dyn Dispatcher> = Arc::new(SlowDispatcher {
+                started: started.clone(),
+                finished: finished.clone(),
+            });
+            let deps = EmbeddingDeps {
+                hnsw: Arc::new(parking_lot::RwLock::new(
+                    brain_index::entity_hnsw::EntityHnswIndex::new(
+                        brain_index::entity_hnsw::EntityHnswParams::default_v1(),
+                    )
+                    .unwrap(),
+                )),
+                embedder,
+                embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
+            };
+            let mems = vec![make_mem(1, "memory")];
+            let embed = build_candidate_predicate_map(&metadata, &deps, &mems);
+            let probe = async {
+                while !started.load(Ordering::SeqCst) {
+                    glommio::timer::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                !finished.load(Ordering::SeqCst)
+            };
+            let (map, progressed) = futures_lite::future::zip(embed, probe).await;
+            assert!(!map.is_empty());
+            assert!(progressed);
+        });
     }
 
     fn __ts() -> brain_metadata::RowScope {
@@ -7266,7 +8290,6 @@ mod tests {
             vec![classifier as Arc<dyn Extractor>],
             &mems,
             &mem_namespaces,
-            false,
             None,
             None,
             None,
@@ -7424,7 +8447,6 @@ mod tests {
             vec![llm, classifier], // intentional reverse order — pipeline must reorder.
             &mems,
             &mem_namespaces,
-            false,
             None,
             None,
             None,
@@ -9630,8 +10652,8 @@ mod tests {
         }
     }
 
-    /// A failed tier records a Failure row carrying its reason; a
-    /// budget-skipped LLM tier records a SkippedBudget row.
+    /// A failed tier records a Failure row carrying its reason; a skipped
+    /// LLM tier records a skip row carrying why it did not run.
     #[test]
     fn apply_emits_failure_and_skip_audit_rows() {
         use brain_metadata::audit_by_extractor;
@@ -9651,8 +10673,8 @@ mod tests {
         outcome.llm_audit = Some(TierAudit {
             extractor_id: 55,
             extractor_version: 1,
-            status: extraction_status::SKIPPED_BUDGET,
-            reason: "cycle LLM budget exhausted".to_string(),
+            status: extraction_status::SKIPPED_DISABLED,
+            reason: "namespace has no llm credential".to_string(),
         });
 
         futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
@@ -9665,7 +10687,141 @@ mod tests {
         assert_eq!(failed[0].status_reason, "boom");
         let skipped = audit_by_extractor(&rtxn, 55, 10).unwrap();
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].status, extraction_status::SKIPPED_BUDGET);
+        assert_eq!(skipped[0].status, extraction_status::SKIPPED_DISABLED);
+    }
+
+    /// An extractor that reports a fixed provider cost for every memory it is
+    /// handed. Stands in for the real LLM tier so the batch path's spend
+    /// accounting is observable without a provider.
+    struct Costing {
+        id: brain_core::ExtractorId,
+        kind: brain_core::ExtractorKind,
+        name: String,
+        cost_micro_usd: u64,
+    }
+
+    impl Extractor for Costing {
+        fn id(&self) -> brain_core::ExtractorId {
+            self.id
+        }
+        fn kind(&self) -> brain_core::ExtractorKind {
+            self.kind
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn extractor_version(&self) -> u32 {
+            1
+        }
+        fn run<'a>(
+            &'a self,
+            _ctx: &'a ExtractionContext<'a>,
+            _mem: &'a CoreMemory,
+        ) -> brain_extractors::ExtractionFuture<'a> {
+            let cost = self.cost_micro_usd;
+            Box::pin(async move { ExtractionResult::success(Vec::new(), 0, 0).with_cost(cost) })
+        }
+    }
+
+    /// A worker + context whose live registry holds one `Costing` extractor of
+    /// the given tier, billing `cost_micro_usd` per memory.
+    fn __spend_env(
+        kind: brain_core::ExtractorKind,
+        cost_micro_usd: u64,
+    ) -> (
+        ExtractorWorker,
+        crate::context::WorkerContext,
+        brain_planner::SharedMetadataDb,
+    ) {
+        let (worker, ctx, metadata) = __join_env();
+        let mut reg = ExtractorRegistry::new();
+        reg.register(Arc::new(Costing {
+            id: brain_core::ExtractorId::from(91),
+            kind,
+            name: "brain:costing".to_string(),
+            cost_micro_usd,
+        }) as Arc<dyn Extractor>);
+        *ctx.ops.extractor_registry.write() = reg;
+        (worker, ctx, metadata)
+    }
+
+    /// Drain one micro-batch of freshly-seeded memories through the real batch
+    /// path, exactly as a cycle would. The LLM tier fetches extractor context,
+    /// which embeds its cue on Glommio's blocking pool, so the batch runs on a
+    /// reactor; the worker and its context are `!Send`, so the executor comes
+    /// up on this thread.
+    fn __drain_spend_batch(
+        worker: &ExtractorWorker,
+        ctx: &crate::context::WorkerContext,
+        metadata: &brain_metadata::MetadataDb,
+        slots: &[u64],
+    ) {
+        let items: Vec<ExtractorEnqueue> = slots
+            .iter()
+            .map(|&slot| {
+                let memory_id = brain_core::MemoryId::pack(0, slot, 1);
+                __seed_memory_row(metadata, memory_id, __ts());
+                (memory_id, Arc::<str>::from("Alice shipped the release."))
+            })
+            .collect();
+        glommio::LocalExecutor::default().run(drain_batch(worker, ctx, &items));
+    }
+
+    /// Every memory the LLM tier billed for is summed into the shard's
+    /// cumulative spend metric — the figure an operator reconciles against the
+    /// provider invoice.
+    #[test]
+    fn a_batch_reports_what_it_spent() {
+        let (worker, ctx, metadata) = __spend_env(brain_core::ExtractorKind::Llm, 1_200);
+        __drain_spend_batch(&worker, &ctx, &metadata, &[101, 102, 103]);
+        assert_eq!(
+            worker.metrics.snapshot().llm_micro_usd_spent_total,
+            3_600,
+            "three memories at 1200 µ$ each",
+        );
+    }
+
+    /// Spend is cumulative across batches: nothing resets it between cycles,
+    /// so the metric is a running total for the shard's lifetime.
+    #[test]
+    fn spend_accumulates_across_batches() {
+        let (worker, ctx, metadata) = __spend_env(brain_core::ExtractorKind::Llm, 500);
+        __drain_spend_batch(&worker, &ctx, &metadata, &[201, 202]);
+        assert_eq!(worker.metrics.snapshot().llm_micro_usd_spent_total, 1_000);
+        __drain_spend_batch(&worker, &ctx, &metadata, &[203]);
+        assert_eq!(
+            worker.metrics.snapshot().llm_micro_usd_spent_total,
+            1_500,
+            "the second batch adds to the first; no per-cycle reset",
+        );
+    }
+
+    /// A batch that calls no provider reports zero rather than an estimate: a
+    /// pattern tier costs nothing, and a free path must not inflate the
+    /// invoice reconciliation.
+    #[test]
+    fn a_free_batch_reports_zero_spend() {
+        let (worker, ctx, metadata) = __spend_env(brain_core::ExtractorKind::Pattern, 0);
+        __drain_spend_batch(&worker, &ctx, &metadata, &[301, 302]);
+        assert_eq!(worker.metrics.snapshot().llm_micro_usd_spent_total, 0);
+    }
+
+    /// Nothing in the engine stops derivation once a tenant's spend reaches
+    /// any particular figure. This is a BYOK product: how much of their own
+    /// provider quota a tenant spends is theirs to decide, so a batch that
+    /// has already billed heavily is followed by one that bills just the
+    /// same, and both are reported.
+    #[test]
+    fn spending_heavily_does_not_stop_the_next_batch() {
+        let (worker, ctx, metadata) = __spend_env(brain_core::ExtractorKind::Llm, 400_000);
+        __drain_spend_batch(&worker, &ctx, &metadata, &[401]);
+        assert_eq!(worker.metrics.snapshot().llm_micro_usd_spent_total, 400_000);
+        __drain_spend_batch(&worker, &ctx, &metadata, &[402]);
+        assert_eq!(
+            worker.metrics.snapshot().llm_micro_usd_spent_total,
+            800_000,
+            "the second batch runs its LLM tier and bills in full",
+        );
     }
 
     const D1: u64 = 1_684_540_800_000_000_000; // 2023-05-20
@@ -10201,7 +11357,9 @@ mod tests {
         // `want` (the old behaviour) would return only front rows, filter them
         // all out, and make zero progress. The over-drain must page past them
         // and surface the due row this cycle.
-        let due = load_pending_batch(&ctx, 2).unwrap();
+        let (_tx, rx) = flume::unbounded();
+        let worker = ExtractorWorker::new(rx);
+        let due = load_pending_batch(&worker, &ctx, 2).unwrap();
         assert!(
             due.contains(&due_id),
             "a due row behind a backing-off front window must be found this cycle"
@@ -10374,11 +11532,11 @@ mod tests {
     /// declared relation type — and never coin the `brain:` twins.
     #[test]
     fn a_value_outside_a_declared_enum_is_refused() {
-        // `clone_status` declares a lifecycle, not free text. A tier that
-        // answered with the environment's own name — the live failure was
-        // `clone_status = "slack-clone-v1"` — used to store it verbatim, so
-        // a reader filtering on `ready` silently skipped the row and the
-        // declaration was decorative.
+        // `clone_status` declares a lifecycle, not free text. A tier can
+        // answer with the environment's own name — observed live as
+        // `clone_status = "slack-clone-v1"` — and storing that verbatim makes
+        // a reader filtering on `ready` silently skip the row, leaving the
+        // declaration decorative.
         use brain_core::{MemoryId, StatementKind};
 
         let (worker, ctx, metadata) = __join_env();
@@ -10492,10 +11650,10 @@ mod tests {
     fn a_declared_relation_type_does_not_also_mint_a_predicate() {
         // A name the namespace declares ONLY as a relation type, emitted as a
         // statement triple with an entity object, is written to the relations
-        // table. It used to ALSO mint an `ImplicitFromWrite` predicate of the
-        // same name that nothing ever referenced — a duplicate of a name the
-        // schema had already declared on the other axis, which then showed up
-        // in the operator's promotion shortlist.
+        // table, and only there. ALSO minting an `ImplicitFromWrite` predicate
+        // of the same name leaves a row nothing ever references — a duplicate
+        // of a name the schema already declares on the other axis, which then
+        // shows up in the operator's promotion shortlist.
         use brain_core::{MemoryId, StatementKind};
 
         let (worker, ctx, metadata) = __join_env();
@@ -10607,10 +11765,10 @@ mod tests {
 
     #[test]
     fn a_value_that_violates_a_declared_number_type_is_refused() {
-        // `success_rate` is declared `object: Value<number>`. A tier that
-        // hands it "medium" used to have that stored verbatim as text, so a
-        // numeric read over the predicate silently skipped the row and the
-        // typed graph held a fact contradicting its own schema.
+        // `success_rate` is declared `object: Value<number>`. A tier can hand
+        // it "medium"; storing that verbatim as text makes a numeric read over
+        // the predicate silently skip the row, and the typed graph then holds
+        // a fact contradicting its own schema.
         use brain_core::{MemoryId, StatementKind};
 
         let (worker, ctx, metadata) = __join_env();
@@ -10955,6 +12113,45 @@ mod tests {
         assert_eq!(declared_vocab_blocks(&rtxn, &mem_namespaces), blocks);
     }
 
+    /// Declared kind prompt blocks contain only the owning namespace's kinds
+    /// while retaining the deployment-wide built-in taxonomy.
+    #[test]
+    fn declared_kinds_blocks_are_scoped_to_memory_namespace() {
+        let (_worker, _ctx, metadata) = __join_env();
+        const MIRROR_KINDS: &str = r#"
+namespace mirror
+define kind clone_run {
+    cardinality: set
+    temporal: event
+    hint: "a clone finished a run"
+}
+"#;
+        const GLOBEX_KINDS: &str = r#"
+namespace globex
+define kind audit_entry {
+    cardinality: set
+    temporal: event
+    hint: "an audit entry landed"
+}
+"#;
+        let _ = __upload_schema_scope(&metadata, MIRROR_KINDS, "mirror");
+        let _ = __upload_schema_scope(&metadata, GLOBEX_KINDS, "globex");
+        let rtxn = metadata.read_txn().unwrap();
+        let blocks = declared_kinds_blocks(&rtxn, &["mirror".into(), "globex".into()]);
+        let mirror = &blocks["mirror"];
+        assert!(mirror.contains("mirror:clone_run"));
+        assert!(mirror.contains("a clone finished a run"));
+        assert!(!mirror.contains("audit_entry"));
+        assert!(!mirror.contains("an audit entry landed"));
+        let globex = &blocks["globex"];
+        assert!(globex.contains("globex:audit_entry"));
+        assert!(globex.contains("an audit entry landed"));
+        assert!(!globex.contains("clone_run"));
+        assert!(!globex.contains("a clone finished a run"));
+        assert!(mirror.contains("Attribute"));
+        assert!(globex.contains("Attribute"));
+    }
+
     // ----- Per-namespace entity-type vocabulary. -----
 
     #[test]
@@ -11007,6 +12204,37 @@ mod tests {
             );
             assert!(!vocab[ns].block.contains("CloneEnv"), "{ns}");
         }
+    }
+
+    /// A missing namespace vocabulary is authoritative and must reach the
+    /// classifier as an empty label set instead of activating shard labels.
+    #[test]
+    fn a_namespace_with_no_vocab_gets_empty_labels_not_the_shard_set() {
+        use brain_core::{ExtractorId as TestExtractorId, ExtractorKind};
+        use std::sync::Mutex as StdMutex;
+
+        let seen: RecordingSeen = Arc::new(StdMutex::new(Vec::new()));
+        let extractors: Vec<Arc<dyn Extractor>> = vec![Arc::new(RecordingLabels {
+            id: TestExtractorId::from(4),
+            kind: ExtractorKind::Classifier,
+            name: "brain:gliner".into(),
+            seen: seen.clone(),
+        })];
+        let mems = vec![make_mem(30, "a")];
+        let mem_namespaces = vec!["globex".to_string()];
+        let entity_vocab: HashMap<String, NamespaceEntityVocab> = HashMap::new();
+        let _ = futures_lite::future::block_on(run_pipeline_per_namespace(
+            extractors,
+            &mems,
+            &mem_namespaces,
+            None,
+            &entity_vocab,
+            None,
+            &HashMap::new(),
+        ));
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].2, Some(Vec::new()));
     }
 
     /// End to end through the pipeline: each LLM / classifier call receives
@@ -11107,11 +12335,10 @@ mod tests {
             extractors,
             &mems,
             &mem_namespaces,
-            false,
             None,
             &entity_vocab,
             None,
-            None,
+            &HashMap::new(),
         ));
 
         // Outcomes are scattered back into batch order.
@@ -11156,6 +12383,398 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ----- Concurrency of the derivation fan-out. -----
+
+    /// Proof device for "these futures were in flight at the same moment".
+    /// Each party announces its arrival and then waits for the others; it only
+    /// gets past the wait if the executor had every party started at once.
+    ///
+    /// The wait gives up after a bounded number of polls instead of blocking
+    /// forever, so a caller that runs the parties one after another reports a
+    /// failed assertion rather than hanging the test binary.
+    struct Rendezvous {
+        parties: usize,
+        arrived: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Rendezvous {
+        fn new(parties: usize) -> Arc<Self> {
+            Arc::new(Self {
+                parties,
+                arrived: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        /// Returns true iff every party was mid-flight alongside this one.
+        /// The poll budget only has to exceed the number of parties; it is
+        /// generous so a loaded machine cannot turn a pass into a flake.
+        async fn wait(&self) -> bool {
+            use std::sync::atomic::Ordering;
+            self.arrived.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..1024 {
+                if self.arrived.load(Ordering::SeqCst) >= self.parties {
+                    return true;
+                }
+                YieldOnce::default().await;
+            }
+            false
+        }
+    }
+
+    /// Returns `Pending` exactly once, re-waking itself, so the executor gets
+    /// a turn to drive the sibling futures before polling this one again.
+    #[derive(Default)]
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.yielded {
+                return std::task::Poll::Ready(());
+            }
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    /// An extractor whose every call parks on a shared rendezvous and reports,
+    /// as an entity mention, whether its siblings were running at the same
+    /// time. The mention text also carries the memory id and the summary this
+    /// call was handed, so ordering and context routing stay checkable.
+    struct Rendezvousing {
+        id: brain_core::ExtractorId,
+        kind: brain_core::ExtractorKind,
+        name: String,
+        gate: Arc<Rendezvous>,
+    }
+
+    impl Extractor for Rendezvousing {
+        fn id(&self) -> brain_core::ExtractorId {
+            self.id
+        }
+        fn kind(&self) -> brain_core::ExtractorKind {
+            self.kind
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn extractor_version(&self) -> u32 {
+            1
+        }
+        fn run<'a>(
+            &'a self,
+            ctx: &'a ExtractionContext<'a>,
+            mem: &'a CoreMemory,
+        ) -> brain_extractors::ExtractionFuture<'a> {
+            let gate = self.gate.clone();
+            let ext_id = self.id.raw();
+            let memory_id = mem.id.raw();
+            let summary = ctx
+                .extractor_context
+                .and_then(|m| m.get(&mem.id))
+                .and_then(|c| c.summary.clone())
+                .unwrap_or_else(|| "none".to_string());
+            Box::pin(async move {
+                let overlapped = gate.wait().await;
+                let item = ExtractedItem::EntityMention(EntityMention {
+                    entity_type_qname: "brain:Person".into(),
+                    text: format!("e{ext_id}/m{memory_id}/{summary}/{overlapped}"),
+                    start: 0,
+                    end: 0,
+                    confidence: 1.0,
+                    extractor_id: ext_id,
+                    extractor_version: 1,
+                });
+                ExtractionResult::success(vec![item], 0, 0)
+            })
+        }
+    }
+
+    /// Every mention text a batch of outcomes produced, flattened in outcome
+    /// order so the caller can assert on ordering as well as content.
+    fn mention_texts(outcomes: &[PipelineOutcome]) -> Vec<String> {
+        outcomes
+            .iter()
+            .flat_map(|o| o.items.iter())
+            .filter_map(|i| match i {
+                ExtractedItem::EntityMention(e) => Some(e.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Calibrates the proof device the two tests below depend on: awaiting the
+    /// parties one after another must NOT report overlap, while composing them
+    /// must. Without this, a passing overlap assertion could mean nothing more
+    /// than that the rendezvous always says yes.
+    #[test]
+    fn the_rendezvous_tells_serial_awaits_from_composed_ones() {
+        let gate = Rendezvous::new(2);
+        let serial = futures_lite::future::block_on(async {
+            let first = gate.wait().await;
+            let second = gate.wait().await;
+            (first, second)
+        });
+        assert_eq!(
+            serial,
+            (false, true),
+            "awaited in sequence, the first party is alone while it waits",
+        );
+
+        let gate = Rendezvous::new(2);
+        let composed = futures_lite::future::block_on(futures_util::future::join_all(vec![
+            gate.wait(),
+            gate.wait(),
+        ]));
+        assert_eq!(composed, vec![true, true], "composed, both are in flight");
+    }
+
+    /// Two extractors registered in the same tier must have their batches in
+    /// flight together: each one parks until the other has entered, which only
+    /// resolves if `run_tier_into` composes their futures instead of awaiting
+    /// them one after the other.
+    #[test]
+    fn a_tier_runs_its_extractors_concurrently() {
+        let gate = Rendezvous::new(2);
+        let extractors: Vec<Arc<dyn Extractor>> = vec![
+            Arc::new(Rendezvousing {
+                id: brain_core::ExtractorId::from(41),
+                kind: brain_core::ExtractorKind::Pattern,
+                name: "brain:first".into(),
+                gate: gate.clone(),
+            }),
+            Arc::new(Rendezvousing {
+                id: brain_core::ExtractorId::from(42),
+                kind: brain_core::ExtractorKind::Pattern,
+                name: "brain:second".into(),
+                gate,
+            }),
+        ];
+        let mems = vec![make_mem(70, "a")];
+        let mem_namespaces = vec![SYSTEM_NAMESPACE.to_string()];
+
+        let outcomes = futures_lite::future::block_on(run_pipeline_batch(
+            extractors,
+            &mems,
+            &mem_namespaces,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+
+        let id = mems[0].id.raw();
+        assert_eq!(
+            mention_texts(&outcomes),
+            vec![
+                format!("e41/m{id}/none/true"),
+                format!("e42/m{id}/none/true"),
+            ],
+            "both tier extractors must overlap, and fold in registration order",
+        );
+    }
+
+    /// Namespace groups must run as one fan-out: each group's pipeline parks
+    /// until the other group has entered. The assertion also pins the two
+    /// invariants concurrency could have broken — outcomes stay in batch
+    /// order, and each memory's extractor context follows it into its own
+    /// group (a memory with no context entry still runs).
+    #[test]
+    fn namespace_groups_run_concurrently() {
+        let gate = Rendezvous::new(2);
+        let extractors: Vec<Arc<dyn Extractor>> = vec![Arc::new(Rendezvousing {
+            id: brain_core::ExtractorId::from(43),
+            kind: brain_core::ExtractorKind::Llm,
+            name: "brain:llm".into(),
+            gate,
+        })];
+
+        let mems = vec![make_mem(80, "a"), make_mem(81, "b")];
+        let mem_namespaces = vec!["mirror".to_string(), "globex".to_string()];
+
+        // Only the first memory carries a context entry; the second must run
+        // regardless, and must not inherit the first's.
+        let mut context_map: HashMap<MemoryId, ExtractorContext> = HashMap::new();
+        context_map.insert(
+            mems[0].id,
+            ExtractorContext {
+                neighbors: Vec::new(),
+                summary: Some("mirror-ctx".to_string()),
+            },
+        );
+
+        let entity_vocab: HashMap<String, NamespaceEntityVocab> = HashMap::new();
+        let outcomes = futures_lite::future::block_on(run_pipeline_per_namespace(
+            extractors,
+            &mems,
+            &mem_namespaces,
+            Some(context_map),
+            &entity_vocab,
+            None,
+            &HashMap::new(),
+        ));
+
+        let (first, second) = (mems[0].id.raw(), mems[1].id.raw());
+        assert_eq!(
+            mention_texts(&outcomes),
+            vec![
+                format!("e43/m{first}/mirror-ctx/true"),
+                format!("e43/m{second}/none/true"),
+            ],
+            "namespace groups must overlap, keep batch order, and keep their own context",
+        );
+    }
+
+    /// A micro-batch's per-memory context fetches must be one fan-out: every
+    /// memory's fetch parks until all of them have entered, which only
+    /// resolves if the batch composes the fetches instead of awaiting them one
+    /// after another. The assertion also pins what concurrency could have
+    /// broken — one entry per memory, each carrying its OWN memory's result
+    /// and not a sibling's.
+    #[test]
+    fn a_batch_fetches_its_memory_contexts_concurrently() {
+        let mems = vec![make_mem(90, "a"), make_mem(91, "b"), make_mem(92, "c")];
+        let gate = Rendezvous::new(mems.len());
+        let metrics = ExtractorMetrics::new();
+
+        let map = futures_lite::future::block_on(context_map_from_fetches(
+            &mems,
+            &metrics,
+            |m: &CoreMemory| {
+                let gate = gate.clone();
+                let id = m.id.raw();
+                async move {
+                    let overlapped = gate.wait().await;
+                    Ok::<_, String>(ExtractorContext {
+                        neighbors: Vec::new(),
+                        summary: Some(format!("m{id}/{overlapped}")),
+                    })
+                }
+            },
+        ));
+
+        let summaries: Vec<String> = mems
+            .iter()
+            .map(|m| {
+                map.get(&m.id)
+                    .and_then(|c| c.summary.clone())
+                    .unwrap_or_else(|| "missing".to_string())
+            })
+            .collect();
+        let ids: Vec<u128> = mems.iter().map(|m| m.id.raw()).collect();
+        assert_eq!(
+            summaries,
+            ids.iter()
+                .map(|id| format!("m{id}/true"))
+                .collect::<Vec<_>>(),
+            "every memory's context fetch must overlap the others and land under its own id",
+        );
+        assert_eq!(map.len(), mems.len(), "exactly one entry per input memory");
+    }
+
+    /// Micro-batches inside the in-flight window must be live at the same
+    /// moment: each one parks until every other has entered, which only
+    /// resolves if the driver composes them instead of awaiting each in turn.
+    /// Each task reports whether it overlapped, so the sum is the number of
+    /// batches that genuinely ran together.
+    #[test]
+    fn micro_batches_overlap_inside_the_in_flight_window() {
+        let gate = Rendezvous::new(3);
+        let batches = (0..3).map(|_| {
+            let gate = gate.clone();
+            async move { usize::from(gate.wait().await) }
+        });
+
+        let overlapped =
+            futures_lite::future::block_on(run_bounded_concurrently(batches, 3, || false));
+        assert_eq!(
+            overlapped, 3,
+            "every micro-batch in the window must be in flight alongside the others",
+        );
+    }
+
+    /// The window is a real bound, not a hint: with six batches queued behind
+    /// a window of two, at no instant may more than two be resident. This is
+    /// the property the preparation-stage memory ceiling rests on.
+    #[test]
+    fn the_in_flight_window_bounds_resident_micro_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let batches = (0..6).map(|_| {
+            let live = live.clone();
+            let peak = peak.clone();
+            async move {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                for _ in 0..4 {
+                    YieldOnce::default().await;
+                }
+                live.fetch_sub(1, Ordering::SeqCst);
+                1
+            }
+        });
+
+        let drained =
+            futures_lite::future::block_on(run_bounded_concurrently(batches, 2, || false));
+        assert_eq!(drained, 6, "every queued micro-batch must still be drained");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "never more micro-batches resident than the window allows",
+        );
+    }
+
+    /// The cycle's runtime cut-off and the shutdown signal stop the worker
+    /// LAUNCHING further micro-batches; the ones already in flight run to
+    /// completion, because each one owns durable queue-row removals and
+    /// per-memory stage publishes that must not be abandoned half-done.
+    #[test]
+    fn the_cycle_cut_off_stops_launching_and_lets_the_launched_finish() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let launched = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let batches = (0..8).map(|_| {
+            let launched = launched.clone();
+            let completed = completed.clone();
+            async move {
+                launched.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..4 {
+                    YieldOnce::default().await;
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                1
+            }
+        });
+
+        // Trips as soon as anything is running, standing in for the runtime
+        // budget expiring or the shard being told to shut down mid-cycle.
+        let cut_off = launched.clone();
+        let drained =
+            futures_lite::future::block_on(run_bounded_concurrently(batches, 2, move || {
+                cut_off.load(Ordering::SeqCst) > 0
+            }));
+
+        assert_eq!(
+            launched.load(Ordering::SeqCst),
+            2,
+            "the cut-off must stop further micro-batches from being launched",
+        );
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            2,
+            "every micro-batch already in flight must still run to completion",
+        );
+        assert_eq!(drained, 2, "the cycle counts only what actually ran");
     }
 
     // ----- Entity-name guards. -----
@@ -11247,6 +12866,8 @@ mod tests {
 mod registry_refresh_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    use brain_core::MemoryId;
 
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_extractors::MaterializeDeps;
@@ -11414,5 +13035,118 @@ mod registry_refresh_tests {
             0,
             "no rebuild without the dirty flag",
         );
+    }
+
+    fn test_memory_id(value: u128) -> MemoryId {
+        MemoryId::from_be_bytes(value.to_be_bytes())
+    }
+
+    /// The ladder bound these cases exercise, read from the policy that sets
+    /// it, so the expectations move with the default rather than pinning it.
+    fn max_attempts() -> u32 {
+        super::ExtractorRetryPolicy::default().max_apply_attempts_per_memory
+    }
+
+    #[test]
+    fn apply_failure_retries_then_abandons() {
+        let id = test_memory_id(1);
+        let limit = max_attempts();
+        let mut state = std::collections::HashMap::new();
+        // Every attempt below the bound stays on the ladder, numbered in order.
+        for attempt in 1..limit {
+            let verdict =
+                super::note_apply_failure(&mut state, id, u64::from(attempt) - 1, false, limit);
+            match verdict {
+                super::ApplyRetryVerdict::Retry { attempts, .. } => assert_eq!(attempts, attempt),
+                super::ApplyRetryVerdict::Abandon { .. } => {
+                    panic!("attempt {attempt} below the bound abandoned")
+                }
+            }
+        }
+        // The attempt that reaches the bound abandons and drops the entry.
+        match super::note_apply_failure(&mut state, id, u64::from(limit) - 1, false, limit) {
+            super::ApplyRetryVerdict::Abandon { attempts } => assert_eq!(attempts, limit),
+            super::ApplyRetryVerdict::Retry { .. } => {
+                panic!("the attempt at the bound stayed on the ladder")
+            }
+        }
+        assert!(!state.contains_key(&id));
+    }
+
+    #[test]
+    fn deterministic_apply_failure_abandons_without_state() {
+        let id = test_memory_id(2);
+        let mut state = std::collections::HashMap::new();
+        assert!(matches!(
+            super::note_apply_failure(&mut state, id, 0, true, max_attempts()),
+            super::ApplyRetryVerdict::Abandon { attempts: 1 }
+        ));
+        assert!(!state.contains_key(&id));
+    }
+
+    #[test]
+    fn clear_apply_failure_resets_attempt_ladder() {
+        let id = test_memory_id(3);
+        let mut state = std::collections::HashMap::new();
+        assert!(matches!(
+            super::note_apply_failure(&mut state, id, 0, false, max_attempts()),
+            super::ApplyRetryVerdict::Retry { attempts: 1, .. }
+        ));
+        super::clear_apply_failure(&mut state, id);
+        assert!(matches!(
+            super::note_apply_failure(&mut state, id, 1, false, max_attempts()),
+            super::ApplyRetryVerdict::Retry { attempts: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn apply_retry_backoff_widens_and_saturates() {
+        assert_eq!(super::apply_retry_backoff_nanos(1), 5_000_000_000);
+        assert_eq!(super::apply_retry_backoff_nanos(2), 10_000_000_000);
+        assert_eq!(super::apply_retry_backoff_nanos(3), 20_000_000_000);
+        assert_eq!(
+            super::apply_retry_backoff_nanos(u32::MAX),
+            super::APPLY_RETRY_BACKOFF_CAP_NANOS
+        );
+    }
+
+    #[test]
+    fn apply_failure_determinism_reads_the_storage_fault() {
+        for fault in [
+            super::StorageFault::Corrupted,
+            super::StorageFault::ValueTooLarge,
+            super::StorageFault::Misuse,
+        ] {
+            assert!(super::apply_failure_is_deterministic(
+                &super::ApplyError::Storage {
+                    fault,
+                    detail: "commit: ...".into(),
+                }
+            ));
+        }
+        assert!(!super::apply_failure_is_deterministic(
+            &super::ApplyError::Storage {
+                fault: super::StorageFault::Transient,
+                detail: "write: Io(...)".into(),
+            }
+        ));
+        assert!(!super::apply_failure_is_deterministic(
+            &super::ApplyError::Edge("edge failure".into())
+        ));
+    }
+
+    #[test]
+    fn apply_failure_tracking_map_is_bounded() {
+        let mut state = std::collections::HashMap::new();
+        for value in 0..(super::MAX_TRACKED_APPLY_FAILURES + 64) {
+            let _ = super::note_apply_failure(
+                &mut state,
+                test_memory_id(value as u128),
+                value as u64,
+                false,
+                max_attempts(),
+            );
+        }
+        assert!(state.len() <= super::MAX_TRACKED_APPLY_FAILURES);
     }
 }

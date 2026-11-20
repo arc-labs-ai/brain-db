@@ -2,8 +2,8 @@
 //! which is the plan-time failure mode.
 //!
 //! Each variant maps to a wire-protocol error code at the server
-//! boundary. The executor surfaces these through `execute_recall`
-//! / `execute_reason` / `execute_path`; the unified write path
+//! boundary. The executor surfaces these through `execute_reason`
+//! / `execute_path`; the unified write path
 //! (brain-ops `submit(Write)`) raises its own `WriterError` and the
 //! handlers wrap it here.
 

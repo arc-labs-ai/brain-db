@@ -548,6 +548,11 @@ pub struct MemoryInspectRequest {
 /// A memory that exists but whose bundle has not been written yet is still a
 /// success, with an empty `artifact`. That is a different condition from the
 /// memory being absent, and keeping the two apart is the point.
+///
+/// The edge view is bounded per direction, so a memory with an arbitrarily
+/// large edge set is still inspectable; `edge_total_count`, when reported,
+/// and `edges_truncated` tell the caller when the view is partial, and
+/// `GRAPH_FETCH` enumerates the rest.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryInspectResponse {
     pub memory_id: WireMemoryId,
@@ -565,6 +570,27 @@ pub struct MemoryInspectResponse {
     /// response gets an empty list rather than a decode error.
     #[serde(default)]
     pub edges: Vec<MemoryEdgeWire>,
+    /// How many memory↔memory edges are anchored at this memory, both
+    /// directions, counted before the per-direction cap is applied.
+    /// `edges.len()` is smaller than this when the view was cut.
+    ///
+    /// This is an `Option` because an absent total and a total of zero are
+    /// different claims — defaulting an absent total to `0` would tell a
+    /// caller that the memory has no edges when the server simply did not
+    /// say.
+    #[serde(default)]
+    pub edge_total_count: Option<u32>,
+    /// True when `edges` carries only part of the set, because at least one
+    /// direction holds more edges than this verb returns. A caller that needs
+    /// the complete enumeration reads it from `GRAPH_FETCH`, which paginates;
+    /// this verb is a single-shot diagnostic and answers with a bounded view
+    /// plus the count it did not show.
+    ///
+    /// `false` is a safe default here in a way `0` is not for the count:
+    /// silence about truncation means the view is whole, while silence about
+    /// the number of edges does not mean there are zero edges.
+    #[serde(default)]
+    pub edges_truncated: bool,
 }
 
 /// Lifecycle state a `MEMORY_AGGREGATE` group counts.
@@ -711,6 +737,11 @@ pub enum EdgeDirectionWire {
     Outgoing = 0,
     /// The inspected memory is the edge's target.
     Incoming = 1,
+    /// An edge direction this build cannot name reads as unknown; the
+    /// surrounding inspection frame still decodes, so a peer one version
+    /// ahead can describe a direction this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 // ============================================================
@@ -977,6 +1008,11 @@ pub enum EncodeTraceStageStatus {
     /// handler's bounded wait window. Its `StageCompleted` event will
     /// still arrive on SUBSCRIBE later.
     Timeout = 3,
+    /// A trace phase status this build cannot name reads as unknown; the
+    /// surrounding trace frame still decodes, so a peer one version ahead can
+    /// report a status this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// What an ENCODE produced, resolved after the async stages drained. Empty
@@ -1158,6 +1194,11 @@ pub enum RecallCandidateKind {
     Statement = 1,
     Entity = 2,
     Relation = 3,
+    /// A candidate kind this build cannot name reads as unknown; the
+    /// surrounding trace frame still decodes, so a peer one version ahead can
+    /// report a kind this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// One retriever-lane candidate surfaced in full-detail trace mode. The
@@ -1193,6 +1234,11 @@ pub enum RecallTraceRetrieverStatus {
     /// The lane returned an error and was dropped from fusion.
     /// `status_detail` carries the message.
     Failure = 3,
+    /// A retriever status this build cannot name reads as unknown; the
+    /// surrounding recall trace still decodes, so a peer one version ahead can
+    /// report a status this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// Kind of a [`RecallTraceDroppedId`], disambiguating which id-space the
@@ -1211,6 +1257,11 @@ pub enum RankedItemKindWire {
     Statement = 1,
     Entity = 2,
     Relation = 3,
+    /// A ranked item kind this build cannot name reads as unknown; the
+    /// surrounding trace still decodes, so a peer one version ahead can report
+    /// a kind this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// One id a filter-chain step dropped, tagged with which id-space it came
@@ -1663,6 +1714,11 @@ pub enum PlanTraceDirection {
     Forward = 0,
     /// Visited by the backward search, rooted at `goal`.
     Backward = 1,
+    /// A plan traversal direction this build cannot name reads as unknown; the
+    /// surrounding plan trace still decodes, so a peer one version ahead can
+    /// report a direction this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// One node the bidirectional BFS visited, from either direction.
@@ -1868,6 +1924,43 @@ mod memory_list_tests {
 #[cfg(test)]
 mod serde_smoke {
     use super::*;
+
+    /// An older server can omit the edge view entirely, and a newer client
+    /// must still receive the memory and artifact rather than lose the whole
+    /// response to a missing optional view.
+    #[test]
+    fn memory_inspect_response_accepts_older_server_shape() {
+        use crate::codec::opcode::Opcode;
+        use crate::envelope::response::ResponseBody;
+
+        #[derive(serde::Serialize)]
+        struct OlderMemoryInspectResponse {
+            memory_id: WireMemoryId,
+            text: String,
+            artifact: EncodeStageArtifact,
+        }
+
+        let older = OlderMemoryInspectResponse {
+            memory_id: 9,
+            text: "older response".into(),
+            artifact: EncodeStageArtifact::default(),
+        };
+        let bytes = crate::codec::cbor::to_cbor_bytes(&older);
+        let decoded = ResponseBody::decode(Opcode::MemoryInspectResp, &bytes)
+            .expect("a missing edge key must not cost the caller the whole response");
+
+        match decoded {
+            ResponseBody::MemoryInspect(response) => {
+                assert!(response.edges.is_empty());
+                assert_eq!(
+                    response.edge_total_count, None,
+                    "an unreported total must not read as zero edges"
+                );
+                assert!(!response.edges_truncated);
+            }
+            other => panic!("wrong response variant: {other:?}"),
+        }
+    }
 
     // The raw embedding for ENCODE_VECTOR_DIRECT rides the trailing raw
     // section of the frame payload, not the CBOR map. This proves three

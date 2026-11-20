@@ -59,6 +59,7 @@ pub mod snapshot_manifest;
 pub mod tantivy_recovery;
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -79,7 +80,7 @@ use brain_protocol::envelope::request::{ForgetMode, RequestBody};
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };
-use brain_storage::recovery::{recover, RecoveryError};
+use brain_storage::recovery::{recover, RecoveryError, WalTail};
 use brain_storage::wal::{Wal, WalConfig, WalError, WalRecord};
 use brain_workers::cache_evict::CacheEvictionSource;
 use brain_workers::hnsw_maint::RebuildSource;
@@ -90,7 +91,7 @@ use brain_workers::{
     CounterReconcileWorker, DisabledCacheEvictionSource, DisabledSummarizer, EdgeScrubWorker,
     ExtractorKnobs, ExtractorWorker, HnswMaintenanceWorker, IdempotencyCleanupWorker,
     LlmCacheSweeper, MetricsSnapshot, SlotReclamationWorker, SnapshotWorker,
-    StatisticsUpdateWorker, Summarizer, WalRetentionWorker, WorkerConfig, WorkerKind,
+    StatisticsUpdateWorker, Summarizer, WalRetentionWorker, Worker, WorkerConfig, WorkerKind,
     WorkerScheduler,
 };
 
@@ -99,7 +100,7 @@ use self::adapters::{
     WalDirRetentionSource,
 };
 use flume::{Receiver, Sender};
-use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
+use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement, PoolPlacement};
 use tracing::{error, info, warn, Instrument as _};
 
 // ---------------------------------------------------------------------------
@@ -220,6 +221,14 @@ pub(crate) enum ShardRequest {
     StorageStats {
         reply_tx: Sender<StorageStatsSnapshot>,
     },
+    /// Measure the durable extraction (derivation) backlog from the
+    /// shard's metadata redb. Used by the admin `/metrics` path and the
+    /// debug snapshot. `None` means the read failed — callers emit
+    /// nothing rather than a zero, because a fabricated "no backlog"
+    /// is the exact blindness this metric exists to remove.
+    ExtractionBacklog {
+        reply_tx: Sender<Option<ExtractionBacklogSnapshot>>,
+    },
     /// Snapshot the predicate review queue — the qnames this shard's
     /// corpus coined that no schema declared, with sighting counts.
     /// Read-only operator diagnostic; not on any hot path.
@@ -310,7 +319,7 @@ pub(crate) enum ShardRequest {
     },
 }
 
-/// Per-shard counts surfaced by [`ShardRequest::ExtractBackfill`]. The
+/// Per-shard counts surfaced by the `ExtractBackfill` shard request. The
 /// admin handler sums these across every shard before replying to the
 /// CLI.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -329,7 +338,7 @@ pub struct ExtractBackfillReport {
     pub namespace_matched: u64,
 }
 
-/// Action verbs for [`ShardRequest::WorkerControl`].
+/// Action verbs for the `WorkerControl` shard request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerAction {
     /// Pause the worker. Loop keeps ticking but skips `run_cycle`.
@@ -383,6 +392,22 @@ pub struct StorageStatsSnapshot {
     pub arena_slots_used: u64,
     /// Reclaimed slots sitting on the free list, ready to reuse.
     pub arena_slots_free: u64,
+}
+
+/// Derivation backlog surfaced by `ShardRequest::ExtractionBacklog`.
+/// Pure data type so it crosses the Tokio↔Glommio boundary without
+/// further plumbing.
+///
+/// Writes accepted by a shard outrun its extractor worker by a wide
+/// margin, so this pair — how much work is owed and how stale the
+/// oldest of it is — is what tells an operator a workspace is degrading
+/// while every request still returns 200.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtractionBacklogSnapshot {
+    /// Memories durably queued for extraction. Exact.
+    pub depth: u64,
+    /// Seconds the oldest queued memory has waited. Zero when empty.
+    pub oldest_age_secs: u64,
 }
 
 /// Owned snapshot descriptor surfaced through `ShardHandle`. Mirrors
@@ -452,12 +477,11 @@ pub enum AuditPage {
 // ---------------------------------------------------------------------------
 
 /// `Debug` is not derived — `Arc<dyn Summarizer>` doesn't
-/// implement `Debug`. Tests that previously printed the spawn
-/// config can format individual fields directly.
+/// implement `Debug`. A caller that needs to print the spawn
+/// config formats individual fields directly.
 #[derive(Clone)]
 pub struct ShardSpawnConfig {
     pub channel_capacity: usize,
-    pub pin_cpu: Option<usize>,
     /// How many shards this deployment runs in total (`[storage]
     /// shard_count`). A shard only ever reads its own data, so handlers
     /// need this to say whether their answer covers the deployment —
@@ -480,6 +504,16 @@ pub struct ShardSpawnConfig {
     /// changed no behaviour at all. The config defaults happen to equal
     /// `default_v1()`, which is why the disconnect was invisible.
     pub index_params: IndexParams,
+    /// Maintenance-worker cadences from `[workers]`, resolved against the
+    /// built-in table and paired with the kind each one governs.
+    ///
+    /// Applied before registration because that is the only moment that
+    /// matters: the scheduler reads a worker's config once and sleeps on that
+    /// interval for the life of the process. Before this field existed the
+    /// whole set of `[workers] *_interval_sec` keys reached nothing at all —
+    /// parsed, validated non-zero, and then ignored, so an operator who
+    /// shortened a cadence saw no change.
+    pub maintenance_worker_configs: [(WorkerKind, WorkerConfig); 10],
     /// Consolidation worker's Summarizer. Defaults to
     /// [`DisabledSummarizer`] so existing tests + non-LLM deployments
     /// keep working. `main.rs::linux_main::run` injects an LLM-backed
@@ -610,12 +644,15 @@ impl Default for AutoEdgeSpawnConfig {
 pub struct ExtractorSpawnConfig {
     pub interval_ms: u64,
     pub drain_per_cycle: usize,
-    pub llm_budget_per_cycle_micro_usd: u64,
     pub channel_capacity: usize,
     pub skip_already_extracted: bool,
     /// Memories the extractor worker batches into one classifier
     /// forward pass per cycle iteration.
     pub batch_size: usize,
+    /// Retry and attribution bounds the extractor worker is held to, ferried
+    /// from `[workers.extractor]`. Carried as the worker's own policy type so
+    /// the spawn path hands it over whole and the defaults stay derived.
+    pub retry_policy: brain_workers::workers::extractor::ExtractorRetryPolicy,
     /// Re-extract a namespace's existing memories after a SCHEMA_UPLOAD.
     /// Read by the SchemaMigrationWorker, not the extractor worker — it
     /// lives under `[workers.extractor]` because it governs extractor
@@ -628,10 +665,10 @@ impl Default for ExtractorSpawnConfig {
         Self {
             interval_ms: 1000,
             drain_per_cycle: 32,
-            llm_budget_per_cycle_micro_usd: 50_000,
             channel_capacity: 1024,
             skip_already_extracted: true,
             batch_size: brain_workers::DEFAULT_EXTRACTOR_BATCH_SIZE,
+            retry_policy: brain_workers::workers::extractor::ExtractorRetryPolicy::default(),
             reextract_on_schema_change: false,
         }
     }
@@ -881,12 +918,13 @@ impl ShardSpawnConfig {
     pub fn new(data_dir: impl Into<PathBuf>, dispatcher: Arc<dyn Dispatcher>) -> Self {
         Self {
             channel_capacity: 1024,
-            pin_cpu: None,
             total_shards: 1,
             data_dir: data_dir.into(),
             arena_initial_capacity_slots: DEFAULT_INITIAL_CAPACITY_SLOTS,
             wal_config: WalConfig::default(),
             index_params: IndexParams::default_v1(),
+            maintenance_worker_configs: crate::config::WorkersConfig::default()
+                .maintenance_worker_configs(),
             summarizer: Arc::new(DisabledSummarizer),
             auto_edge: AutoEdgeSpawnConfig::default(),
             extractor: ExtractorSpawnConfig::default(),
@@ -940,6 +978,19 @@ pub enum ShardError {
 
     #[error("failed to create shard directory at {path}: {source}")]
     DirCreate {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The shard's `wal/` directory could not be listed. The spawn path
+    /// decides whether to replay the WAL or boot fresh from this listing, and
+    /// a listing we could not read is not evidence that the directory is
+    /// empty — concluding "no segments" from a failed `readdir` would skip
+    /// recovery over durable records. So any failure to enumerate, including
+    /// one on a single entry partway through, aborts the spawn.
+    #[error("failed to list WAL directory at {path}: {source}")]
+    WalDirScan {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -1019,6 +1070,9 @@ pub enum ShardError {
 impl ShardError {
     fn dir_create(path: PathBuf, source: std::io::Error) -> Self {
         Self::DirCreate { path, source }
+    }
+    fn wal_dir_scan(path: PathBuf, source: std::io::Error) -> Self {
+        Self::WalDirScan { path, source }
     }
     fn uuid_file(path: PathBuf, source: std::io::Error) -> Self {
         Self::UuidFile { path, source }
@@ -1100,6 +1154,12 @@ pub struct ShardHandle {
     aggregate_metrics: Arc<brain_ops::AggregateMetrics>,
     /// Analytics service, when `[analytics]` is enabled.
     analytics: Option<Arc<brain_analytics::Analytics>>,
+    /// Write-path metrics: per-phase submit counters and the ack
+    /// path's per-stage latency histograms. Always wired — every shard
+    /// serves writes. Shared by `Arc` with the shard's
+    /// `RealWriterHandle`, which records into it on every submit;
+    /// `/metrics` reads it here.
+    writer_metrics: Arc<brain_ops::WriterMetrics>,
 }
 
 /// Per-group totals from one shard's counters.
@@ -1135,6 +1195,7 @@ impl ShardHandle {
             agg_maintenance_stats: None,
             aggregate_metrics: Arc::default(),
             analytics: None,
+            writer_metrics: Arc::new(brain_ops::WriterMetrics::new()),
         }
     }
 
@@ -1156,7 +1217,7 @@ impl ShardHandle {
         !self.tx.is_disconnected()
     }
 
-    /// Number of [`ShardRequest`]s queued on this shard's request
+    /// Number of shard requests queued on this shard's request
     /// channel but not yet drained by the executor loop — the
     /// dispatch-queue depth.
     ///
@@ -1279,6 +1340,15 @@ impl ShardHandle {
             .await
             .map_err(|_| ShardError::ShardDisconnected)?
             .map_err(ShardError::Spawn)
+    }
+
+    /// Read-only handle to the write-path metric state — per-phase
+    /// submit counters plus the ack path's per-stage latency
+    /// histograms. Always wired. `/metrics` exposition reads this
+    /// directly.
+    #[must_use]
+    pub fn writer_metrics(&self) -> Arc<brain_ops::WriterMetrics> {
+        self.writer_metrics.clone()
     }
 
     /// Per-shard event feed. Cloning the Receiver shares the underlying
@@ -1464,6 +1534,27 @@ impl ShardHandle {
             .map_err(|_| ShardError::ShardDisconnected)
     }
 
+    /// Measure this shard's derivation backlog — the durable extraction
+    /// queue, not the extractor's wakeup channel. Sampled on the call
+    /// that asks for it, inside the shard executor where the metadata
+    /// read txn lives; nothing on the write path pays for it.
+    ///
+    /// `Ok(None)` means the metadata read failed. The caller emits an
+    /// absent series, never a zero.
+    pub async fn extraction_backlog(
+        &self,
+    ) -> Result<Option<ExtractionBacklogSnapshot>, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::ExtractionBacklog { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)
+    }
+
     /// Snapshot this shard's predicate review queue: `(qname, count)`
     /// pairs, descending by count. These are predicates the extractor
     /// coined because no schema declared them — the statements are
@@ -1635,7 +1726,7 @@ impl ShardHandle {
     /// Backs the admin `POST /v1/rebuild?index=<target>` route. For
     /// `RebuildTarget::All` the returned report aggregates the per-target
     /// entry counts (sum) and total elapsed time.
-    pub(crate) async fn rebuild_index(
+    pub async fn rebuild_index(
         &self,
         target: rebuild::RebuildTarget,
     ) -> Result<RebuildReport, ShardError> {
@@ -1892,7 +1983,6 @@ struct Shard {
     wal: Rc<RefCell<Option<Wal>>>,
     /// Per-shard OpsContext — embedder, index, metadata, writer.
     /// Constructed inside the executor.
-    #[allow(dead_code)] // consumed by the frame dispatcher
     ops: Arc<OpsContext>,
     /// Per-shard worker scheduler. `Option` so shutdown can `.take()`.
     scheduler: Option<WorkerScheduler>,
@@ -2028,7 +2118,7 @@ impl Shard {
     /// encoded in the current run has no arena slot yet. The embedder is
     /// deterministic, so re-embedding reproduces the exact vector indexed
     /// at encode time.
-    fn memory_vector_for(
+    async fn memory_vector_for(
         &self,
         space: brain_core::SpaceId,
         memory_id: brain_core::MemoryId,
@@ -2036,25 +2126,29 @@ impl Shard {
         use brain_metadata::tables::memory::MEMORIES_TABLE;
         use brain_metadata::tables::text::TEXTS_TABLE;
 
-        let rtxn = self.ops.executor.metadata.read_txn().ok()?;
-        let table = rtxn.open_table(MEMORIES_TABLE).ok()?;
-        let row = table.get(memory_id.to_be_bytes()).ok().flatten()?.value();
-        // Space wall + liveness: a subscriber may only anchor similarity
-        // on a live memory its own (effective) space owns.
-        if !row.is_active() || row.space_id_bytes != space.0.into_bytes() {
-            return None;
-        }
-        // Resolve the reference vector by re-embedding the memory's stored
-        // text, NOT by reading the arena. The arena is populated only by
-        // WAL recovery on shard restart, so a memory encoded in the
-        // current run has no arena slot yet and would resolve to None —
-        // which silently rejected every same-run similarity subscription.
-        // The embedder is deterministic, so re-embedding the stored text
-        // reproduces the exact vector that was indexed at encode time.
-        let texts = rtxn.open_table(TEXTS_TABLE).ok()?;
-        let stored = texts.get(memory_id.to_be_bytes()).ok().flatten()?;
-        let text = std::str::from_utf8(stored.value()).ok()?;
-        self.ops.executor.embedder.embed(text).ok()
+        let text = {
+            let rtxn = self.ops.executor.metadata.read_txn().ok()?;
+            let table = rtxn.open_table(MEMORIES_TABLE).ok()?;
+            let row = table.get(memory_id.to_be_bytes()).ok().flatten()?.value();
+            // Space wall + liveness: a subscriber may only anchor similarity
+            // on a live memory its own (effective) space owns.
+            if !row.is_active() || row.space_id_bytes != space.0.into_bytes() {
+                return None;
+            }
+            // Resolve the reference vector by re-embedding the memory's stored
+            // text, NOT by reading the arena. The arena is populated only by
+            // WAL recovery on shard restart, so a memory encoded in the
+            // current run has no arena slot yet and would resolve to None —
+            // which silently rejected every same-run similarity subscription.
+            // The embedder is deterministic, so re-embedding the stored text
+            // reproduces the exact vector that was indexed at encode time.
+            let texts = rtxn.open_table(TEXTS_TABLE).ok()?;
+            let stored = texts.get(memory_id.to_be_bytes()).ok().flatten()?;
+            std::str::from_utf8(stored.value()).ok()?.to_owned()
+        };
+        brain_ops::embedding::embed_off_reactor(&self.ops.executor.embedder, &text)
+            .await
+            .ok()
     }
 
     /// Read one page of the historical audit tables under a single redb
@@ -2228,6 +2322,39 @@ impl Shard {
             arena_slots_used,
             arena_slots_free,
         }
+    }
+
+    /// Measure the durable extraction queue for `/metrics` and the debug
+    /// snapshot. The queue table is the authoritative record of derivation
+    /// work owed; the extractor's flume channel is only a wakeup hint and
+    /// its length says nothing about how far behind the shard is.
+    ///
+    /// Runs on the shard's own core at scrape cadence over a bounded row
+    /// window, so a deep queue cannot turn the scrape into a long stall.
+    /// Returns `None` if the metadata read fails — a failed measurement
+    /// must read as "unknown", not as "no backlog".
+    fn extraction_backlog(&self) -> Option<ExtractionBacklogSnapshot> {
+        let rtxn = self
+            .ops
+            .executor
+            .metadata
+            .read_txn()
+            .inspect_err(|e| {
+                warn!(shard_id = self.shard_id, error = %e, "extraction backlog read_txn failed");
+            })
+            .ok()?;
+        let backlog = brain_metadata::extraction_queue_backlog(
+            &rtxn,
+            brain_metadata::EXTRACTION_BACKLOG_SCAN_CAP,
+        )
+        .inspect_err(|e| {
+            warn!(shard_id = self.shard_id, error = %e, "extraction backlog read failed");
+        })
+        .ok()?;
+        Some(ExtractionBacklogSnapshot {
+            depth: backlog.depth,
+            oldest_age_secs: backlog.oldest_age_secs(brain_ops::clock::now_unix_nanos()),
+        })
     }
 
     /// Rebuild the memory HNSW from the authoritative redb vector
@@ -2640,35 +2767,48 @@ async fn await_ack(ack_rx: &flume::Receiver<()>, label: &str, phase: &str) -> Re
 /// real adapters for `RebuildSource`, `WalRetentionSource`,
 /// and `SnapshotSource`. `Summarizer` is injected by `main.rs` (OpenAI
 /// / Ollama if configured, `DisabledSummarizer` otherwise).
+#[allow(clippy::too_many_arguments)]
 fn register_phase8_workers(
     scheduler: &mut WorkerScheduler,
     ops: Arc<OpsContext>,
+    maintenance_worker_configs: &[(WorkerKind, WorkerConfig); 10],
     rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>>,
     wal_retention_source: Arc<dyn WalRetentionSource>,
     snapshot_source: Arc<dyn SnapshotSource>,
     cache_eviction_source: Arc<dyn CacheEvictionSource>,
     summarizer: Arc<dyn Summarizer>,
 ) -> Result<(), brain_workers::WorkerError> {
-    scheduler.register(Arc::new(AccessBoostWorker::new()), ops.clone())?;
-    scheduler.register(Arc::new(ConsolidationWorker::new(summarizer)), ops.clone())?;
-    scheduler.register(
-        Arc::new(HnswMaintenanceWorker::new(rebuild_source)),
-        ops.clone(),
-    )?;
-    scheduler.register(Arc::new(IdempotencyCleanupWorker::new()), ops.clone())?;
-    scheduler.register(Arc::new(EdgeScrubWorker::new()), ops.clone())?;
-    scheduler.register(Arc::new(SlotReclamationWorker::new()), ops.clone())?;
-    scheduler.register(Arc::new(StatisticsUpdateWorker::new()), ops.clone())?;
-    scheduler.register(Arc::new(CounterReconcileWorker::new()), ops.clone())?;
-    scheduler.register(
-        Arc::new(CacheEvictionWorker::new(cache_eviction_source)),
-        ops.clone(),
-    )?;
-    scheduler.register(
-        Arc::new(WalRetentionWorker::new(wal_retention_source)),
-        ops.clone(),
-    )?;
-    scheduler.register(Arc::new(SnapshotWorker::new(snapshot_source)), ops)?;
+    // Register a worker on the cadence `[workers]` declares for the kind the
+    // worker itself reports. Reading the kind off the instance is what keeps a
+    // cadence from being paired with the wrong worker here, which is a mistake
+    // no config-level test can catch.
+    macro_rules! register_tuned {
+        ($w:expr) => {{
+            let w = $w;
+            let kind = w.kind();
+            let w = match maintenance_worker_configs
+                .iter()
+                .find(|(declared, _)| *declared == kind)
+            {
+                Some((_, worker_cfg)) => w.with_config(worker_cfg.clone()),
+                // `access_boost` has no cadence key; it keeps its built-in tick.
+                None => w,
+            };
+            scheduler.register(Arc::new(w), ops.clone())?;
+        }};
+    }
+
+    register_tuned!(AccessBoostWorker::new());
+    register_tuned!(ConsolidationWorker::new(summarizer));
+    register_tuned!(HnswMaintenanceWorker::new(rebuild_source));
+    register_tuned!(IdempotencyCleanupWorker::new());
+    register_tuned!(EdgeScrubWorker::new());
+    register_tuned!(SlotReclamationWorker::new());
+    register_tuned!(StatisticsUpdateWorker::new());
+    register_tuned!(CounterReconcileWorker::new());
+    register_tuned!(CacheEvictionWorker::new(cache_eviction_source));
+    register_tuned!(WalRetentionWorker::new(wal_retention_source));
+    register_tuned!(SnapshotWorker::new(snapshot_source));
     Ok(())
 }
 
@@ -2725,6 +2865,50 @@ fn interpret_wal_ready(
     }
 }
 
+/// Next arena slot to issue given the shard's persisted high-water mark.
+///
+/// `max_assigned_slot` answers `0` for a shard that has never held a
+/// memory, so a fresh shard issues slot 1; a shard whose highest assigned
+/// slot is `n` resumes at `n + 1` and never re-issues a live slot.
+fn seeded_next_slot(high_water: u64) -> u64 {
+    high_water.saturating_add(1)
+}
+
+/// Classify one `read_dir` item as a WAL segment.
+///
+/// `DirEntry::path()` and `Path::extension()` issue no syscalls, so the only
+/// failure this can see is the directory iterator itself reporting an error
+/// from `readdir` — a failing disk, a stale NFS handle, a directory removed
+/// mid-iteration. That error is returned rather than folded into `false`:
+/// the caller uses the answer to decide whether durable WAL state exists, and
+/// an unreadable entry is not evidence that it does not.
+fn entry_is_wal_segment(entry: std::io::Result<std::fs::DirEntry>) -> std::io::Result<bool> {
+    let entry = entry?;
+    Ok(entry.path().extension().is_some_and(|ext| ext == "wal"))
+}
+
+/// Whether `wal_dir` holds at least one `*.wal` segment.
+///
+/// `true` routes the spawn through WAL recovery; `false` boots the shard
+/// fresh at LSN 1. Because the `false` answer skips replay of durable
+/// records, it is only ever returned for a directory that was enumerated
+/// end to end. Any failure — opening the directory or reading a single entry
+/// out of it — aborts the spawn instead, so a shard never concludes it has no
+/// WAL from a listing it could not complete.
+fn wal_segments_present(wal_dir: &Path) -> Result<bool, ShardError> {
+    for entry in wal_dir
+        .read_dir()
+        .map_err(|e| ShardError::wal_dir_scan(wal_dir.to_path_buf(), e))?
+    {
+        if entry_is_wal_segment(entry)
+            .map_err(|e| ShardError::wal_dir_scan(wal_dir.to_path_buf(), e))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------------
 // Public spawn entry point
 // ---------------------------------------------------------------------------
@@ -2777,23 +2961,13 @@ pub fn spawn_shard(
     // `ensure_dirs` above already created wal_dir; this assertion documents
     // the precondition for the segment scan below.
     debug_assert!(wal_dir.is_dir(), "ensure_dirs must have created wal/");
-    let segments_present = wal_dir
-        .read_dir()
-        .map_err(|e| ShardError::dir_create(wal_dir.clone(), e))?
-        .any(|entry| {
-            entry
-                .as_ref()
-                .ok()
-                .and_then(|e| e.path().extension().map(|s| s.to_owned()))
-                .map(|ext| ext == "wal")
-                .unwrap_or(false)
-        });
+    let segments_present = wal_segments_present(&wal_dir)?;
     let next_lsn_after_recovery: u64;
-    // Physical byte length the active WAL segment must be truncated to
-    // before reopening for append — the tail recovery validated. Passed to
+    // Physical tail the WAL segment must be truncated to before reopening
+    // for append — recovery validated it. Passed to
     // `Wal::open_existing` so a crash-left torn tail or never-committed
     // dangling-transaction prefix is dropped rather than appended past.
-    let recovered_tail_offset: u64;
+    let recovered_tail: Option<WalTail>;
     let allocator = if segments_present {
         let (report, alloc) = recover(&mut arena, &wal_dir, shard_uuid, &mut metadata_db)?;
         info!(
@@ -2802,16 +2976,16 @@ pub fn spawn_shard(
             records_skipped = report.records_skipped,
             records_discarded = report.records_discarded,
             next_lsn = report.next_lsn,
-            active_tail_offset = report.active_tail_offset,
-            active_segment_seq = ?report.active_segment_seq,
+            tail_segment_seq = ?report.tail.map(|tail| tail.segment_seq),
+            tail_offset = ?report.tail.map(|tail| tail.offset),
             "WAL recovery complete"
         );
         next_lsn_after_recovery = report.next_lsn;
-        recovered_tail_offset = report.active_tail_offset;
+        recovered_tail = report.tail;
         alloc
     } else {
         next_lsn_after_recovery = 1;
-        recovered_tail_offset = 0;
+        recovered_tail = None;
         SlotAllocator::rebuild_from_arena(&arena)
     };
     let metadata: SharedMetadataDb = Arc::new(metadata_db);
@@ -2899,11 +3073,13 @@ pub fn spawn_shard(
     // fanout_task that drains `ops.events` into this channel; the
     // connection layer reads the Receiver via `ShardHandle::events()`.
     let (events_tx, events_rx) = flume::bounded::<EventEnvelope>(1024);
-    let placement = match cfg.pin_cpu {
-        Some(cpu) => Placement::Fixed(cpu),
-        None => Placement::Unbound,
-    };
+    // A shard's executor is schedulable on any core. The alternative,
+    // `Placement::Fixed`, was reachable only through a spawn-config field that
+    // defaulted to none, that `spawn_shards` never set, and that no
+    // configuration key fed, so no deployment could ask for a pinned shard.
+    let placement = Placement::Unbound;
     let wal_config = cfg.wal_config;
+    let max_in_flight = max_in_flight_for_wal(&wal_config);
     let summarizer = cfg.summarizer;
     let total_shards_for_ops = cfg.total_shards;
     let auto_edge_spawn_cfg_for_closure = cfg.auto_edge.clone();
@@ -2918,6 +3094,7 @@ pub fn spawn_shard(
     let llm_cache_sweep_spawn_cfg = cfg.llm_cache_sweep;
     let extractor_tuning_spawn_cfg = cfg.extractor_tuning.clone();
     let index_spawn_cfg = cfg.index;
+    let maintenance_worker_configs = cfg.maintenance_worker_configs;
 
     // ---- Cross-encoder (rerank) capability gate ----------------------------
     //
@@ -3052,6 +3229,12 @@ pub fn spawn_shard(
     let query_metrics_for_handle: Arc<brain_ops::QueryMetrics> =
         Arc::new(brain_ops::QueryMetrics::new());
     let query_metrics_for_closure = query_metrics_for_handle.clone();
+    // The write path's family is built out here for the same reason:
+    // the writer itself lives inside the executor closure, so the
+    // `/metrics` side needs its own `Arc` to the same counters.
+    let writer_metrics_for_handle: Arc<brain_ops::WriterMetrics> =
+        Arc::new(brain_ops::WriterMetrics::new());
+    let writer_metrics_for_closure = writer_metrics_for_handle.clone();
     // Clone the process-wide dispatcher Arc into the executor closure.
     // The CachingDispatcher<CpuDispatcher> built once in main.rs is
     // shared across every shard so the BERT weights live in memory
@@ -3069,7 +3252,7 @@ pub fn spawn_shard(
     let analytics_for_closure = analytics.clone();
     let aggregate_metrics_for_closure = aggregate_metrics.clone();
     // Tantivy is opened above and propagated into the closure pre-built.
-    // The closure can no longer downgrade lexical retrieval to `None`.
+    // The closure cannot downgrade lexical retrieval to `None`.
     let tantivy_for_closure = tantivy_shard.clone();
     let lexical_retriever_for_closure = lexical_retriever.clone();
     // Concrete retriever + shard dir, captured for the shard's hot
@@ -3078,7 +3261,7 @@ pub fn spawn_shard(
     let tantivy_dir_for_closure = dir.clone();
     // WAL open/create runs *inside* the Glommio executor closure below —
     // it needs the executor's io_uring reactor to `.await`, and it depends
-    // on `next_lsn_after_recovery` / `recovered_tail_offset` produced by the
+    // on `next_lsn_after_recovery` / `recovered_tail` produced by the
     // recovery pass above. That means it can't be hoisted outside the closure
     // like the tantivy/rerank init. To keep a WAL IO failure (permissions,
     // ENOSPC, an FS without O_DIRECT/io_uring support) from panicking the
@@ -3091,6 +3274,23 @@ pub fn spawn_shard(
     // treated as a spawn failure.
     let (wal_ready_tx, wal_ready_rx) = flume::bounded::<Result<(), WalError>>(1);
     let join_handle = LocalExecutorBuilder::new(placement)
+        // Two blocking threads per shard, to keep a slow offload from sitting
+        // in front of a fast one. Everything this shard moves off its reactor
+        // shares this pool: every ENCODE's embed, both text indexers,
+        // statement embedding, and glommio's own rename and truncate. The
+        // default is one thread, which makes that pool a single queue with no
+        // priority, so one multi-second item — a classifier pass runs ~3.8 s
+        // on CPU — delays every ~20 ms embed queued behind it. A second lane
+        // means the slow item occupies one and the embeds keep flowing
+        // through the other.
+        //
+        // Two, not the core count: the pool is built per executor, so the
+        // figure is per shard and multiplies by the shard count. At nine
+        // shards a ten-wide pool would be ninety blocking threads on ten
+        // cores, which is the oversubscription that sizing the embed fan-out
+        // to cores-per-shard exists to remove. What is wanted here is one lane
+        // that a slow item cannot monopolise, not parallelism within a shard.
+        .blocking_thread_pool_placement(PoolPlacement::Unbound(2))
         .name(&format!("brain-shard-{shard_id}"))
         .spawn(move || async move {
             // Build per-shard HNSW; tombstones rebuilt by HnswMaintenanceWorker.
@@ -3187,8 +3387,8 @@ pub fn spawn_shard(
             // (Send + Sync), the receiver is drained by a Glommio-
             // local task spawned after the Wal is open (see "WAL
             // drain task" below). Without this link the writer
-            // silently falls back to the legacy bus-stamped-LSN
-            // path and subscribe --start-lsn finds an empty log.
+            // silently falls back to the bus-stamped-LSN path and
+            // subscribe --start-lsn finds an empty log.
             let (wal_sink, wal_drain_rx) = brain_ops::writer::channel_wal_sink();
             let wal_sink_for_ops: Arc<dyn brain_ops::writer::WalSink> = wal_sink.clone();
 
@@ -3380,13 +3580,13 @@ pub fn spawn_shard(
                     // No model on the real boot path: fail stop. The classifier
                     // is a required tier, not an enhancement.
                     //
-                    // This used to log "classifier tier inactive" and carry on
-                    // with the pattern tier alone. That is the failure mode that
-                    // shipped in v0.1.0: the published image carried no GLiNER
-                    // weights, every ENCODE ran a weaker extractor, the server
-                    // reported itself healthy, and GET_CAPABILITIES said
-                    // `classifier_extractor: true` because the tier exists in the
-                    // build. Nothing distinguished "running correctly" from
+                    // Logging "classifier tier inactive" and carrying on with
+                    // the pattern tier alone is the failure mode that shipped in
+                    // v0.1.0: the published image carried no GLiNER weights,
+                    // every ENCODE ran a weaker extractor, the server reported
+                    // itself healthy, and GET_CAPABILITIES said
+                    // `classifier_extractor: true` because the tier exists in
+                    // the build. Nothing distinguished "running correctly" from
                     // "running degraded" except one INFO line at boot.
                     //
                     // The embedder already fails stop for the same reason. Making
@@ -3572,33 +3772,43 @@ pub fn spawn_shard(
             // committed tail: recovery replays every WAL record up to
             // `next_lsn - 1` into redb and commits, so that LSN is durable
             // in metadata at boot. A fresh shard seeds 0.
-            let redb_committed_watermark = brain_ops::RedbCommittedWatermark::new();
-            redb_committed_watermark.advance_to(next_lsn_after_recovery.saturating_sub(1));
+            let redb_committed_watermark = brain_ops::RedbCommittedWatermark::sealed_through(
+                next_lsn_after_recovery.saturating_sub(1),
+            );
 
             let mut real_writer = RealWriterHandle::new(metadata.clone(), hnsw_writer)
                 .with_shard_id(shard_id)
                 .with_event_bus(event_bus.clone())
                 .with_wal_sink(wal_sink)
+                .with_writer_metrics(writer_metrics_for_closure.clone())
                 .with_redb_committed_watermark(redb_committed_watermark.clone());
             // Seed the slot counter from the persisted high-water mark so a
             // restart on a non-empty shard never re-issues a live arena slot.
             // (The counter resets to 1 in-process; without this, restart-reuse
             // collides memory_ids — overwriting rows and skipping extraction.)
-            match metadata.read_txn() {
-                Ok(rtxn) => {
-                    match brain_metadata::tables::slot_version::max_assigned_slot(&rtxn) {
-                        Ok(hi) => real_writer.seed_next_slot(hi.saturating_add(1)),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "slot high-water recovery failed; slot counter starts at 1"
-                        ),
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "slot high-water recovery read_txn failed; slot counter starts at 1"
-                ),
-            }
+            // A shard that cannot determine its high-water mark refuses to
+            // start: an unreadable scan is not evidence of an empty shard.
+            // A successful scan finding nothing is the legitimate fresh-shard
+            // case and still starts at slot 1.
+            let high_water = {
+                // Confine the read transaction because its snapshot pages cannot be reclaimed while open.
+                let rtxn = metadata.read_txn().unwrap_or_else(|e| {
+                    panic!(
+                        "shard {shard_id}: cannot open the metadata read transaction that \
+                         recovers the slot high-water mark: {e}. Refusing to start: a shard \
+                         that starts at slot 1 over live memories overwrites them."
+                    )
+                });
+                brain_metadata::tables::slot_version::max_assigned_slot(&rtxn)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "shard {shard_id}: slot high-water scan failed: {e}. Refusing to \
+                             start: an unreadable scan is not an empty shard, and starting at \
+                             slot 1 over live memories overwrites them."
+                        )
+                    })
+            };
+            real_writer.seed_next_slot(seeded_next_slot(high_water));
             if let Some(tx) = auto_edge_sender {
                 real_writer.set_auto_edge_sender(tx);
             }
@@ -3749,7 +3959,7 @@ pub fn spawn_shard(
                     &wal_dir_for_executor,
                     shard_uuid,
                     next_lsn_after_recovery,
-                    recovered_tail_offset,
+                    recovered_tail.expect("segments present implies a recovered WAL tail"),
                     wal_config,
                 )
                 .await
@@ -3790,18 +4000,55 @@ pub fn spawn_shard(
             // at shard shutdown when the `OpsContext` Arc count
             // hits zero.
             let wal_cell_for_drain = wal_cell.clone();
+            let redb_committed_watermark_for_drain = redb_committed_watermark.clone();
             let __wal_drain_task = glommio::spawn_local(async move {
                 while let Ok(msg) = wal_drain_rx.recv_async().await {
+                    let writer_batch = !msg.records.is_empty()
+                        && msg.records.iter().all(|record| {
+                            record.flags & brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT == 0
+                        });
                     let outcome = {
                         let guard = wal_cell_for_drain.borrow();
                         match guard.as_ref() {
+                            // `From<WalError>` owns the classification: a
+                            // latched WAL-broken fault becomes
+                            // `StorageFaulted`, which the wire marks
+                            // non-retryable. The detail is logged here because
+                            // the client-facing message carries none of it.
                             Some(wal) => wal.append_many(msg.records).await.map_err(|e| {
-                                brain_ops::writer::WalSinkError::Internal(format!("{e}"))
+                                let mapped = brain_ops::writer::WalSinkError::from(e);
+                                if let brain_ops::writer::WalSinkError::StorageFaulted { detail } =
+                                    &mapped
+                                {
+                                    tracing::error!(
+                                        detail = %detail,
+                                        "shard write-ahead log is terminally faulted; writes fail \
+                                         until this shard process is restarted"
+                                    );
+                                }
+                                mapped
                             }),
                             None => Err(brain_ops::writer::WalSinkError::Disconnected),
                         }
                     };
-                    let _ = msg.reply.send(outcome);
+                    let reservation = match &outcome {
+                        Ok(lsns) if writer_batch => lsns
+                            .first()
+                            .zip(lsns.last())
+                            .map(|(first, last)| (first.raw(), last.raw())),
+                        _ => None,
+                    };
+                    if let Some((first, last)) = reservation {
+                        redb_committed_watermark_for_drain.reserve(first, last);
+                        if msg.reply.send(outcome).is_err() {
+                            // The submitting task is gone, so nothing will ever commit
+                            // or abandon this range; leaving it reserved would hold the
+                            // contiguous frontier below it for the life of the shard.
+                            redb_committed_watermark_for_drain.abandon(first, last);
+                        }
+                    } else {
+                        let _ = msg.reply.send(outcome);
+                    }
                 }
             });
 
@@ -4076,6 +4323,7 @@ pub fn spawn_shard(
             register_phase8_workers(
                 &mut scheduler,
                 ops.clone(),
+                &maintenance_worker_configs,
                 redb_rebuild_source,
                 wal_retention_source,
                 snapshot_source.clone(),
@@ -4389,8 +4637,6 @@ pub fn spawn_shard(
                 };
                 let knobs = ExtractorKnobs {
                     drain_per_cycle: extractor_spawn_cfg.drain_per_cycle,
-                    llm_budget_per_cycle_micro_usd: extractor_spawn_cfg
-                        .llm_budget_per_cycle_micro_usd,
                     skip_already_extracted: extractor_spawn_cfg.skip_already_extracted,
                     batch_size: extractor_spawn_cfg.batch_size,
                     hype_refresh_per_cycle:
@@ -4399,6 +4645,7 @@ pub fn spawn_shard(
                 let mut extractor_worker = ExtractorWorker::new(rx)
                     .with_config(worker_cfg)
                     .with_knobs(knobs)
+                    .with_retry_policy(extractor_spawn_cfg.retry_policy)
                     .with_embed_deps(brain_extractors::resolver::EmbeddingDeps {
                         hnsw: entity_hnsw_for_shard.clone(),
                         embedder: dispatcher.clone(),
@@ -4541,7 +4788,7 @@ pub fn spawn_shard(
                 memory_text_control: __memory_text_control,
                 statement_text_control: __statement_text_control,
             };
-            shard_main_loop(shard, rx).await;
+            shard_main_loop(shard, rx, max_in_flight).await;
             // Stop background DB readers and wait for them to let go before
             // this executor (and with it the shard's DB) goes away.
             if !lifeline_owner.shutdown(std::time::Duration::from_secs(30)) {
@@ -4574,6 +4821,7 @@ pub fn spawn_shard(
         agg_maintenance_stats: Some(agg_maintenance_stats),
         aggregate_metrics,
         analytics,
+        writer_metrics: writer_metrics_for_handle,
     };
     let joiner = ShardJoiner {
         shard_id,
@@ -4591,7 +4839,44 @@ pub fn spawn_shard(
 /// of a single batch; the point is to bound the wait, not to race it.
 const LEXICAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
+/// The dominant write record is `EncodePayload`: a 384-element `Vec<f32>`
+/// contributes 1536 bytes, with memory text, the rkyv response payload,
+/// inline edges, a 32-byte record header, and a footer. Four KiB is one page,
+/// sits comfortably above that vector-plus-framing floor, and stays honest
+/// about the text.
+const WAL_RECORD_BUDGET_BYTES: usize = 4 * 1024;
+
+/// Derive the per-shard request bound from the WAL group-commit batch. The
+/// smallest bound that means anything is two: one would reproduce serial
+/// dispatch, while zero would wedge the shard. The value follows the
+/// operator-tunable per-shard WAL configuration, so widening the commit
+/// window and its batch budget gives the matching concurrency.
+fn max_in_flight_for_wal(cfg: &WalConfig) -> usize {
+    (cfg.group_commit.max_batch_bytes / WAL_RECORD_BUDGET_BYTES).max(2)
+}
+
+/// Admit one request and detach it onto this shard's local executor. The
+/// permit is held until the supplied future has completely finished.
+async fn admit_and_spawn<F, Fut>(permit_rx: Receiver<()>, permit_tx: Sender<()>, future_factory: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let _ = permit_rx.recv_async().await;
+    glommio::spawn_local(async move {
+        future_factory().await;
+        let _ = permit_tx.send_async(()).await;
+    })
+    .detach();
+}
+
+async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>, max_in_flight: usize) {
+    let (permit_tx, permit_rx) = flume::bounded::<()>(max_in_flight);
+    for _ in 0..max_in_flight {
+        permit_tx
+            .send(())
+            .expect("permit channel just created with this capacity");
+    }
     info!(
         shard_id = shard.shard_id,
         "shard executor entering main loop"
@@ -4611,7 +4896,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 memory_id,
                 reply_tx,
             } => {
-                let vector = shard.memory_vector_for(space, memory_id);
+                let vector = shard.memory_vector_for(space, memory_id).await;
                 if reply_tx.send_async(vector).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
@@ -4741,6 +5026,15 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
+            ShardRequest::ExtractionBacklog { reply_tx } => {
+                let backlog = shard.extraction_backlog();
+                if reply_tx.send_async(backlog).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "ExtractionBacklog reply dropped (caller gone)"
+                    );
+                }
+            }
             ShardRequest::PredicateReview { reply_tx } => {
                 let queue = shard
                     .ops
@@ -4813,8 +5107,8 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 }
             }
             ShardRequest::BackfillSubmit { request, reply_tx } => {
-                // Reach the same per-shard worker handle the (now-rejected)
-                // wire op used to: the `Arc<dyn BackfillControl>` threaded
+                // Reach the same per-shard worker handle the rejected wire
+                // op would: the `Arc<dyn BackfillControl>` threaded
                 // onto the executor context at shard construction. `submit`
                 // is a synchronous `&self` push onto worker-owned state, so
                 // no borrow crosses the reply `.await`.
@@ -4912,13 +5206,13 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 reply_tx,
                 parent_span,
             } => {
-                // `brain_ops::dispatch` is async and runs entirely
-                // within the per-shard Glommio executor: it touches
-                // `OpsContext` (which is !Send) and yields
-                // through Glommio-aware I/O. Awaiting here is sound —
-                // the main loop is single-threaded and processes one
-                // request at a time, the same shape as
-                // `AppendWalRecord`.
+                // The shard is single-threaded but dispatches concurrently:
+                // each !Send request is detached onto this executor with
+                // `spawn_local`, never `spawn`. The permit bound is derived
+                // from the WAL group-commit batch so it limits in-flight
+                // records to the useful fsync-amortisation window. Redb
+                // writes still self-serialize because each write transaction
+                // contains no await and is therefore atomic on this executor.
                 //
                 // `.instrument(parent_span)` re-enters the connection-layer
                 // `client.request` span on this Glommio thread so the
@@ -4926,7 +5220,8 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 // it. We instrument the future rather than holding an
                 // `enter()` guard because the dispatch yields at `.await`
                 // points; a guard held across `.await` would mis-attribute
-                // spans from interleaved work.
+                // spans from interleaved work. The protocol correlates replies
+                // by `stream_id`, so the shard imposes no ordering here.
                 // Peek for a direct (non-transactional) hard FORGET before
                 // moving `req` into dispatch. Hard forget promises the
                 // plaintext-derived embedding is "no longer recoverable from
@@ -4944,34 +5239,43 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     }
                     _ => None,
                 };
-                let out = brain_ops::dispatch::dispatch(*req, caller, &shard.ops)
-                    .instrument(parent_span)
-                    .await;
-                // Zero the arena slot only after a successful commit. FORGET
-                // is lenient (a missing/stale id is a no-op success) and
-                // `hard_forget_slot` is itself guarded on occupancy + slot
-                // version, so an over-eager call is a safe no-op: a same-run
-                // memory (never in the arena) and a slot since reclaimed by a
-                // newer memory (invariant #4) are both left untouched.
-                if let (Some(id), Ok(_)) = (hard_forget_id, &out) {
-                    let zeroed = {
-                        let mut arena = shard.arena.borrow_mut();
-                        arena.hard_forget_slot(id.slot(), id.version())
-                    };
-                    if zeroed {
-                        tracing::debug!(
-                            shard_id = shard.shard_id,
-                            memory_id = ?id,
-                            "hard forget: zeroed arena slot at rest"
-                        );
+                let ops = shard.ops.clone();
+                let arena = shard.arena.clone();
+                let shard_id = shard.shard_id;
+                // Parking this receive also parks Ping, AllocSlot, and the
+                // other cheap requests. In-order service of a saturated shard
+                // is preferable to a second scheduling lane with unreasoned
+                // starvation behavior.
+                admit_and_spawn(permit_rx.clone(), permit_tx.clone(), move || async move {
+                    let out = brain_ops::dispatch::dispatch(*req, caller, &ops)
+                        .instrument(parent_span)
+                        .await;
+                    // Zero the arena slot only after this request's successful
+                    // commit. Detachment permits another request to commit in
+                    // between, but `hard_forget_slot` checks occupancy and
+                    // slot version: if an ENCODE reclaimed the slot, the
+                    // version check leaves the new memory's vector alone. The
+                    // plaintext is already gone from redb; the arena is its
+                    // at-rest copy and is either zeroed or provably belongs to
+                    // someone else.
+                    if let (Some(id), Ok(_)) = (hard_forget_id, &out) {
+                        let zeroed = {
+                            let mut arena = arena.borrow_mut();
+                            arena.hard_forget_slot(id.slot(), id.version())
+                        };
+                        if zeroed {
+                            tracing::debug!(
+                                shard_id,
+                                memory_id = ?id,
+                                "hard forget: zeroed arena slot at rest"
+                            );
+                        }
                     }
-                }
-                if reply_tx.send_async(out).await.is_err() {
-                    warn!(
-                        shard_id = shard.shard_id,
-                        "DispatchOp reply dropped (caller gone)"
-                    );
-                }
+                    if reply_tx.send_async(out).await.is_err() {
+                        warn!(shard_id, "DispatchOp reply dropped (caller gone)");
+                    }
+                })
+                .await;
             }
             ShardRequest::RecallGather {
                 req,
@@ -5054,6 +5358,15 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             }
         }
     }
+    // Every detached dispatch returns its permit as its final statement, so holding all
+    // max_in_flight permits proves that no dispatch is still in flight; no task-handle
+    // bookkeeping is needed. This must complete before teardown begins because the
+    // scheduler drain assumes no further background jobs will be enqueued, and the final
+    // snapshot assumes the committed watermark it samples is final.
+    for _ in 0..max_in_flight {
+        let _ = permit_rx.recv_async().await;
+    }
+
     // Clean shutdown: drain worker scheduler → final snapshot → WAL
     // committer → arena msync. Order matters:
     //   - Workers drain first so in-flight WAL appends complete and the
@@ -5089,6 +5402,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             );
         }
     }
+
     // Flush the lexical indexes before anything else is torn down.
     //
     // These are JOINED, not cancelled: their final `commit()` is durable
@@ -5578,6 +5892,19 @@ mod tests {
     }
 
     #[test]
+    fn fresh_shard_seeds_slot_one() {
+        // A successful scan finding nothing is the legitimate empty-shard case.
+        assert_eq!(seeded_next_slot(0), 1);
+    }
+
+    #[test]
+    fn populated_shard_resumes_past_high_water() {
+        // A populated shard resumes after its high-water mark, saturating at the maximum.
+        assert_eq!(seeded_next_slot(7), 8);
+        assert_eq!(seeded_next_slot(u64::MAX), u64::MAX);
+    }
+
+    #[test]
     fn queue_depth_tracks_undrained_requests() {
         // The dispatch-queue depth reflects requests queued on the
         // request channel but not yet drained by the executor. With no
@@ -5643,6 +5970,181 @@ mod tests {
         drop(tx);
         let out = interpret_wal_ready(rx.recv());
         assert!(matches!(out, Err(ShardError::Spawn(_))));
+    }
+
+    #[test]
+    fn wal_concurrency_bound_follows_group_commit_batch() {
+        let cfg = WalConfig::default();
+        assert_eq!(max_in_flight_for_wal(&cfg), 15);
+
+        let mut tiny = cfg;
+        tiny.group_commit.max_batch_bytes = 1;
+        assert_eq!(max_in_flight_for_wal(&tiny), 2);
+
+        let mut doubled = cfg;
+        doubled.group_commit.max_batch_bytes *= 2;
+        assert_eq!(max_in_flight_for_wal(&doubled), 30);
+    }
+
+    struct Rendezvous {
+        parties: usize,
+        arrived: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Rendezvous {
+        fn new(parties: usize) -> Arc<Self> {
+            Arc::new(Self {
+                parties,
+                arrived: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        async fn wait(&self) -> bool {
+            use std::sync::atomic::Ordering;
+            self.arrived.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..1024 {
+                if self.arrived.load(Ordering::SeqCst) >= self.parties {
+                    return true;
+                }
+                YieldOnce::default().await;
+            }
+            false
+        }
+    }
+
+    #[derive(Default)]
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.yielded {
+                return std::task::Poll::Ready(());
+            }
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    #[test]
+    fn the_rendezvous_tells_serial_awaits_from_composed_ones() {
+        glommio::LocalExecutor::default().run(async {
+            let gate = Rendezvous::new(2);
+            let serial = (gate.wait().await, gate.wait().await);
+            assert_eq!(serial, (false, true));
+
+            let gate = Rendezvous::new(2);
+            let first = glommio::spawn_local({
+                let gate = gate.clone();
+                async move { gate.wait().await }
+            });
+            let second = glommio::spawn_local({
+                let gate = gate.clone();
+                async move { gate.wait().await }
+            });
+            assert_eq!([first.await, second.await], [true, true]);
+        });
+    }
+
+    #[test]
+    fn bounded_dispatch_spawns_two_requests_in_flight() {
+        glommio::LocalExecutor::default().run(async {
+            let (permit_tx, permit_rx) = flume::bounded(2);
+            permit_tx.send(()).expect("seed permit");
+            permit_tx.send(()).expect("seed permit");
+            let gate = Rendezvous::new(2);
+            let (done_tx, done_rx) = flume::bounded(2);
+
+            let first = glommio::spawn_local({
+                let gate = gate.clone();
+                let done_tx = done_tx.clone();
+                admit_and_spawn(permit_rx.clone(), permit_tx.clone(), move || async move {
+                    let overlapped = gate.wait().await;
+                    let _ = done_tx.send_async(overlapped).await;
+                })
+            });
+            let second = glommio::spawn_local({
+                let gate = gate.clone();
+                admit_and_spawn(permit_rx, permit_tx, move || async move {
+                    let overlapped = gate.wait().await;
+                    let _ = done_tx.send_async(overlapped).await;
+                })
+            });
+            first.await;
+            second.await;
+            assert!(done_rx.recv_async().await.expect("first result"));
+            assert!(done_rx.recv_async().await.expect("second result"));
+        });
+    }
+
+    /// One fake write: park on the rendezvous (standing in for the WAL-append
+    /// await, which is where two dispatches interleave), then run a critical
+    /// region standing in for the redb write transaction. `overlap` is set if a
+    /// party enters the region while another party is inside it.
+    ///
+    /// `yield_in_region` exists to calibrate the detector: a region that contains
+    /// an await is exactly what the single-writer invariant forbids, and the
+    /// calibration below asserts that such a region is caught. Without that, a
+    /// passing assertion would only prove the detector never fires.
+    async fn fake_write(
+        gate: Arc<Rendezvous>,
+        busy: Rc<std::cell::Cell<bool>>,
+        overlap: Rc<std::cell::Cell<bool>>,
+        yield_in_region: bool,
+    ) -> bool {
+        let in_flight_together = gate.wait().await;
+        if busy.replace(true) {
+            overlap.set(true);
+        }
+        if yield_in_region {
+            YieldOnce::default().await;
+        }
+        busy.set(false);
+        in_flight_together
+    }
+
+    #[test]
+    fn concurrent_dispatches_do_not_overlap_sync_write_regions() {
+        glommio::LocalExecutor::default().run(async {
+            let run_pair = |gate: Arc<Rendezvous>,
+                            busy: Rc<std::cell::Cell<bool>>,
+                            overlap: Rc<std::cell::Cell<bool>>,
+                            yield_in_region: bool| {
+                let first = glommio::spawn_local({
+                    let gate = gate.clone();
+                    let busy = busy.clone();
+                    let overlap = overlap.clone();
+                    async move { fake_write(gate, busy, overlap, yield_in_region).await }
+                });
+                let second = glommio::spawn_local(async move {
+                    fake_write(gate, busy, overlap, yield_in_region).await
+                });
+                async move { [first.await, second.await] }
+            };
+
+            let gate = Rendezvous::new(2);
+            let busy = Rc::new(std::cell::Cell::new(false));
+            let overlap = Rc::new(std::cell::Cell::new(false));
+            let results = run_pair(gate, busy, overlap.clone(), false).await;
+            assert!(results[0]);
+            assert!(results[1]);
+            assert!(!overlap.get());
+
+            let gate = Rendezvous::new(2);
+            let busy = Rc::new(std::cell::Cell::new(false));
+            let overlap = Rc::new(std::cell::Cell::new(false));
+            let results = run_pair(gate, busy, overlap.clone(), true).await;
+            assert!(results[0]);
+            assert!(results[1]);
+            assert!(overlap.get());
+        });
     }
 
     /// Spawn config for tests that run without real model files. The
@@ -5812,7 +6314,6 @@ mod tests {
     fn shard_spawn_config_new_uses_arena_default_capacity() {
         let cfg = ShardSpawnConfig::new("/tmp/example", stub_dispatcher());
         assert_eq!(cfg.channel_capacity, 1024);
-        assert_eq!(cfg.pin_cpu, None);
         assert_eq!(
             cfg.arena_initial_capacity_slots,
             DEFAULT_INITIAL_CAPACITY_SLOTS
@@ -5846,6 +6347,65 @@ mod tests {
         std::fs::write(&path, b"short").unwrap();
         let err = read_or_generate_uuid(&path).expect_err("should reject");
         assert!(matches!(err, ShardError::UuidFile { .. }));
+    }
+
+    #[test]
+    fn entry_error_is_not_classified_as_absent() {
+        let err = std::io::Error::other("readdir failed");
+        assert!(
+            entry_is_wal_segment(Err(err)).is_err(),
+            "a directory entry we could not read must not be reported as 'not a WAL segment'"
+        );
+    }
+
+    #[test]
+    fn wal_segments_present_detects_a_segment() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("000000.wal"), b"").unwrap();
+        assert!(wal_segments_present(dir.path()).expect("listing succeeds"));
+    }
+
+    #[test]
+    fn wal_segments_present_ignores_non_segment_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("README"), b"").unwrap();
+        std::fs::write(dir.path().join("000000.wal.bak"), b"").unwrap();
+        assert!(!wal_segments_present(dir.path()).expect("listing succeeds"));
+    }
+
+    #[test]
+    fn wal_segments_present_missing_dir_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("no-such-wal-dir");
+        assert!(matches!(
+            wal_segments_present(&missing),
+            Err(ShardError::WalDirScan { .. })
+        ));
+    }
+
+    #[test]
+    fn wal_segments_present_unreadable_dir_is_an_error_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let wal = dir.path().join("wal");
+        std::fs::create_dir(&wal).unwrap();
+        std::fs::write(wal.join("000000.wal"), b"").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root ignores the permission bits, so the listing succeeds and there
+        // is nothing to assert. Probe before asserting rather than reporting a
+        // pass that was never exercised.
+        let enforced = std::fs::read_dir(&wal).is_err();
+        let observed = wal_segments_present(&wal);
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        if enforced {
+            assert!(
+                matches!(observed, Err(ShardError::WalDirScan { .. })),
+                "an unreadable WAL directory must abort the spawn, not read as empty"
+            );
+        }
     }
 
     #[test]
@@ -5893,11 +6453,11 @@ mod tests {
         // modules open them on demand.
         assert!(
             !paths.entity_hnsw().exists(),
-            "entity.hnsw is created by phase 16, not by spawn"
+            "entity.hnsw is created on demand by its owning module, not by spawn"
         );
         assert!(
             !paths.statement_hnsw().exists(),
-            "statement.hnsw is created by phase 17, not by spawn"
+            "statement.hnsw is created on demand by its owning module, not by spawn"
         );
 
         // llm_cache.redb — IS created by spawn.
@@ -5923,10 +6483,11 @@ mod tests {
 
     #[test]
     fn reconcile_forgotten_tombstones_inactive_snapshot_nodes() {
-        // IDX1 convergence: a memory HNSW loaded from a snapshot holds M1..M3
-        // active; a post-snapshot FORGET marked M2 inactive in redb.
-        // Reconciliation must tombstone exactly M2 so the HNSW active set
-        // converges to the redb active set — M1/M3 stay live, no ghost.
+        // HNSW/redb active-set convergence: a memory HNSW loaded from a
+        // snapshot holds M1..M3 active; a post-snapshot FORGET marked M2
+        // inactive in redb. Reconciliation must tombstone exactly M2 so the
+        // HNSW active set converges to the redb active set — M1/M3 stay live,
+        // no ghost.
         use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
         use brain_index::SharedHnsw;
         use brain_metadata::tables::memory::{flags, MemoryMetadata, MEMORIES_TABLE};

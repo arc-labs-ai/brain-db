@@ -33,8 +33,8 @@ fn round_trip_error(body: ErrorResponse) -> ErrorResponse {
 #[test]
 fn predicate_not_in_schema_round_trips() {
     let original = ErrorResponse {
-        code: ErrorCodeWire::PredicateNotInSchema,
-        category: ErrorCategoryWire::Validation,
+        code: ErrorCodeWire::PredicateNotInSchema as u16,
+        category: ErrorCategoryWire::Validation as u8,
         message: "predicate 'acme:ghost' not in active schema v3".into(),
         details: Some(ErrorDetails {
             field: Some("predicate".into()),
@@ -45,9 +45,9 @@ fn predicate_not_in_schema_round_trips() {
     };
     let decoded = round_trip_error(original.clone());
     assert_eq!(decoded, original);
-    assert_eq!(decoded.code, ErrorCodeWire::PredicateNotInSchema);
+    assert_eq!(decoded.code, ErrorCodeWire::PredicateNotInSchema as u16);
     // And the wire → in-memory bridge stays in sync.
-    let code: ErrorCode = decoded.code.into();
+    let code: ErrorCode = ErrorCodeWire::try_from(decoded.code).unwrap().into();
     assert_eq!(code, ErrorCode::PredicateNotInSchema);
     assert_eq!(code.category(), ErrorCategory::Validation);
 }
@@ -55,15 +55,15 @@ fn predicate_not_in_schema_round_trips() {
 #[test]
 fn relation_type_not_in_schema_round_trips() {
     let original = ErrorResponse {
-        code: ErrorCodeWire::RelationTypeNotInSchema,
-        category: ErrorCategoryWire::Validation,
+        code: ErrorCodeWire::RelationTypeNotInSchema as u16,
+        category: ErrorCategoryWire::Validation as u8,
         message: "relation type 'acme:rivals' not in active schema v1".into(),
         details: None,
         retry_after_ms: None,
     };
     let decoded = round_trip_error(original.clone());
     assert_eq!(decoded, original);
-    let code: ErrorCode = decoded.code.into();
+    let code: ErrorCode = ErrorCodeWire::try_from(decoded.code).unwrap().into();
     assert_eq!(code, ErrorCode::RelationTypeNotInSchema);
     assert_eq!(code.category(), ErrorCategory::Validation);
 }
@@ -71,8 +71,8 @@ fn relation_type_not_in_schema_round_trips() {
 #[test]
 fn cardinality_violation_round_trips() {
     let original = ErrorResponse {
-        code: ErrorCodeWire::CardinalityViolation,
-        category: ErrorCategoryWire::Conflict,
+        code: ErrorCodeWire::CardinalityViolation as u16,
+        category: ErrorCategoryWire::Conflict as u8,
         message: "OneToOne on 'acme:married_to' violated: 2 existing current rows".into(),
         details: Some(ErrorDetails {
             field: Some("relation_type".into()),
@@ -83,7 +83,7 @@ fn cardinality_violation_round_trips() {
     };
     let decoded = round_trip_error(original.clone());
     assert_eq!(decoded, original);
-    let code: ErrorCode = decoded.code.into();
+    let code: ErrorCode = ErrorCodeWire::try_from(decoded.code).unwrap().into();
     assert_eq!(code, ErrorCode::CardinalityViolation);
     assert_eq!(code.category(), ErrorCategory::Conflict);
 }
@@ -149,12 +149,11 @@ fn random_bytes_to_error_response_returns_malformed_not_panic() {
 fn bytes_with_corrupt_middle_return_malformed_not_panic() {
     // Build a real ErrorResponse, encode, then corrupt the middle of
     // the buffer. The CBOR decoder must reject this without
-    // panicking. Resolution-in-force: `UnknownErrorCode` doesn't
-    // panic — the decoder rejects invalid u16 discriminants and
-    // surfaces them as MalformedPayload.
+    // panicking. The decoder must reject malformed structure while the
+    // open integer classification fields remain valid wire values.
     let resp = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::InvalidArgument,
-        category: ErrorCategoryWire::Validation,
+        code: ErrorCodeWire::InvalidArgument as u16,
+        category: ErrorCategoryWire::Validation as u8,
         message: "x".repeat(64),
         details: None,
         retry_after_ms: None,
@@ -176,8 +175,8 @@ fn bytes_with_corrupt_middle_return_malformed_not_panic() {
 #[test]
 fn truncated_real_payload_returns_malformed_not_panic() {
     let resp = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::CardinalityViolation,
-        category: ErrorCategoryWire::Conflict,
+        code: ErrorCodeWire::CardinalityViolation as u16,
+        category: ErrorCategoryWire::Conflict as u8,
         message: "long message to force payload size > 16".repeat(8),
         details: None,
         retry_after_ms: None,
@@ -212,8 +211,8 @@ fn malformed_bytes_on_unrelated_opcode_also_returns_structured_error() {
 #[test]
 fn baseline_invalid_argument_round_trip_still_works() {
     let original = ErrorResponse {
-        code: ErrorCodeWire::InvalidArgument,
-        category: ErrorCategoryWire::Validation,
+        code: ErrorCodeWire::InvalidArgument as u16,
+        category: ErrorCategoryWire::Validation as u8,
         message: "top_k out of range".into(),
         details: Some(ErrorDetails {
             field: Some("top_k".into()),

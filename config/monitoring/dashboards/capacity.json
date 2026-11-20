@@ -26,8 +26,8 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "process_resident_memory_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
-        { "expr": "predict_linear(process_resident_memory_bytes[6h:], 86400)", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+        { "expr": "process_memory_resident_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "predict_linear(process_memory_resident_bytes[6h:], 86400)", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
     },
     {
@@ -37,7 +37,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "process_virtual_memory_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+        { "expr": "process_memory_virtual_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
     },
     {

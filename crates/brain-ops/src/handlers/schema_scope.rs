@@ -23,9 +23,6 @@ use brain_protocol::SchemaScope;
 use crate::context::OpsContext;
 use crate::error::OpError;
 
-/// 1 MiB cap on an uploaded schema document.
-pub const MAX_SCHEMA_DOCUMENT_BYTES: usize = 1024 * 1024;
-
 /// Resolve the scope a `SCHEMA_UPLOAD` declares at into the 16-byte space
 /// the entity-type registry is keyed on.
 ///
@@ -170,7 +167,9 @@ pub fn map_schema_store_error(e: SchemaStoreError) -> OpError {
 pub fn map_writer_err(err: WriterError) -> OpError {
     match err {
         WriterError::Conflict(msg) => OpError::Conflict(msg),
-        WriterError::Overloaded => OpError::Overloaded("writer overloaded".into()),
+        WriterError::NotFound { what, detail } => OpError::NotFound { what, detail },
+        WriterError::InvalidRequest(msg) => OpError::InvalidRequest(msg),
         WriterError::Internal(msg) => OpError::Internal(msg),
+        WriterError::StorageFaulted { detail } => OpError::ShardStorageFaulted { detail },
     }
 }

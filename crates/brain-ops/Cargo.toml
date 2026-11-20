@@ -20,6 +20,8 @@ brain-metadata = { path = "../brain-metadata" }
 brain-analytics = { path = "../brain-analytics" }
 brain-rerank = { path = "../brain-rerank" }
 brain-storage = { path = "../brain-storage" }
+# Intra-op pool that confines Candle's matmul fan-out during embedding offload.
+rayon.workspace = true
 rkyv.workspace = true
 ciborium.workspace = true
 serde.workspace = true
@@ -39,16 +41,16 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 # so external test crates can use it, hence tempfile lives in regular
 # deps rather than dev-only.
 tempfile.workspace = true
-# 17.7: SmallVec used when projecting overflow evidence back to inline
+# SmallVec used when projecting overflow evidence back to inline
 # for StatementView responses.
 smallvec.workspace = true
-# 22.3 — bounded channel between the ENCODE / FORGET post-commit
+# Bounded channel between the ENCODE / FORGET post-commit
 # hooks and the per-shard tantivy indexer drain task.
 flume = { workspace = true }
-# 22.3 — IndexWriter, PreparedCommit, Term, doc!() — used by
+# IndexWriter, PreparedCommit, Term, doc!() — used by
 # the text indexer worker.
 tantivy = { workspace = true }
-# 22.3 — `glommio::spawn_local` for the per-shard drain task,
+# `glommio::spawn_local` for the per-shard drain task,
 # `glommio::timer::sleep` + `futures_lite::FutureExt::or` for the
 # Glommio-side wait-or-deadline race in the text indexers
 # (matches the pattern in `brain-storage::wal::group_commit`).

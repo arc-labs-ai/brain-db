@@ -12,7 +12,7 @@ description = "Metadata store (redb) and graph storage for Brain."
 brain-crypto = { path = "../brain-crypto" }
 brain-core = { path = "../brain-core" }
 brain-storage = { path = "../brain-storage" }
-# 19.5: schema_store accepts `ValidatedSchema` (brain-protocol) and
+# schema_store accepts `ValidatedSchema` (brain-protocol) and
 # encodes the AST via serde_json into the schema_versions row.
 brain-protocol = { path = "../brain-protocol" }
 serde_json = { workspace = true }
@@ -21,10 +21,10 @@ rkyv.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
-# 17.4: SmallVec used when projecting StatementMetadata → Statement
+# SmallVec used when projecting StatementMetadata → Statement
 # (inline evidence list size INLINE_EVIDENCE_CAP).
 smallvec.workspace = true
-# Phase 8.dedup: BLAKE3 over canonical UTF-8 text for the
+# BLAKE3 over canonical UTF-8 text for the
 # `fingerprints` opt-in content-dedup index.
 blake3.workspace = true
 zeroize.workspace = true
@@ -38,12 +38,17 @@ parking_lot.workspace = true
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+# The page-cache test reads redb's eviction counters to prove the size this
+# crate configures is the one redb enforces. The counters are feature-gated
+# and cost atomics on every cache operation, so they are enabled for the test
+# build only — a released binary links a redb that does not count.
+redb = { workspace = true, features = ["cache_metrics"] }
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 # Used by fingerprint dedup tests to fabricate SpaceIds.
 uuid.workspace = true
-# Hosts the async WAL writer in integration tests (sub-task 9.6a port).
+# Hosts the async WAL writer in integration tests.
 glommio.workspace = true
 # block_on for tiered supersession decider tests (judge is async).
 futures-lite.workspace = true

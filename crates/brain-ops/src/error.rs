@@ -1,8 +1,10 @@
 //! error taxonomy.
 //!
-//! `OpError` is brain-ops's runtime error type. Each variant maps to
-//! a stable wire `ErrorCode` (`error_code()`) and carries a
-//! `retryable` flag (`retryable()`) — both surfaced to clients per
+//! `OpError` is brain-ops's runtime error type. Every variant maps to a
+//! stable wire `ErrorCode` through `error_code()`, and that mapping is the
+//! single classification this crate owns. Retryability is not decided
+//! here: the dispatcher turns the `ErrorCode` into a `brain_protocol::ErrorCode`,
+//! and clients read it from that code's `ErrorCategory`.
 //!
 //! `#[from]` conversions wrap `brain_planner::PlanError` and
 //! `brain_planner::ExecError` so handlers can `?` upstream errors
@@ -19,9 +21,33 @@ pub enum OpError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// — an invalid request whose offending input is known by name.
+    ///
+    /// Carries the same client-facing sentence as `InvalidRequest` plus the
+    /// parts the wire `ErrorDetails` block is made of, so a client can branch
+    /// on which input it got wrong instead of parsing the message. `expected`
+    /// and `actual` hold the constraint and the value that broke it when the
+    /// check knows them; a check that only knows the field leaves them unset.
+    #[error("invalid request: {reason}")]
+    InvalidField {
+        field: String,
+        expected: Option<String>,
+        actual: Option<String>,
+        reason: String,
+    },
+
     /// — referenced entity does not exist.
     #[error("{what} not found: {detail}")]
     NotFound { what: &'static str, detail: String },
+
+    /// — a supersession chain does not terminate.
+    ///
+    /// A read that follows `superseded_by` gives up after a bounded number of
+    /// hops. Only corrupt or mis-replayed state can produce a chain that long,
+    /// so this is the substrate's fault, not the caller's: the walk stops and
+    /// says so rather than spinning inside a read that never yields.
+    #[error("{what} supersession chain does not terminate: {detail}")]
+    SupersessionChainCycle { what: &'static str, detail: String },
 
     /// — the write's namespace has no usable LLM provider credential (BYOK).
     ///
@@ -31,6 +57,14 @@ pub enum OpError {
     /// caller why recall degraded.
     #[error("no LLM provider credential for namespace {namespace}: {detail}")]
     LlmCredentialMissing { namespace: String, detail: String },
+
+    /// This shard's write-ahead log is terminally broken. Terminal for the
+    /// life of the process: the fault latches and nothing clears it, so the
+    /// client must stop rather than retry. `detail` holds the underlying
+    /// failure for the server log and stays out of the `Display` that reaches
+    /// the client.
+    #[error("shard storage is terminally faulted: this shard's write-ahead log can no longer be written, so every write will fail until an operator restarts the shard process; retrying will not help")]
+    ShardStorageFaulted { detail: String },
 
     /// The request conflicts with committed state. Two causes: an
     /// idempotency mismatch on a duplicate `request_id` ("same RequestId
@@ -51,7 +85,7 @@ pub enum OpError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
-    /// — substrate is shedding load. Retryable.
+    /// — maps to wire `Overloaded` (`Unavailable`), which clients retry.
     #[error("overloaded: {0}")]
     Overloaded(String),
 
@@ -161,7 +195,7 @@ pub enum OpError {
     /// Diagnostic-only: a retrieval retriever degraded after the shard
     /// spawned (tantivy segment corruption, an HNSW reader going
     /// stale, etc.). Surfaced only by admin / health surfaces
-    /// (`/health`, `ADMIN_STATUS`) so operators learn about the
+    /// (`/health`, `ADMIN_STATS`) so operators learn about the
     /// degradation; never returned from `handle_recall` in v1,
     /// because RECALL is a single verb whose path the server picks
     /// and whose required sinks shard spawn guarantees.
@@ -178,10 +212,19 @@ pub enum OpError {
     #[error("capability \"{capability}\" is not enabled on this shard")]
     CapabilityNotEnabled { capability: &'static str },
 
-    /// Catch-all for internal bookkeeping: maps to
-    /// wire `InternalError`. Not retryable.
+    /// Catch-all for internal bookkeeping: maps to wire `InternalError`, whose
+    /// protocol category is `Internal`, so clients may retry it. A shard whose
+    /// write-ahead log is terminally broken is routed to
+    /// `ShardStorageFaulted`, because an operator restart is what recovers it;
+    /// a broken engine invariant or unreadable stored row is routed to
+    /// `PermanentFault`, because no restart touches that.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A stored row or engine invariant is permanently broken; retrying
+    /// cannot change the fault and it needs investigation.
+    #[error("permanent fault: the request cannot succeed on a retry; the fault needs investigation: {0}")]
+    PermanentFault(String),
 }
 
 /// — stable wire error codes.
@@ -231,6 +274,12 @@ pub enum ErrorCode {
     /// client RECALL never sees this — the server picks the path
     /// and shard spawn guarantees the required sinks are wired.
     RetrievalUnavailable,
+    /// This shard's WAL is terminally broken. Maps to wire
+    /// `ShardStorageFaulted` (0x00A0, category `OperatorIntervention`).
+    /// Terminal — clients must not retry it; an operator must restart the shard.
+    ShardStorageFaulted,
+    /// Engine state is permanently inconsistent and a retry cannot clear it.
+    PermanentFault,
     InternalError,
 }
 
@@ -239,9 +288,10 @@ impl OpError {
     #[must_use]
     pub fn error_code(&self) -> ErrorCode {
         match self {
-            Self::InvalidRequest(_) | Self::TooManyMemories | Self::SchemaConflict { .. } => {
-                ErrorCode::InvalidRequest
-            }
+            Self::InvalidRequest(_)
+            | Self::InvalidField { .. }
+            | Self::TooManyMemories
+            | Self::SchemaConflict { .. } => ErrorCode::InvalidRequest,
             // Route the typed-graph NotFound cases to their precise wire
             // codes. The `what` tag is set at construction (here and in the
             // `From<*OpError>` conversions); anything else stays generic.
@@ -252,6 +302,7 @@ impl OpError {
             },
             Self::Conflict(_) => ErrorCode::Conflict,
             Self::LlmCredentialMissing { .. } => ErrorCode::LlmCredentialMissing,
+            Self::ShardStorageFaulted { .. } => ErrorCode::ShardStorageFaulted,
             Self::TxnExpired => ErrorCode::TxnExpired,
             Self::TxnNotFound => ErrorCode::TxnNotFound,
             Self::TransactionTooLarge { .. } => ErrorCode::TransactionTooLarge,
@@ -267,6 +318,9 @@ impl OpError {
             // server-side intervention by dropping the opt-in flag.
             Self::CapabilityNotEnabled { .. } => ErrorCode::InvalidRequest,
             Self::NotYetImplemented(_) | Self::Internal(_) => ErrorCode::InternalError,
+            Self::PermanentFault(_) | Self::SupersessionChainCycle { .. } => {
+                ErrorCode::PermanentFault
+            }
             Self::PlanError(p) => match p {
                 PlanError::QueryTooExpensive { .. } | PlanError::InvalidParameters { .. } => {
                     ErrorCode::InvalidRequest
@@ -280,23 +334,56 @@ impl OpError {
                 | ExecError::Unsupported(_)
                 | ExecError::Internal(_) => ErrorCode::InternalError,
                 ExecError::MemoryNotFound { .. } => ErrorCode::NotFound,
-                ExecError::WriterFailed(WriterError::Overloaded) => ErrorCode::Overloaded,
+                ExecError::WriterFailed(WriterError::NotFound { what, .. }) => match *what {
+                    "entity" | "subject entity" => ErrorCode::EntityNotFound,
+                    "statement" => ErrorCode::StatementNotFound,
+                    _ => ErrorCode::NotFound,
+                },
                 ExecError::WriterFailed(WriterError::Conflict(_)) => ErrorCode::Conflict,
+                ExecError::WriterFailed(WriterError::InvalidRequest(_)) => {
+                    ErrorCode::InvalidRequest
+                }
                 ExecError::WriterFailed(WriterError::Internal(_)) => ErrorCode::InternalError,
+                ExecError::WriterFailed(WriterError::StorageFaulted { .. }) => {
+                    ErrorCode::ShardStorageFaulted
+                }
             },
         }
     }
+}
 
-    /// clients see a `retryable` flag. Only
-    /// `Overloaded` (and the same condition surfacing from the
-    /// writer) is retryable; everything else needs operator
-    /// investigation or is a client-side bug.
-    #[must_use]
-    pub fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Overloaded(_) | Self::ExecError(ExecError::WriterFailed(WriterError::Overloaded))
-        )
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brain_planner::ExecError;
+
+    /// An apply-side refusal of the caller's input must keep its
+    /// invalid-request classification all the way to the wire. Collapsing it
+    /// into `InternalError` puts it in a category clients retry, so a client
+    /// spins against a write the engine refuses every time.
+    #[test]
+    fn a_writer_invalid_request_reaches_the_wire_as_an_invalid_request() {
+        let err = OpError::ExecError(ExecError::WriterFailed(WriterError::InvalidRequest(
+            "relation_create: entity type violation on from".into(),
+        )));
+        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+    }
+
+    /// The writer's three caller-facing classifications must stay apart: a
+    /// client routes on the difference between "fix the request", "the row is
+    /// gone" and "you raced committed state".
+    #[test]
+    fn writer_faults_keep_their_classifications_apart() {
+        let invalid = OpError::ExecError(ExecError::WriterFailed(WriterError::InvalidRequest(
+            "bad endpoint".into(),
+        )));
+        let conflict =
+            OpError::ExecError(ExecError::WriterFailed(WriterError::Conflict("dup".into())));
+        let internal =
+            OpError::ExecError(ExecError::WriterFailed(WriterError::Internal("io".into())));
+        assert_eq!(invalid.error_code(), ErrorCode::InvalidRequest);
+        assert_eq!(conflict.error_code(), ErrorCode::Conflict);
+        assert_eq!(internal.error_code(), ErrorCode::InternalError);
     }
 }
 
@@ -304,11 +391,21 @@ impl OpError {
 // Domain-error → OpError conversions.
 //
 // One place each metadata error type is classified into the wire taxonomy,
-// so handlers `?` them through. Previously every handler module hand-rolled
-// a `map_*_op_error` fn — and the procedural handler's copies silently
-// downgraded everything to `Internal` (500), losing NotFound/Conflict
-// classification. Centralizing here removes that divergence.
+// so handlers `?` them through. Per-handler `map_*_op_error` copies diverge:
+// a copy that silently downgrades everything to `Internal` (500) loses the
+// NotFound/Conflict classification a client routes on, and nothing catches it
+// because each copy is only ever read on its own.
 // ---------------------------------------------------------------------------
+
+/// redb already records whether a failure is deterministic; stringifying it
+/// before classification loses the only evidence of whether a retry can work.
+fn storage_op_error<E: crate::apply::RedbFault>(e: &E, message: String) -> OpError {
+    if e.storage_fault().is_deterministic() {
+        OpError::PermanentFault(message)
+    } else {
+        OpError::Internal(message)
+    }
+}
 
 impl From<brain_metadata::schema::predicate::PredicateOpError> for OpError {
     fn from(err: brain_metadata::schema::predicate::PredicateOpError) -> Self {
@@ -324,8 +421,8 @@ impl From<brain_metadata::schema::predicate::PredicateOpError> for OpError {
                 what: "predicate",
                 detail: format!("{id:?}"),
             },
-            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::Storage(e) => storage_op_error(&e, format!("redb storage: {e}")),
+            E::Table(e) => storage_op_error(&e, format!("redb table: {e}")),
             // A neighbouring subsystem failed underneath a predicate op; the
             // caller did nothing wrong, so this is ours, not theirs.
             E::Dependency(detail) => OpError::Internal(format!("predicate dependency: {detail}")),
@@ -379,10 +476,10 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
                 OpError::InvalidRequest("predicate must match on supersede".into())
             }
             E::DecodeFailed => {
-                OpError::Internal("statement row decode failed — possible corruption".into())
+                OpError::PermanentFault("statement row decode failed — possible corruption".into())
             }
-            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::Storage(e) => storage_op_error(&e, format!("redb storage: {e}")),
+            E::Table(e) => storage_op_error(&e, format!("redb table: {e}")),
             E::Kind(e) => OpError::Internal(format!("kind registry: {e}")),
             E::PredicateOp(e) => OpError::from(e),
             E::EntityOp(e) => {
@@ -410,11 +507,11 @@ impl From<brain_metadata::entity::ops::EntityOpError> for OpError {
             } => OpError::Conflict(format!(
                 "canonical_name {name:?} already exists for type {type_id:?}: {existing:?}"
             )),
-            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::Storage(e) => storage_op_error(&e, format!("redb storage: {e}")),
+            E::Table(e) => storage_op_error(&e, format!("redb table: {e}")),
             E::TrigramOp(e) => OpError::Internal(format!("trigram op: {e}")),
             E::MergeRedirectCycle(id) => {
-                OpError::Internal(format!("entity {id:?} merge-redirect chain is a cycle"))
+                OpError::PermanentFault(format!("entity {id:?} merge-redirect chain is a cycle"))
             }
         }
     }
@@ -430,8 +527,8 @@ impl From<brain_metadata::relation::types::RelationTypeOpError> for OpError {
             E::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
                 "relation_type {qname:?} already exists with id {existing_id:?}"
             )),
-            E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-            E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            E::Storage(e) => storage_op_error(&e, format!("redb storage: {e}")),
+            E::Table(e) => storage_op_error(&e, format!("redb table: {e}")),
         }
     }
 }
@@ -450,4 +547,54 @@ pub fn caller_tombstone_reason(byte: u8) -> Result<brain_core::TombstoneReason, 
             "unknown tombstone_reason byte {byte}; expected 1..=4"
         ))
     })
+}
+
+#[cfg(test)]
+mod permanent_fault_tests {
+    use super::*;
+
+    /// A permanent fault must remain non-retryable through the protocol
+    /// category selected for it.
+    #[test]
+    fn permanent_fault_is_non_retryable_end_to_end() {
+        let error = OpError::PermanentFault("chain dangling at 7".into());
+        assert_eq!(error.error_code(), ErrorCode::PermanentFault);
+        assert_eq!(
+            brain_protocol::error::ErrorCode::UnrecoverableInternal.category(),
+            brain_protocol::error::ErrorCategory::OperatorIntervention
+        );
+        assert!(!brain_protocol::error::ErrorCategory::OperatorIntervention.is_retryable());
+    }
+
+    /// Collapsing the two directions is the bug this split prevents: a
+    /// permanent fault makes a client spin, while a transient one must not
+    /// abandon work that could succeed.
+    #[test]
+    fn internal_fault_remains_retryable() {
+        assert_eq!(
+            OpError::Internal("busy".into()).error_code(),
+            ErrorCode::InternalError
+        );
+        assert_eq!(
+            brain_protocol::error::ErrorCode::Internal.category(),
+            brain_protocol::error::ErrorCategory::Internal
+        );
+    }
+
+    /// A restart recovers a faulted WAL and does nothing for a corrupt row, so
+    /// borrowing that instruction would send an operator down the wrong path.
+    #[test]
+    fn permanent_fault_message_does_not_instruct_restart() {
+        assert!(!OpError::PermanentFault("corrupt row".into())
+            .to_string()
+            .contains("restart"));
+    }
+
+    #[test]
+    fn deterministic_redb_failure_becomes_permanent() {
+        let error = brain_metadata::statement::StatementOpError::Table(
+            redb::TableError::TableDoesNotExist("x".into()),
+        );
+        assert!(matches!(OpError::from(error), OpError::PermanentFault(_)));
+    }
 }
