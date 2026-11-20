@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.4.3](https://github.com/arc-labs-ai/brain-db/compare/v0.4.2...v0.4.3) (2026-11-20)
+
+
+### Features
+
+* added kinds.json for local ([38a0b17](https://github.com/arc-labs-ai/brain-db/commit/38a0b1751a18c4fb876fa16d0ab4cf90c3468e9d))
+* **llm:** admit derivation by the bytes it holds, and price every billed call ([6eae7e0](https://github.com/arc-labs-ai/brain-db/commit/6eae7e0dd99d71d88d05b9b87740f182b65d3309))
+* machine-sized capacity, derivation off the request lane, and a boot that will not lose a write ([4ff427c](https://github.com/arc-labs-ai/brain-db/commit/4ff427c7fa8b68e815bf11ac73ad5f0884a364ea))
+
+
+### Bug Fixes
+
+* boot past a refused replay, and accept both nullable conventions ([7589baa](https://github.com/arc-labs-ai/brain-db/commit/7589baad57cfb972531d8495c980d11c1a65726b))
+* **metadata:** give the id allocators a persistent high-water mark ([f8c779e](https://github.com/arc-labs-ai/brain-db/commit/f8c779e3a7d9cd40a6fa0b063c04112514398932))
+* **ops:** ack the row that exists, bound what a client may send, and name a degraded read ([302d52b](https://github.com/arc-labs-ai/brain-db/commit/302d52b6426c1de35304c489369e64a840fd6ada))
+* **ops:** require a minimum provider-key length before sealing ([6cf45ca](https://github.com/arc-labs-ai/brain-db/commit/6cf45ca6e6bb389903e98f216a837996e1bc83e2))
+* **storage:** stop boot from silently discarding acked writes ([a84f665](https://github.com/arc-labs-ai/brain-db/commit/a84f665b25a53ac2e028632db15ca52cae51d9b7))
+* **tests:** drop the schema argument two call sites still passed ([dbddc2c](https://github.com/arc-labs-ai/brain-db/commit/dbddc2c0697d3fc90421eac7fd10377791dfc6c5))
+* **workers:** keep derivation out of the request lane ([10b3cb7](https://github.com/arc-labs-ai/brain-db/commit/10b3cb7036a753f7fa1148bd10defb4edb74de32))
+
+
+### Refactoring
+
+* **server:** give brain-server a lib target, and derive capacity from the machine ([0fd81fe](https://github.com/arc-labs-ai/brain-db/commit/0fd81fe544c663b5850cc4091d5a84c56f6c257a))
+
 ## [0.4.2](https://github.com/arc-labs-ai/brain-db/compare/v0.4.1...v0.4.2) (2026-11-13)
 
 
